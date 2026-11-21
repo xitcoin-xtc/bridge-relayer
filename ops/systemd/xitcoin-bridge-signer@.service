@@ -14,6 +14,8 @@ LoadCredentialEncrypted=keystore-password:/etc/credstore.encrypted/xitcoin-bridg
 LoadCredentialEncrypted=transport-token:/etc/credstore.encrypted/xitcoin-bridge-signer-%i-transport-token
 Restart=on-failure
 RestartSec=5s
+# Durable approval journal only; the keystore directory stays read-only.
+StateDirectory=xitcoin-bridge/signer-%i-journal
 NoNewPrivileges=true
 PrivateDevices=true
 PrivateTmp=true
@@ -36,6 +38,7 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
+ReadWritePaths=/var/lib/xitcoin-bridge/signer-%i-journal
 
 [Install]
 WantedBy=multi-user.target

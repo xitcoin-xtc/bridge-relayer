@@ -11,9 +11,11 @@ export function sign(request, indexes = [1, 0]) {
 }
 export function inbound(overrides = {}) {
   const request = buildApprovalRequest({ direction: DIRECTION_INBOUND, payload: {
-    routeId: "cronos-testnet-xitcoin-testnet", sourceChainId: "338", sourceRef: `0x${"aa".repeat(32)}`,
+    destinationChainId: "xitcoin-testnet-v2-1", routeId: "cronos-testnet-xitcoin-testnet", sourceChainId: "338", sourceRef: `0x${"aa".repeat(32)}`,
     nonce: "18446744073709551615", destination: evmAddressToBech32(signers[0]), amount: "10",
-    deadlineUnix: "2000000000", ...overrides,
+    // 1999999999 gives the two fixture approvals different recovery bytes
+    // (0x1b and 0x1c) under the v2 network-specific digest.
+    deadlineUnix: "1999999999", ...overrides,
   } });
   return { chainId: "xitcoin-testnet-v2-1", request, approvals: sign(request), authorizedSigners: signers,
     submitter: evmAddressToBech32(signers[2]), nowUnix: 1_900_000_000 };

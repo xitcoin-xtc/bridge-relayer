@@ -27,7 +27,7 @@ function approvedStore(request) {
 }
 
 const inbound = buildApprovalRequest({ direction: DIRECTION_INBOUND, payload: {
-  routeId: "cronos-xitcoin-xtc-v1", sourceChainId: "25", sourceRef: ref, nonce: "7",
+  destinationChainId: "xitcoin", routeId: "cronos-xitcoin-xtc-v1", sourceChainId: "25", sourceRef: ref, nonce: "7",
   destination: "xtc1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg32rdvg9", amount: "10", deadlineUnix: 2_000_000_000,
 } });
 

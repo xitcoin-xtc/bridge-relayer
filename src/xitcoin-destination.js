@@ -35,8 +35,11 @@ export function prepareXitcoinAttestation(input) {
     const { request, approvals, authorizedSigners, submitter, nowUnix } = value;
     if (value.chainId !== "xitcoin-testnet-v2-1" || request.direction !== DIRECTION_INBOUND) throw new Error();
     const p = request.payload;
-    exactFields(p, ["routeId", "sourceChainId", "sourceRef", "nonce", "destination", "amount", "deadlineUnix", ...(Object.hasOwn(p, "sourceEvidence") ? ["sourceEvidence"] : [])]);
+    exactFields(p, ["destinationChainId", "routeId", "sourceChainId", "sourceRef", "nonce", "destination", "amount", "deadlineUnix", ...(Object.hasOwn(p, "sourceEvidence") ? ["sourceEvidence"] : [])]);
     if (Object.hasOwn(p, "sourceEvidence")) validateSourceEvidence(p.sourceEvidence);
+    // The destination chain ID is signed (network-specific digest) but not sent:
+    // the chain verifies against its own chain ID.
+    if (p.destinationChainId !== value.chainId) throw new Error();
     if (p.routeId !== ROUTE || p.sourceChainId !== "338" || !/^0x[0-9a-f]{64}$/.test(p.sourceRef)) throw new Error();
     const nonce = decimal(p.nonce, 64);
     decimal(p.amount, 256);

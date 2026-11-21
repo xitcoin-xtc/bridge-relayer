@@ -1,5 +1,5 @@
 import { evmAddressToBech32 } from "./address.js";
-import { attestationDigest, attestationId, depositId, releaseDigest } from "./protocol.js";
+import { attestationDigest, attestationId, attestationPayloadHash, depositId, releaseDigest } from "./protocol.js";
 import { TESTNET_ROUTE_ID } from "./preflight.js";
 
 const route = "cronos-testnet-xitcoin-testnet";
@@ -14,6 +14,7 @@ const vector = {
 };
 
 const attestation = {
+  destinationChainId: "xitcoin-testnet-v2-1",
   routeId: route,
   direction: "cronos_to_xitcoin",
   sourceChainId: String(cronosChainId),
@@ -27,6 +28,7 @@ const attestation = {
 Object.assign(vector, {
   attestation,
   attestationId: attestationId(attestation),
+  attestationPayloadHash: attestationPayloadHash(attestation),
   attestationDigest: attestationDigest(attestation),
   depositId: depositId({
     chainId: cronosChainId,

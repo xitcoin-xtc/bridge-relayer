@@ -32,6 +32,7 @@ test("builds stable route, deposit and attestation identifiers", () => {
   const attestation = {
     routeId: route,
     direction: "cronos_to_xitcoin",
+    destinationChainId: "xitcoin",
     sourceChainId: "25",
     sourceRef: reference,
     nonce: "7",
@@ -64,4 +65,19 @@ test("binds release approval to chain and vault", () => {
     releaseDigest(common),
     releaseDigest({ ...common, vault: "0x4444444444444444444444444444444444444444" }),
   );
+});
+
+test("attestation replay key, payload hash and digest match the pos-chain cross-check vectors", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const fixture = JSON.parse(await readFile(new URL("./fixtures/attestation-cross-check.json", import.meta.url), "utf8"));
+  const { attestationPayloadHash, attestationDomain } = await import("../src/protocol.js");
+  for (const vector of fixture.vectors) {
+    const attestation = { ...fixture.attestation, destinationChainId: vector.chainId, sourceChainId: vector.sourceChainId };
+    assert.equal(attestationId(attestation), vector.id);
+    assert.equal(attestationPayloadHash(attestation), vector.payloadHash);
+    assert.equal(attestationDigest(attestation), vector.digest);
+    assert.equal(attestationId({ ...attestation, deadlineUnix: "1800000999", destination: "xtc1other" }), vector.id);
+  }
+  assert.equal(attestationDomain("xitcoin"), "xitcoin-bridge-attestation-v2/xitcoin");
+  for (const bad of ["", "xitcoin/1", "a b", "x".repeat(65)]) assert.throws(() => attestationDomain(bad), /chain ID/);
 });

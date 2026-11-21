@@ -55,8 +55,9 @@ Operators must never delete a pending database merely to clear an error.
   independent HTTPS origin.
 - Never embed credentials in signer URLs; inject authentication in a private
   runtime wrapper outside this repository.
-- Keep signer response limits and timeouts bounded, reject redirects, and stop
-  on any invalid response instead of silently lowering the quorum.
+- Keep signer response limits and timeouts bounded and reject redirects. An
+  invalid response is discarded and never counted toward the quorum; a round
+  with fewer than two distinct valid approvals fails and records nothing.
 - Rotate the configured signer set atomically with the on-chain signer-set
   version. Old-domain approvals must never be reused.
 - The public coordinator stores signatures because they are transaction input,
@@ -70,8 +71,15 @@ Operators must never delete a pending database merely to clear an error.
   public service neither loads nor stores private keys.
 - Pin the canonical Xitcoin route and the deployed Cronos `bytes32` route ID
   independently; never derive the deployed route from a display label. Also pin
-  the Cronos chain ID, vault, maximum amount and maximum deadline window on
-  every signer.
+  the Cronos chain ID, the destination Xitcoin chain ID, vault, maximum amount
+  and maximum deadline window on every signer. Set the maximum amount no higher
+  than the chain route's `max_transfer_amount` and the vault's release limit.
+- Give every signer a durable approval journal (`journalPath`, an absolute path
+  in a directory writable only by that signer, for example
+  `/var/lib/xitcoin-bridge/signer-1-journal/approvals.sqlite`; the systemd
+  template provides it as `StateDirectory`). Never delete, copy between signers
+  or restore an old copy of a journal: it is what stops a signer from signing
+  two different requests for one deposit. Back it up like a key.
 - Require transport authorization before reading request bodies. Terminate TLS
   and mutual authentication in a hardened private ingress; never expose the
   approval endpoint directly to the public Internet.
@@ -79,6 +87,57 @@ Operators must never delete a pending database merely to clear an error.
   approval or another signer's response is never sufficient evidence.
 - Treat source disagreement, a mismatched digest, a wrong signing account or an
   expired request as a hard rejection and emit no signature.
+
+## Deposits that cannot mint and refunds
+
+The Xitcoin module refuses to mint a deposit that exceeds the route's
+`max_transfer_amount`, the remaining daily limit or `max_outstanding_amount`,
+that would exceed the XTC maximum supply, or whose recipient is a blocked
+module account. The Cronos vault has no user refund function. The future vault
+rejects deposits above its own deposit limits (configure them no higher than
+the chain limits), but a deposit that is already locked follows this procedure:
+
+1. Daily limit: no action. The approval expires and is re-issued with a new
+   deadline (same replay key) on a later day.
+2. Outstanding limit or per-transfer limit: the signer quorum may raise the
+   chain limits with a 2-of-3 `update_route_config`, after which the deposit
+   mints normally. This is a limit decision and needs the owner's approval.
+3. Blocked recipient, or a deposit the owner decides not to mint: refund on
+   Cronos. The owner approves the refund in writing with the depositId, amount
+   and original depositor. Each signer operator first closes the deposit in its
+   own journal (`npm run signer:journal -- close <journal> <attestation ID>
+   "refund <ticket>"`), which makes later mint approvals impossible; the
+   attestation ID is printed by `xitcoind query bridge source-deposit-key 25
+   <depositId>`. Two signers then sign a vault `Release` to the original
+   depositor with `sourceBurnId = keccak256("xitcoin-bridge-refund-v1" ||
+   depositId)`, which cannot collide with a chain burn request ID. The signer
+   service cannot produce this signature (it only signs releases backed by a
+   finalized Xitcoin burn), so the refund is a manual, reviewed signing step
+   outside the service. Mark the coordinator row `failed` with the refund
+   reference. Accounting stays balanced because the deposit was never minted.
+
+Outbound burns to the zero or `0x…dEaD` address are rejected by the chain
+before burning, because the vault refuses to release to them.
+
+## Reconciliation
+
+`src/reconciler.js` compares the vault's locked balance with the chain's
+`outstanding_amount` plus in-flight transfers from the coordinator store:
+
+```text
+vault locked = chain outstanding + deposits in flight + burns in flight + surplus
+```
+
+What exists: the comparison, interfaces for the two read-only chain readers
+(`ReconciliationSource`), a decoder for the chain's store value
+(`/store/bridge/key`, key `0x07`), alerts, and a pause request after a
+configurable number of consecutive deficits. What does not exist: chain reader
+adapters, a scheduler, and any automatic pause. The default mode is `dry_run`,
+which only alerts (`pause_request_dry_run`). In `request_pause` mode the
+reconciler calls an injected hook with a structured request; the guardian must
+still sign and submit the pause on each chain. A surplus (for example a donated
+or refunded-pending deposit) is a warning only. An unreadable chain raises a
+`reconciliation_unavailable` warning and does not count as a deficit.
 
 ## Encrypted signer credentials
 

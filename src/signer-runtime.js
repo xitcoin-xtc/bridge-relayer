@@ -23,6 +23,7 @@ export async function createSecureSignerService({
   keystorePath,
   keystoreCredentialPath,
   policy,
+  journal,
   verifySource,
   loadSigner = createEncryptedKeystoreDigestSigner,
 }) {
@@ -36,6 +37,7 @@ export async function createSecureSignerService({
     identity,
     signerAddress: key.signerAddress,
     policy,
+    journal,
     verifySource,
     signDigest: key.signDigest,
   });

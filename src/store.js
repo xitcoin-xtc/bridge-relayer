@@ -148,6 +148,39 @@ export class RelayStore {
     return JSON.parse(persisted.approval_request);
   }
 
+  // Replaces a persisted approval request whose deadline has passed with a
+  // re-issued one for the same source event. The caller (coordinator) must
+  // have checked that `next` differs from `previous` only in its deadline (or
+  // release signer-set version); this method re-checks the persisted bytes,
+  // the lifecycle state and expiry atomically and drops approvals collected
+  // for the expired digest, which can no longer be submitted.
+  reissueApprovalRequest(sourceChain, sourceRef, previous, next, { nowUnix = Math.floor(Date.now() / 1000) } = {}) {
+    const previousEncoded = JSON.stringify(previous);
+    const nextEncoded = JSON.stringify(next);
+    if (!next || typeof next !== "object" || Array.isArray(next) || nextEncoded.length > 65_536) {
+      throw new Error("invalid approval request");
+    }
+    if (!Number.isSafeInteger(previous?.deadlineUnix) || !Number.isSafeInteger(next.deadlineUnix)
+        || previous.deadlineUnix >= nowUnix || next.deadlineUnix <= nowUnix) {
+      throw new Error("only an expired approval request may be re-issued with a later deadline");
+    }
+    const ref = sourceRef.toLowerCase();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const updated = this.database.prepare(`
+        UPDATE transfers SET approval_request = ?, updated_at = ?
+        WHERE source_chain = ? AND source_ref = ? AND state = 'finalized' AND approval_request = ?
+      `).run(nextEncoded, Math.floor(Date.now() / 1000), sourceChain, ref, previousEncoded);
+      if (updated.changes !== 1) throw new Error("concurrent or conflicting approval request");
+      this.database.prepare("DELETE FROM approvals WHERE source_chain = ? AND source_ref = ?").run(sourceChain, ref);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return JSON.parse(this.get(sourceChain, sourceRef).approval_request);
+  }
+
   approvalRequest(sourceChain, sourceRef) {
     const encoded = this.get(sourceChain, sourceRef)?.approval_request;
     return encoded ? JSON.parse(encoded) : undefined;

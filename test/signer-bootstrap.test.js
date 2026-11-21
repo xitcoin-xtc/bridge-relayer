@@ -8,6 +8,7 @@ const CONFIG = Object.freeze({
   identity: "signer-1",
   expectedAddress: "0xF54f893fc9b983589d3812a0F1F318d593763E55",
   keystorePath: "/var/lib/xitcoin-bridge/signer-1/keystore.json",
+  journalPath: "/var/lib/xitcoin-bridge/signer-1-journal/approvals.sqlite",
   listen: { host: "127.0.0.1", port: 43101 },
   policy: {
     routeId: "cronos-testnet-xitcoin-testnet",
@@ -41,6 +42,10 @@ test("accepts only a strict pinned testnet signer configuration", () => {
   assert.throws(() => validateSignerConfig({ ...CONFIG, policy: { ...CONFIG.policy, routeId: "cronos-xitcoin-xtc-v1" } }), /not canonical/);
   assert.throws(() => validateSignerConfig({ ...CONFIG, policy: { ...CONFIG.policy, cronosRouteId: `0x${"66".repeat(32)}` } }), /not canonical/);
   assert.throws(() => validateSignerConfig({ ...CONFIG, xitcoin: { ...CONFIG.xitcoin, chainId: "wrong" } }), /not canonical/);
+  const { journalPath: omitted, ...withoutJournal } = CONFIG;
+  assert.equal(omitted, config.journalPath);
+  assert.throws(() => validateSignerConfig(withoutJournal), /journal path is required/);
+  assert.throws(() => validateSignerConfig({ ...CONFIG, journalPath: "approvals.sqlite" }), /journal path must be absolute/);
 });
 
 test("loads only a root-owned non-writable regular config without following links", async () => {
@@ -80,6 +85,7 @@ test("composes both independent watchers and starts only after credentials load"
     makeXitcoinWatcher: (options) => ({ kind: "xitcoin", ...options }),
     makeVerifier: (watchers) => { calls.push(["verifier", watchers]); return async () => ({ canonical: true, finalized: true }); },
     makeService: async (options) => { calls.push(["service", options]); return { approve: async () => ({}) }; },
+    makeJournal: (path) => { calls.push(["journal", path]); return { plan() {}, record() {}, path }; },
     makeHandler: async (options) => { calls.push(["handler", options]); return async () => {}; },
     startServer: async (options) => { calls.push(["server", options]); return fakeServer; },
   });
@@ -91,4 +97,7 @@ test("composes both independent watchers and starts only after credentials load"
   assert.equal(calls.find(([name]) => name === "handler")[1].transportCredentialPath, "/run/credentials/xitcoin-bridge-signer-1.service/transport-token");
   assert.deepEqual(calls.find(([name]) => name === "server")[1].host, "127.0.0.1");
   assert.equal(calls.find(([name]) => name === "verifier")[1].cronosWatcher.routeId, CONFIG.policy.cronosRouteId);
+  assert.equal(calls.find(([name]) => name === "journal")[1], CONFIG.journalPath);
+  assert.equal(calls.find(([name]) => name === "service")[1].journal.path, CONFIG.journalPath);
+  assert.deepEqual([...calls.find(([name]) => name === "service")[1].policy.destinations], ["xitcoin-testnet-v2-1"]);
 });

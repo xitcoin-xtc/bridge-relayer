@@ -1,7 +1,12 @@
 import { FinalityViolation } from "./watchers.js";
-import { collectApprovalQuorum } from "./approvals.js";
-import { buildApprovalRequest } from "./approvals.js";
-import { DIRECTION_INBOUND, DIRECTION_OUTBOUND, normalizeBytes32, validateRouteId } from "./protocol.js";
+import {
+  APPROVAL_REISSUE_GRACE_SECONDS,
+  approvalContentHash,
+  approvalSourceKey,
+  buildApprovalRequest,
+  collectApprovalQuorum,
+} from "./approvals.js";
+import { DIRECTION_INBOUND, DIRECTION_OUTBOUND, normalizeBytes32, validateChainId, validateRouteId } from "./protocol.js";
 export { submitApprovedTransfer } from "./submission.js";
 
 function height(value, label) {
@@ -47,6 +52,7 @@ export function buildTransferApprovalRequest({
   cronosRouteId,
   cronosChainId,
   cronosVault,
+  xitcoinChainId,
   signerSetVersion = 1,
   deadlineUnix,
 }) {
@@ -62,6 +68,7 @@ export function buildTransferApprovalRequest({
     const sourceRef = normalizeBytes32(payload.depositId);
     if (sourceRef !== storedSourceRef(transfer.source_ref)) throw new Error("Cronos source reference mismatch");
     return buildApprovalRequest({ direction: DIRECTION_INBOUND, payload: {
+      destinationChainId: validateChainId(xitcoinChainId),
       routeId: canonicalRouteId,
       sourceChainId: String(chainId),
       sourceRef,
@@ -120,6 +127,25 @@ export async function approveFinalizedTransfer({
   return { transfer: approved, approvals: store.approvals(sourceChain, sourceRef), idempotent: false };
 }
 
+// Returns the request to use for a finalized transfer this cycle, or null
+// when its persisted request expired less than the re-issue grace ago. An
+// expired request is re-issued with a new deadline for the same source event
+// (same source key and content); it is never reused after expiry and never
+// replaced while still valid.
+export function currentApprovalRequest({ store, transfer, build, nowUnix, windowSeconds,
+  graceSeconds = APPROVAL_REISSUE_GRACE_SECONDS }) {
+  const persisted = store.approvalRequest(transfer.source_chain, transfer.source_ref);
+  if (!persisted) return build(nowUnix + windowSeconds);
+  if (persisted.deadlineUnix >= nowUnix) return persisted;
+  if (persisted.deadlineUnix + graceSeconds >= nowUnix) return null;
+  const next = build(nowUnix + windowSeconds);
+  if (approvalSourceKey(next) !== approvalSourceKey(persisted)
+      || approvalContentHash(next) !== approvalContentHash(persisted)) {
+    throw new Error("re-issued approval request does not match the persisted source event");
+  }
+  return store.reissueApprovalRequest(transfer.source_chain, transfer.source_ref, persisted, next, { nowUnix });
+}
+
 export async function scanFinalizedBatch({ watcher, store, sourceChain, startHeight = 1, maxBatch = 100 }) {
   if (!watcher || !store || !sourceChain) throw new Error("watcher, store and source chain are required");
   const first = height(startHeight, "start height");
@@ -155,6 +181,7 @@ export async function runApprovalOnlyCycle({
   cronosRouteId,
   cronosChainId,
   cronosVault,
+  xitcoinChainId,
   signerSetVersion = 1,
   approvalWindowSeconds = 300,
   nowUnix = Math.floor(Date.now() / 1000),
@@ -175,16 +202,15 @@ export async function runApprovalOnlyCycle({
   };
   const finalized = store.pending().filter((transfer) => transfer.state === "finalized").slice(0, limit);
   const results = [];
+  let waiting = 0;
   for (const transfer of finalized) {
-    const request = store.approvalRequest(transfer.source_chain, transfer.source_ref) ?? buildTransferApprovalRequest({
-      transfer,
-      routeId,
-      cronosRouteId,
-      cronosChainId,
-      cronosVault,
-      signerSetVersion,
-      deadlineUnix: now + window,
+    const request = currentApprovalRequest({
+      store, transfer, nowUnix: now, windowSeconds: window,
+      build: (deadlineUnix) => buildTransferApprovalRequest({
+        transfer, routeId, cronosRouteId, cronosChainId, cronosVault, xitcoinChainId, signerSetVersion, deadlineUnix,
+      }),
     });
+    if (request === null) { waiting += 1; continue; }
     results.push(await approveFinalizedTransfer({
       store,
       sourceChain: transfer.source_chain,
@@ -201,6 +227,7 @@ export async function runApprovalOnlyCycle({
     scans: Object.freeze(scans),
     finalized: finalized.length,
     approved: results.length,
+    awaitingReissue: waiting,
     submissions: 0,
   });
 }

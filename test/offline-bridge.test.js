@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -15,6 +15,17 @@ async function start(file) {
     async close() { child.stdin.end(); await new Promise(resolve => child.once('exit', resolve)); assert.equal(child.exitCode, 0, stderr); },
   };
 }
+
+test('offline process: attestation digest and replay key match the pos-chain cross-check vectors', { timeout: 30000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'xitcoin-bridge-vector-'));
+  const worker = await start(join(dir, 'synthetic-state.json'));
+  try {
+    const expected = JSON.parse(await readFile(new URL('./fixtures/attestation-cross-check.json', import.meta.url), 'utf8'));
+    const response = await worker.call({ op: 'vector' });
+    assert.equal(response.ok, true, response.error);
+    assert.deepEqual(response.result, expected.vectors);
+  } finally { await worker.close(); await rm(dir, { recursive: true, force: true }); }
+});
 
 test('offline process: deposit, finality, quorum, mint, burn, return and persisted replay protection', { timeout: 30000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'xitcoin-bridge-offline-'));
@@ -38,8 +49,12 @@ test('offline process: deposit, finality, quorum, mint, burn, return and persist
     }
     await worker.close(); worker = await start(join(dir, 'synthetic-state.json'));
     assert.equal((await ok({ op: 'status' })).locked, '10');
-    await ok({ op: 'mint', ref: deposit.ref });
+    const minted = await ok({ op: 'mint', ref: deposit.ref });
     await reject({ op: 'mint', ref: deposit.ref }, /replay/);
+    // Audit finding 1: a second attestation for the same deposit with another
+    // deadline has the same replay key and cannot mint again.
+    await reject({ op: 'mint', ref: deposit.ref, deadline: 2500, now: 2300 }, /replay/);
+    assert.match(minted.key, /^0x[0-9a-f]{64}$/);
     await ok({ op: 'pause' }); await reject({ op: 'burn' }, /pause/); await ok({ op: 'resume' });
     const burn = await ok({ op: 'burn' });
     await reject({ op: 'release', ref: burn.ref, signers: [0] }, /insufficient/);
@@ -49,5 +64,18 @@ test('offline process: deposit, finality, quorum, mint, burn, return and persist
     await reject({ op: 'release', ref: burn.ref }, /replay/);
     const final = await ok({ op: 'status' });
     assert.equal(final.locked, '0'); assert.equal(final.minted, '0'); assert.equal(final.returned, '10');
+
+    // Expired approval re-issue (audit finding 5) with durable signer journals.
+    const second = await ok({ op: 'deposit', amount: '5' });
+    const first = await ok({ op: 'approve', ref: second.ref, deadline: 2000, now: 1000 });
+    await worker.close(); worker = await start(join(dir, 'synthetic-state.json'));
+    await reject({ op: 'mint', ref: second.ref, deadline: 2000, now: 2100 }, /expired/);
+    // Inside the re-issue grace window the signers still refuse a new deadline.
+    await reject({ op: 'mint', ref: second.ref, deadline: 2600, now: 2100 }, /unexpired approval|quorum not reached/);
+    const reissued = await ok({ op: 'mint', ref: second.ref, deadline: 2600, now: 2200 });
+    assert.equal(reissued.key, first.key);
+    assert.notEqual(reissued.digest, first.digest);
+    await reject({ op: 'mint', ref: second.ref, deadline: 2700, now: 2300 }, /replay/);
+    assert.equal((await ok({ op: 'status' })).minted, '5');
   } finally { await worker.close(); await rm(dir, { recursive: true, force: true }); }
 });

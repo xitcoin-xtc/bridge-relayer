@@ -20,6 +20,20 @@ The vault ABI is checked against
 [`contracts` at d3ae7058d4c6697a9ec079864e1891b661de5b3e](https://github.com/xitcoin-org/contracts/blob/d3ae7058d4c6697a9ec079864e1891b661de5b3e/contracts/cronos/bridge/CronosBridgeVault.sol).
 Source availability does not prove the identity or state of a deployed contract.
 
+The `AttestationStatus` query takes the attestation ID, which since attestation
+protocol v2 is the source-deposit replay key (see [PROTOCOL.md](PROTOCOL.md));
+`processed: true` therefore means "this deposit has been minted", whichever
+approval minted it.
+
+## Reconciliation readers (interfaces only)
+
+`src/reconciler.js` defines `ReconciliationSource` with three read-only methods
+(`vaultLocked`, `chainOutstanding`, `inFlight`). Only `inFlight` has an
+implementation (`inFlightFromStore`). The two chain readers are not
+implemented: they must read the vault's asset balance and the bridge store key
+`0x07` at finalized heights from independent providers, and must never hold a
+key or send a transaction. See [OPERATIONS.md](OPERATIONS.md#reconciliation).
+
 ## Independent durable component
 
 `BroadcastIntentJournal` reserves a transfer ID, approval digest and exact

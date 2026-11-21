@@ -4,6 +4,7 @@ import test from "node:test";
 
 import { SigningKey, computeAddress } from "ethers";
 
+import { SignerApprovalJournal } from "../src/signer-journal.js";
 import { createSignerPolicy } from "../src/signer-service.js";
 import { createSecureSignerHandler, createSecureSignerService, startLoopbackSignerServer } from "../src/signer-runtime.js";
 
@@ -15,6 +16,7 @@ function policy() {
   return createSignerPolicy({
     routeIds: ["cronos-xitcoin-xtc-v1"],
     cronosChainIds: [338],
+    xitcoinChainIds: ["xitcoin-testnet-v2-1"],
     cronosVaults: [VAULT],
     maximumAmount: "1000",
   });
@@ -28,6 +30,7 @@ test("composes an isolated service from the secure key loader", async () => {
     keystorePath: "/state/keystore.json",
     keystoreCredentialPath: "/run/credentials/keystore-password",
     policy: policy(),
+    journal: new SignerApprovalJournal(),
     verifySource: async () => ({ canonical: true, finalized: true }),
     loadSigner: async (options) => {
       loaded = options;

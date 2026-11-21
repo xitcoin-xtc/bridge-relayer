@@ -16,7 +16,7 @@ const TX_HASH = `0x${"bb".repeat(32)}`;
 const KEYS = ["01", "02", "03"].map((value) => new SigningKey(`0x${value.padStart(64, "0")}`));
 const ADDRESSES = KEYS.map((key) => computeAddress(key.publicKey));
 const REQUEST = buildApprovalRequest({ direction: DIRECTION_INBOUND, payload: {
-  routeId: "cronos-xitcoin-xtc-v1", sourceChainId: "25", sourceRef: SOURCE_REF, nonce: "7",
+  destinationChainId: "xitcoin", routeId: "cronos-xitcoin-xtc-v1", sourceChainId: "25", sourceRef: SOURCE_REF, nonce: "7",
   destination: "xtc1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg32rdvg9", amount: "10", deadlineUnix: 2_000_000_000,
 } });
 
