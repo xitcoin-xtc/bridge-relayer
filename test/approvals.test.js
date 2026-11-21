@@ -16,7 +16,7 @@ function signer() {
 
 function inbound(deadlineUnix = 2_000_000_000) {
   return buildApprovalRequest({ direction: DIRECTION_INBOUND, payload: {
-    routeId: "cronos-xitcoin-xtc-v1", sourceChainId: "25", sourceRef: `0x${"aa".repeat(32)}`,
+    destinationChainId: "xitcoin", routeId: "cronos-xitcoin-xtc-v1", sourceChainId: "25", sourceRef: `0x${"aa".repeat(32)}`,
     nonce: "7", destination: "xtc1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg32rdvg9",
     amount: "1000000000000000000", deadlineUnix,
   } });
@@ -80,4 +80,41 @@ test("remote signer transport requires safe URLs and bounded JSON", async () => 
   assert.deepEqual(await client.approve(inbound()), {});
   assert.equal(observedAuthorization, `Bearer ${"a".repeat(32)}`);
   assert.throws(() => new RemoteSignerClient({ url: "https://signer.example", identity: "one" }), /authentication/);
+});
+
+test("one malformed or unauthorized response does not sink a round that still reaches the threshold", async () => {
+  const signers = [signer(), signer(), signer()];
+  const outsider = signer();
+  const request = inbound();
+  const authorizedSigners = signers.map((item) => item.address);
+  const malformed = [
+    async () => ({ digest: request.digest, signature: "0x1234" }),
+    async () => "not an object",
+    async (value) => outsider.approve(value),
+    async (value) => ({ ...signers[2].approve(value), digest: `0x${"00".repeat(32)}` }),
+    async () => { throw new Error("offline"); },
+  ];
+  for (const bad of malformed) {
+    const clients = [
+      { identity: "signer-1", async approve(value) { return signers[0].approve(value); } },
+      { identity: "signer-2", async approve(value) { return signers[1].approve(value); } },
+      { identity: "signer-3", approve: bad },
+    ];
+    const approvals = await collectApprovalQuorum({ clients, request, authorizedSigners, nowUnix: 1_900_000_000 });
+    assert.equal(approvals.length, 2);
+  }
+  const twoBad = [
+    { identity: "signer-1", async approve(value) { return signers[0].approve(value); } },
+    { identity: "signer-2", async approve() { return {}; } },
+    { identity: "signer-3", async approve(value) { return outsider.approve(value); } },
+  ];
+  await assert.rejects(() => collectApprovalQuorum({ clients: twoBad, request, authorizedSigners, nowUnix: 1_900_000_000 }), /quorum not reached \(1 of 2 valid/);
+});
+
+test("inbound approvals bind the destination Xitcoin chain ID", () => {
+  const mainnet = inbound();
+  const testnet = buildApprovalRequest({ direction: DIRECTION_INBOUND, payload: { ...mainnet.payload, destinationChainId: "xitcoin-testnet-v2-1" } });
+  assert.notEqual(mainnet.digest, testnet.digest);
+  assert.throws(() => buildApprovalRequest({ direction: DIRECTION_INBOUND, payload: { ...mainnet.payload, destinationChainId: undefined } }), /chain ID/);
+  assert.throws(() => buildApprovalRequest({ direction: DIRECTION_INBOUND, payload: { ...mainnet.payload, sourceChainId: "cronos" } }), /source chain ID/);
 });

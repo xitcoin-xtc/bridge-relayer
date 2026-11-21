@@ -1,5 +1,6 @@
 import { signerTransportError, sanitizeSignerTransportError } from "./signer-transport-error.js";
 import { readBoundedText, withDeadline } from "./bounded-response.js";
+import { createHash } from "node:crypto";
 import {
   getAddress,
   isHexString,
@@ -10,10 +11,19 @@ import {
   DIRECTION_INBOUND,
   DIRECTION_OUTBOUND,
   attestationDigest,
+  normalizeBytes32,
   releaseDigest,
+  sourceDepositKey,
+  validateChainId,
+  validateEvmChainId,
+  validateRouteId,
 } from "./protocol.js";
 
 export const APPROVAL_PROTOCOL_VERSION = 1;
+// An expired approval request is re-issued (new deadline, same source event)
+// only this long after its deadline, so destination block time that lags the
+// relayer clock cannot still accept the previous approval.
+export const APPROVAL_REISSUE_GRACE_SECONDS = 120;
 
 function positiveInteger(value, label, minimum = 1) {
   const number = Number(value);
@@ -58,6 +68,53 @@ export function buildApprovalRequest({ direction, payload }) {
     deadlineUnix: deadlineOf(direction, payload),
     payload: structuredClone(payload),
   });
+}
+
+function sha256Hex(fields) {
+  return `0x${createHash("sha256").update(fields.join("\0"), "utf8").digest("hex")}`;
+}
+
+// Identity of the source event an approval spends. Inbound: the chain's
+// source-deposit replay key. Outbound: the vault's replay key (sourceBurnId)
+// scoped to the Cronos chain and vault. Deadlines never change it.
+export function approvalSourceKey(request) {
+  const { direction, payload } = buildApprovalRequest(request);
+  if (direction === DIRECTION_INBOUND) return sourceDepositKey(payload);
+  return sha256Hex([
+    "xitcoin-bridge-release-source-v1",
+    validateEvmChainId(String(payload.chainId)),
+    getAddress(payload.vault).toLowerCase(),
+    normalizeBytes32(payload.sourceBurnId),
+  ]);
+}
+
+// Commitment to everything an approval authorizes except the fields that a
+// safe re-issue may change: the deadline (both directions) and, for releases,
+// the vault signer-set version (a rotation invalidates older signatures on
+// the vault). Two requests for one source event with different content hashes
+// are conflicting and must never both be signed.
+export function approvalContentHash(request) {
+  const { direction, payload } = buildApprovalRequest(request);
+  if (direction === DIRECTION_INBOUND) {
+    return sha256Hex([
+      direction,
+      validateChainId(payload.destinationChainId),
+      validateRouteId(payload.routeId),
+      validateEvmChainId(payload.sourceChainId),
+      normalizeBytes32(payload.sourceRef),
+      String(payload.nonce),
+      String(payload.destination).trim(),
+      String(payload.amount),
+    ]);
+  }
+  return sha256Hex([
+    direction,
+    validateEvmChainId(String(payload.chainId)),
+    getAddress(payload.vault).toLowerCase(),
+    normalizeBytes32(payload.sourceBurnId),
+    getAddress(payload.recipient).toLowerCase(),
+    String(payload.amount),
+  ]);
 }
 
 export function verifyApproval({ request, response, authorizedSigners, nowUnix = Math.floor(Date.now() / 1000) }) {
@@ -111,21 +168,28 @@ export async function collectApprovalQuorum({
     throw new Error("approval request has expired");
   }
   const responses = await Promise.allSettled(clients.map((client) => client.approve(expected)));
-  const approvals = responses
-    .filter((response) => response.status === "fulfilled")
-    .map((response) => verifyApproval({
-      request: expected,
-      response: response.value,
-      authorizedSigners: allowed,
-      nowUnix,
-    }));
+  // One unavailable, malformed, unauthorized or duplicate response must not
+  // sink the round: each response is verified on its own and only distinct
+  // valid signers count toward the threshold.
   const unique = new Map();
-  for (const approval of approvals) {
+  const rejected = [];
+  for (const response of responses) {
+    if (response.status !== "fulfilled") { rejected.push("signer unavailable"); continue; }
+    let approval;
+    try {
+      approval = verifyApproval({ request: expected, response: response.value, authorizedSigners: allowed, nowUnix });
+    } catch (error) {
+      rejected.push(String(error?.message ?? "invalid approval").slice(0, 120));
+      continue;
+    }
     const key = approval.signer.toLowerCase();
-    if (unique.has(key)) throw new Error("duplicate signer approval");
+    if (unique.has(key)) { rejected.push("duplicate signer approval"); continue; }
     unique.set(key, approval);
   }
-  if (unique.size < required) throw new Error("approval quorum not reached");
+  if (unique.size < required) {
+    const reasons = [...new Set(rejected)].join("; ");
+    throw new Error(`approval quorum not reached (${unique.size} of ${required} valid${reasons ? `; rejected: ${reasons}` : ""})`);
+  }
   return [...unique.values()]
     .sort((left, right) => left.signer.toLowerCase().localeCompare(right.signer.toLowerCase()))
     .slice(0, required);

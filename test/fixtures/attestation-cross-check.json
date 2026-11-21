@@ -1,0 +1,28 @@
+{
+  "provenance": "Shared with pos-chain x/bridge/types/remediation_test.go (crossCheckVectors). Both implementations must produce these exact values.",
+  "attestation": {
+    "routeId": "cronos-testnet-xitcoin-testnet",
+    "direction": "cronos_to_xitcoin",
+    "sourceRef": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "nonce": "7",
+    "destination": "xtc1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg32rdvg9",
+    "amount": "1000000000000000000",
+    "deadlineUnix": "1800000000"
+  },
+  "vectors": [
+    {
+      "chainId": "xitcoin-testnet-v2-1",
+      "sourceChainId": "338",
+      "id": "0x60e1081b4354c658cfe771da1042e6122798577367f118f0cc589b081a535566",
+      "payloadHash": "0x9eeac63a8ad1fe3b14f939b15cd13dd703bc4634b735defe5fb2725e64098bef",
+      "digest": "0x0fc85111099dd06f0456377e4800671e35d9cd994f22f43f151c69fbe163269a"
+    },
+    {
+      "chainId": "xitcoin",
+      "sourceChainId": "25",
+      "id": "0xb179741ff999179919b2a553db338af2281def1f3a70f990cd0440d91200c2c0",
+      "payloadHash": "0x658de8cb0f7210e77fb416e513c5c1b91a409a8f1e27ee3f709f4d1901a244a6",
+      "digest": "0x95438a631fe0d6dd3440055d89c0e8abdf042ed80999d6c2ce48bd2ec518f30f"
+    }
+  ]
+}

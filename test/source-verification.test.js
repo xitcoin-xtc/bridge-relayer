@@ -43,7 +43,7 @@ test("independently verifies an exact finalized Cronos deposit before signing", 
   const cronosWatcher = watcher(record);
   const verify = createCanonicalSourceVerifier({ cronosWatcher, xitcoinWatcher: watcher({}), cronosRouteId: expectedCronosRouteId });
   const request = buildApprovalRequest({ direction: DIRECTION_INBOUND, payload: {
-    routeId, sourceChainId: "338", sourceRef, nonce: "7", destination, amount: "500",
+    destinationChainId: "xitcoin-testnet-v2-1", routeId, sourceChainId: "338", sourceRef, nonce: "7", destination, amount: "500",
     deadlineUnix: 1_900_000_300, sourceEvidence: sourceEvidence(),
   } });
   const result = await verify(request);
@@ -59,7 +59,7 @@ test("rejects substituted Cronos evidence before invoking canonical verification
   const cronosWatcher = watcher(record);
   const verify = createCanonicalSourceVerifier({ cronosWatcher, xitcoinWatcher: watcher({}), cronosRouteId: expectedCronosRouteId });
   const request = buildApprovalRequest({ direction: DIRECTION_INBOUND, payload: {
-    routeId, sourceChainId: "338", sourceRef, nonce: "7", destination, amount: "501",
+    destinationChainId: "xitcoin-testnet-v2-1", routeId, sourceChainId: "338", sourceRef, nonce: "7", destination, amount: "501",
     deadlineUnix: 1_900_000_300, sourceEvidence: sourceEvidence(),
   } });
   await assert.rejects(() => verify(request), /does not match/);

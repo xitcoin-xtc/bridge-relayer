@@ -1,8 +1,8 @@
 import { Buffer } from "node:buffer";
 import { getAddress, isHexString, recoverAddress, Signature } from "ethers";
 
-import { buildApprovalRequest } from "./approvals.js";
-import { DIRECTION_INBOUND, DIRECTION_OUTBOUND, validateRouteId } from "./protocol.js";
+import { approvalContentHash, approvalSourceKey, buildApprovalRequest } from "./approvals.js";
+import { DIRECTION_INBOUND, DIRECTION_OUTBOUND, validateChainId, validateRouteId } from "./protocol.js";
 
 function positiveInteger(value, label, minimum = 1) {
   const number = Number(value);
@@ -23,14 +23,15 @@ function allowedSet(values, normalize, label) {
   return new Set(values.map(normalize));
 }
 
-export function createSignerPolicy({ routeIds, cronosChainIds = [25], cronosVaults, maximumAmount, maximumDeadlineSeconds = 900 }) {
+export function createSignerPolicy({ routeIds, cronosChainIds = [25], xitcoinChainIds, cronosVaults, maximumAmount, maximumDeadlineSeconds = 900 }) {
   const routes = allowedSet(routeIds, validateRouteId, "allowed route IDs");
   const chains = allowedSet(cronosChainIds, (value) => positiveInteger(value, "Cronos chain ID"), "Cronos chain IDs");
+  const destinations = allowedSet(xitcoinChainIds, validateChainId, "Xitcoin chain IDs");
   const vaults = allowedSet(cronosVaults, (value) => getAddress(value).toLowerCase(), "Cronos vaults");
   const amountLimit = BigInt(exactString(maximumAmount, "maximum amount"));
   if (amountLimit < 1n) throw new Error("maximum amount must be positive");
   const deadlineWindow = positiveInteger(maximumDeadlineSeconds, "maximum deadline window");
-  return Object.freeze({ routes, chains, vaults, amountLimit, deadlineWindow });
+  return Object.freeze({ routes, chains, destinations, vaults, amountLimit, deadlineWindow });
 }
 
 export function authorizeSignerRequest({ request, policy, nowUnix = Math.floor(Date.now() / 1000) }) {
@@ -44,6 +45,7 @@ export function authorizeSignerRequest({ request, policy, nowUnix = Math.floor(D
   if (canonical.direction === DIRECTION_INBOUND) {
     if (!policy.routes.has(validateRouteId(canonical.payload.routeId))) throw new Error("route is not authorized");
     if (!policy.chains.has(positiveInteger(canonical.payload.sourceChainId, "source chain ID"))) throw new Error("source chain is not authorized");
+    if (!policy.destinations.has(validateChainId(canonical.payload.destinationChainId))) throw new Error("destination chain is not authorized");
   } else if (canonical.direction === DIRECTION_OUTBOUND) {
     if (!policy.routes.has(validateRouteId(canonical.payload.routeId))) throw new Error("route is not authorized");
     if (!policy.chains.has(positiveInteger(canonical.payload.chainId, "destination chain ID"))) throw new Error("destination chain is not authorized");
@@ -55,12 +57,19 @@ export function authorizeSignerRequest({ request, policy, nowUnix = Math.floor(D
 }
 
 export class IsolatedSignerService {
-  constructor({ identity, signerAddress, policy, verifySource, signDigest }) {
+  // journal: a SignerApprovalJournal (signer-journal.js). It is mandatory: a
+  // signer that keeps no record of what it signed can be asked to sign two
+  // different requests for one source event.
+  constructor({ identity, signerAddress, policy, verifySource, signDigest, journal }) {
     this.identity = exactString(identity, "signer identity");
     this.signerAddress = getAddress(signerAddress);
     if (!policy) throw new Error("signer policy is required");
     if (typeof verifySource !== "function") throw new Error("source verifier is required");
     if (typeof signDigest !== "function") throw new Error("external digest signer is required");
+    if (!journal || typeof journal.plan !== "function" || typeof journal.record !== "function") {
+      throw new Error("durable signer approval journal is required");
+    }
+    this.journal = journal;
     this.policy = policy;
     this.verifySource = verifySource;
     this.signDigest = signDigest;
@@ -68,6 +77,12 @@ export class IsolatedSignerService {
 
   async approve(request, { nowUnix = Math.floor(Date.now() / 1000) } = {}) {
     const canonical = authorizeSignerRequest({ request, policy: this.policy, nowUnix });
+    const sourceKey = approvalSourceKey(canonical);
+    const contentHash = approvalContentHash(canonical);
+    const plan = this.journal.plan({ sourceKey, contentHash, digest: canonical.digest, nowUnix });
+    if (plan.action === "reuse") {
+      return Object.freeze({ signer: this.signerAddress, digest: canonical.digest, signature: plan.signature });
+    }
     const verification = await this.verifySource(canonical);
     if (!verification || verification.canonical !== true || verification.finalized !== true) {
       throw new Error("source transfer is not canonical and finalized");
@@ -81,6 +96,11 @@ export class IsolatedSignerService {
     if (getAddress(recoverAddress(canonical.digest, signature)) !== this.signerAddress) {
       throw new Error("external signer returned a signature for the wrong account");
     }
+    // Persist before release; a failed conditional write discards the signature.
+    this.journal.record({
+      sourceKey, direction: canonical.direction, contentHash, digest: canonical.digest,
+      deadline: canonical.deadlineUnix, signature, nowUnix, reissueOf: plan.reissueOf,
+    });
     return Object.freeze({ signer: this.signerAddress, digest: canonical.digest, signature });
   }
 }

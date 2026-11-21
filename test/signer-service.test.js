@@ -5,6 +5,7 @@ import { SigningKey, computeAddress } from "ethers";
 
 import { buildApprovalRequest } from "../src/approvals.js";
 import { DIRECTION_INBOUND, DIRECTION_OUTBOUND } from "../src/protocol.js";
+import { SignerApprovalJournal } from "../src/signer-journal.js";
 import { IsolatedSignerService, authorizeSignerRequest, createSignerHttpHandler, createSignerPolicy } from "../src/signer-service.js";
 
 const KEY = new SigningKey(`0x${"11".repeat(32)}`);
@@ -12,7 +13,7 @@ const ADDRESS = computeAddress(KEY.publicKey);
 const VAULT = "0x1111111111111111111111111111111111111111";
 
 function inbound(overrides = {}) {
-  return buildApprovalRequest({ direction: DIRECTION_INBOUND, payload: { routeId: "cronos-xitcoin-xtc-v1", sourceChainId: "25", sourceRef: `0x${"aa".repeat(32)}`, nonce: "7", destination: "xtc1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg32rdvg9", amount: "1000000000000000000", deadlineUnix: 1_900_000_300, ...overrides } });
+  return buildApprovalRequest({ direction: DIRECTION_INBOUND, payload: { destinationChainId: "xitcoin", routeId: "cronos-xitcoin-xtc-v1", sourceChainId: "25", sourceRef: `0x${"aa".repeat(32)}`, nonce: "7", destination: "xtc1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg32rdvg9", amount: "1000000000000000000", deadlineUnix: 1_900_000_300, ...overrides } });
 }
 
 function outbound(overrides = {}) {
@@ -20,7 +21,7 @@ function outbound(overrides = {}) {
 }
 
 function policy() {
-  return createSignerPolicy({ routeIds: ["cronos-xitcoin-xtc-v1"], cronosChainIds: [25], cronosVaults: [VAULT], maximumAmount: "2000000000000000000", maximumDeadlineSeconds: 600 });
+  return createSignerPolicy({ routeIds: ["cronos-xitcoin-xtc-v1"], cronosChainIds: [25], xitcoinChainIds: ["xitcoin"], cronosVaults: [VAULT], maximumAmount: "2000000000000000000", maximumDeadlineSeconds: 600 });
 }
 
 test("authorizes only the pinned route, chain, vault, amount and deadline", () => {
@@ -31,20 +32,22 @@ test("authorizes only the pinned route, chain, vault, amount and deadline", () =
   assert.throws(() => authorizeSignerRequest({ request: outbound({ vault: "0x3333333333333333333333333333333333333333" }), policy: policy(), nowUnix: 1_900_000_000 }), /vault/);
   assert.throws(() => authorizeSignerRequest({ request: outbound({ routeId: "other-route" }), policy: policy(), nowUnix: 1_900_000_000 }), /route/);
   assert.throws(() => authorizeSignerRequest({ request: inbound({ deadlineUnix: 1_900_001_000 }), policy: policy(), nowUnix: 1_900_000_000 }), /deadline/);
+  assert.throws(() => authorizeSignerRequest({ request: inbound({ destinationChainId: "xitcoin-testnet-v2-1" }), policy: policy(), nowUnix: 1_900_000_000 }), /destination chain/);
+  assert.throws(() => createSignerPolicy({ routeIds: ["cronos-xitcoin-xtc-v1"], cronosVaults: [VAULT], maximumAmount: "1" }), /Xitcoin chain IDs/);
 });
 
 test("signs only after independent canonical finality verification", async () => {
-  const service = new IsolatedSignerService({ identity: "signer-one", signerAddress: ADDRESS, policy: policy(), verifySource: async (request) => ({ canonical: true, finalized: true, digest: request.digest }), signDigest: async (digest) => KEY.sign(digest).serialized });
+  const service = new IsolatedSignerService({ identity: "signer-one", signerAddress: ADDRESS, policy: policy(), verifySource: async (request) => ({ canonical: true, finalized: true, digest: request.digest }), signDigest: async (digest) => KEY.sign(digest).serialized, journal: new SignerApprovalJournal() });
   const approval = await service.approve(inbound(), { nowUnix: 1_900_000_000 });
   assert.equal(approval.signer, ADDRESS);
   assert.equal(approval.digest, inbound().digest);
-  const unsafe = new IsolatedSignerService({ identity: "signer-two", signerAddress: ADDRESS, policy: policy(), verifySource: async () => ({ canonical: true, finalized: false }), signDigest: async (digest) => KEY.sign(digest).serialized });
+  const unsafe = new IsolatedSignerService({ identity: "signer-two", signerAddress: ADDRESS, policy: policy(), verifySource: async () => ({ canonical: true, finalized: false }), signDigest: async (digest) => KEY.sign(digest).serialized, journal: new SignerApprovalJournal() });
   await assert.rejects(() => unsafe.approve(inbound(), { nowUnix: 1_900_000_000 }), /canonical and finalized/);
 });
 
 test("rejects a signature from an account other than the configured signer", async () => {
   const wrong = new SigningKey(`0x${"22".repeat(32)}`);
-  const service = new IsolatedSignerService({ identity: "signer-one", signerAddress: ADDRESS, policy: policy(), verifySource: async () => ({ canonical: true, finalized: true }), signDigest: async (digest) => wrong.sign(digest).serialized });
+  const service = new IsolatedSignerService({ identity: "signer-one", signerAddress: ADDRESS, policy: policy(), verifySource: async () => ({ canonical: true, finalized: true }), signDigest: async (digest) => wrong.sign(digest).serialized, journal: new SignerApprovalJournal() });
   await assert.rejects(() => service.approve(inbound(), { nowUnix: 1_900_000_000 }), /wrong account/);
 });
 

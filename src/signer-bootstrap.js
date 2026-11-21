@@ -10,6 +10,7 @@ import {
   decodeXitcoinOutboundBlock,
   decodeXitcoinOutboundTransaction,
 } from "./network.js";
+import { SignerApprovalJournal } from "./signer-journal.js";
 import { createSignerPolicy } from "./signer-service.js";
 import { createSecureSignerHandler, createSecureSignerService, startLoopbackSignerServer } from "./signer-runtime.js";
 import { createCanonicalSourceVerifier } from "./source-verification.js";
@@ -52,7 +53,7 @@ function absolute(value, label) {
 }
 
 export function validateSignerConfig(input) {
-  const config = keys(object(input, "signer config"), ["version", "identity", "expectedAddress", "keystorePath", "listen", "policy", "cronos", "xitcoin"], "signer config");
+  const config = keys(object(input, "signer config"), ["version", "identity", "expectedAddress", "keystorePath", "journalPath", "listen", "policy", "cronos", "xitcoin"], "signer config");
   if (config.version !== 1) throw new Error("signer config version is unsupported");
   const listen = keys(object(config.listen, "listener"), ["host", "port"], "listener");
   const policy = keys(object(config.policy, "policy"), ["routeId", "cronosRouteId", "cronosChainId", "cronosVault", "maximumAmount", "maximumDeadlineSeconds"], "policy");
@@ -71,6 +72,7 @@ export function validateSignerConfig(input) {
     identity,
     expectedAddress: text(config.expectedAddress, "expected signer address"),
     keystorePath: absolute(config.keystorePath, "keystore path"),
+    journalPath: absolute(config.journalPath, "signer approval journal path"),
     listen: { host: text(listen.host, "listener host"), port: integer(listen.port, "listener port") },
     policy: {
       routeId,
@@ -123,6 +125,7 @@ export async function buildSignerRuntime(config, {
   makeXitcoinWatcher = (options) => new XitcoinFinalizedWatcher(options),
   makeVerifier = createCanonicalSourceVerifier,
   makeService = createSecureSignerService,
+  makeJournal = (path) => new SignerApprovalJournal(path),
   makeHandler = createSecureSignerHandler,
   startServer = startLoopbackSignerServer,
 } = {}) {
@@ -155,6 +158,7 @@ export async function buildSignerRuntime(config, {
   const policy = createSignerPolicy({
     routeIds: [manifest.policy.routeId],
     cronosChainIds: [manifest.policy.cronosChainId],
+    xitcoinChainIds: [manifest.xitcoin.chainId],
     cronosVaults: [manifest.policy.cronosVault],
     maximumAmount: manifest.policy.maximumAmount,
     maximumDeadlineSeconds: manifest.policy.maximumDeadlineSeconds,
@@ -165,6 +169,7 @@ export async function buildSignerRuntime(config, {
     keystorePath: manifest.keystorePath,
     keystoreCredentialPath: join(credentialRoot, "keystore-password"),
     policy,
+    journal: makeJournal(manifest.journalPath),
     verifySource: makeVerifier({ cronosWatcher, xitcoinWatcher, cronosRouteId: manifest.policy.cronosRouteId }),
   });
   const handler = await makeHandler({ service, transportCredentialPath: join(credentialRoot, "transport-token") });
