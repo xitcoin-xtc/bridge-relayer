@@ -517,15 +517,19 @@ only our own transaction, or none), and the queue moves on.
   retention), with our nonce consumed on every origin, is recorded
   `release_unverified` (`receipt_history_unserved`); so is a revert whose
   classifying state is no longer served (`revert_history_unserved`). A
-  receipt that only some origins return is not proof on its own: every origin
-  must either refuse the claimed block (null or a JSON-RPC error) or serve that
-  block, with the receipt's block hash, containing our transaction (a pruned
-  transaction index). If any origin serves the claimed block without our
-  transaction, and after a second read no origin that lacked the receipt sees
-  our transaction, the receipt is contradicted: with our nonce used on every
-  origin the row halts `nonce_consumed_without_receipt`, exactly as when no
-  origin returns a receipt, so one origin fabricating an old receipt cannot
-  turn that key-compromise tripwire into an alert. Recent
+  receipt that only some origins return is not proof on its own: it is
+  history no longer served only when a strict majority of origins serve the
+  claimed block, with the receipt's block hash, containing our transaction (a
+  pruned transaction index). When a strict majority serve that block without
+  our transaction, or there is no strict majority either way (for example
+  origins that no longer serve the block), it fails closed: unless an origin
+  that lacked the receipt now sees our transaction (indexing lag), the row
+  halts `nonce_consumed_without_receipt` with our nonce used on every origin,
+  exactly as when no origin returns a receipt. With three or more origins no
+  single origin can force or suppress that key-compromise tripwire (it can
+  only hold it pending); with two, one origin can still force the halt, and
+  an origin that has pruned the block halts the row too. Run three or more
+  origins with the required retention. Recent
   history missing on an origin is indexing lag and transport failures stay
   temporary. Origins must retain at least the maximum expected downtime plus
   `releaseLookbackBlocks` (see [OPERATIONS.md](OPERATIONS.md#cronos-testnet-submitter)).
@@ -535,8 +539,9 @@ Recovery decisions (all from canonical observations, never from send errors):
 | Observation | Action |
 | --- | --- |
 | receipt absent on some origins, mined within the last `releaseLookbackBlocks` | wait (indexing lag) |
-| our receipt, transaction or block older than that and no longer served by some origins (null or JSON-RPC error), every origin refusing the claimed block or serving it with our transaction, nonce consumed on every origin | `release_unverified` (`receipt_history_unserved`); queue continues |
-| our receipt returned by some origins only, older than that, while an origin serves the claimed block without our transaction, nonce consumed on every origin | halt `nonce_consumed_without_receipt` |
+| our receipt older than that and returned by some origins only, a strict majority serving the claimed block with our transaction, nonce consumed on every origin | `release_unverified` (`receipt_history_unserved`); queue continues |
+| our receipt older than that and returned by some origins only, without such a majority (a majority serves the block without our transaction, or none either way), nonce consumed on every origin | halt `nonce_consumed_without_receipt` |
+| our included transaction or block older than that and no longer served by some origins (null or JSON-RPC error) while every origin returns the receipt, nonce consumed on every origin | `release_unverified` (`receipt_history_unserved`); queue continues |
 | receipts or included transactions differ between origins, or content disagrees | temporary stop (`rpc_disagreement`), retried |
 | transaction pending on any origin | wait |
 | unknown everywhere, nonce unused, not processed, not paused, attempts left | resend the identical persisted bytes (also after the deadline: they then revert and consume the nonce) |
@@ -565,8 +570,9 @@ completes a transfer or sends anything.
 
 Every persisted halt is based on evidence that every origin returns
 identically, with two exceptions where a halt is preferred to an alert: a
-mismatching `Released` event and an old receipt for our transaction that an
-origin's copy of the claimed block contradicts (both above). Otherwise a
+mismatching `Released` event, and an old receipt for our transaction that a
+strict majority of origins does not confirm in the claimed block (with two
+origins, one origin can force that halt; both above). Otherwise a
 single origin (stalling, rate limiting or lying) can only cause a temporary
 stop or a non-blocking alert, and no approval deadline can turn a provider
 fault into a queue-wide halt.
@@ -602,10 +608,13 @@ pause mined just before our transaction in its block (`reverted`,
 `vault_paused`); a governance limit change mined after our transaction in its
 block (not taken as the cause: `failed`); our own receipt or the state
 classifying our revert no longer served by one origin after downtime beyond
-the lookback, with that origin's old blocks still served or pruned too
-(`release_unverified`); one origin fabricating an old receipt for a send that
-never landed while our nonce was used elsewhere and the other origin serves
-the claimed block without it (halt `nonce_consumed_without_receipt`); a release to another recipient signed by
+the lookback, with that origin's old blocks still served (two origins) or
+pruned too (three origins) (`release_unverified`), and with two origins the
+fail-closed halt when one origin has pruned the block; one of two or of three
+origins fabricating an old receipt and block for a send that never landed
+while our nonce was used elsewhere (halt `nonce_consumed_without_receipt`);
+with three origins, one origin hiding our old transaction from its block
+(still the alert, no halt); a release to another recipient signed by
 two compromised signer keys, visible on one origin while the other no longer
 serves that range (halt); a RelayStore locked by another process (temporary stop, then
 progress); SIGKILL in a child process at every boundary (claimed, signed,

@@ -180,8 +180,8 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
   // when other origins fail or do not serve that range: only a compromised
   // signer quorum (or a lying origin, settled in the offline review) produces
   // it, and a halt is preferred to a non-blocking alert. With the receipt
-  // proof in `observe`, one of the two places where a single origin's answer
-  // persists a blocking state.
+  // proof in `observe` (with two origins only), one of the two places where a
+  // single origin's answer persists a blocking state.
   async function releaseElsewhere(request, ownHash = null, ownBlock = null) {
     const p = request.payload, burn = String(p.sourceBurnId).toLowerCase();
     const expected = VAULT.encodeEventLog(VAULT.getEvent("Released"), [p.sourceBurnId, p.recipient, p.amount, p.signerSetVersion]);
@@ -525,27 +525,31 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
         if (verdict === "visible") return { action: "pending" };
         const nonces = await accountNonces();
         if (!nonces || nonces.latest <= row.nonce) throw new RpcDisagreement();
-        // Our nonce is used and an origin serves the claimed block without our
-        // transaction: the key-compromise tripwire, exactly as when no origin
-        // returns a receipt. A fabricated receipt can never turn it into an alert.
+        // Our nonce is used and the claimed block is not shown with our
+        // transaction by a strict majority: the key-compromise tripwire, exactly
+        // as when no origin returns a receipt. One fabricated receipt can never
+        // turn it into an alert.
         if (verdict === "contradicted") return halt("nonce_consumed_without_receipt");
         return { action: "release_unverified", code: "receipt_history_unserved", ...inclusion };
       };
       const missing = (results) => results.filter((answer) => !answer.ok || answer.value === null);
-      // A receipt that only some origins return is not proof on its own: each
-      // origin must refuse the claimed block (null or a JSON-RPC error: history
-      // it no longer serves) or serve that block, with the receipt's hash, with
-      // our transaction in it (a pruned transaction index). Any origin serving
-      // the claimed block without our transaction contradicts the receipt. The
-      // origins that did not return it are then observed again: if one now
-      // sees our transaction it is indexing lag, not a contradiction.
+      // A receipt that only some origins return is not proof on its own. It is
+      // history no longer served (an alert) only when a strict majority of
+      // origins serve the claimed block, with the receipt's hash, with our
+      // transaction in it (a pruned transaction index). A strict majority
+      // serving that block without our transaction contradicts the receipt,
+      // and with no strict majority either way it fails closed the same way:
+      // the origins that did not return the receipt are observed again (if one
+      // now sees our transaction it is indexing lag), then the tripwire halt.
+      // With three or more origins no single origin can force or suppress it;
+      // with two, one origin can still force the halt.
       const receiptProof = async () => {
         const blocks = await rpc.blocksSettled(receipt.blockNumber);
         const failure = blocks.find((block) => !block.ok && !block.explicit);
         if (failure) throw failure.error;
-        const contradicted = blocks.some((block) => block.ok && block.value !== null
-          && !(block.value.hash === receipt.blockHash && block.value.transactions.includes(row.transactionHash)));
-        if (!contradicted) return "unserved";
+        const containing = blocks.filter((block) => block.ok && block.value !== null
+          && block.value.hash === receipt.blockHash && block.value.transactions.includes(row.transactionHash)).length;
+        if (containing >= rpc.majoritySize) return "unserved";
         const silent = answers.flatMap((answer, index) => (!answer.ok || answer.value === null ? [index] : []));
         const [again, seen] = await Promise.all([rpc.receiptsSettled(row.transactionHash), rpc.transactionsSettled(row.transactionHash)]);
         for (const index of silent) {

@@ -970,8 +970,8 @@ function pruneOwnHistory(proxy, oldest, { receipts = true, blocks = false, state
   };
 }
 
-for (const pruned of ["its transaction index", "its transaction index and blocks"]) {
-test(`our own receipt that an origin no longer serves after long downtime (${pruned} pruned) is a non-blocking alert, never pending forever`, options, () => scenario(async ({ chain, proxies, runtime, facts, burns, approve }) => {
+for (const [pruned, origins] of [["its transaction index", 2], ["its transaction index and blocks", 3]]) {
+test(`our own receipt that one of ${origins} origins no longer serves after long downtime (${pruned} pruned) is a non-blocking alert, never pending forever`, options, () => scenario(async ({ chain, proxies, runtime, facts, burns, approve }) => {
   const rt = await runtime();
   const sent = await rt.runOnce();
   assert.equal(sent.action, "submitted");
@@ -995,41 +995,83 @@ test(`our own receipt that an origin no longer serves after long downtime (${pru
   assert.equal(facts.relay(burns[1]).state, "completed");
   assert.ok(reports.every((report) => report.attention.releaseUnverified === 1));
   assert.equal(await facts.nonce(), 2);
-}, { burns: 2, approved: 1 }));
+}, { burns: 2, approved: 1, origins }));
 }
 
-test("one origin fabricating an old receipt for a send that never landed cannot turn a foreign use of our nonce into an alert", options, () => scenario(async ({ chain, bridge, proxies, runtime, facts, burns, approve }) => {
-  for (const proxy of proxies) proxy.hook = async ({ message, forward, response }) => {
-    if (message.method === "eth_sendRawTransaction") { response.destroy(); return undefined; }
-    return forward();
-  };
+test("with two origins, an old receipt that one origin no longer serves at all, block included, fails closed with the halt", options, () => scenario(async ({ chain, proxies, runtime, facts }) => {
   const rt = await runtime();
-  const sent = await rt.runOnce();
-  assert.equal(sent.action, "submitted"); // our bytes never reach the chain
-  for (const proxy of proxies) proxy.hook = null;
-  // Our key is used elsewhere at the reserved nonce.
-  await included(chain, await signedCall(chain, localKeys.submitter, { to: localAddress(localKeys.deployer), data: "0x", gasLimit: 21_000n, nonce: 0 }));
-  assert.equal(await facts.nonce(), 1);
-  // One origin claims our hash was mined in an old block; the honest origin still serves that block, without it.
-  const claimed = await chain.rpc("eth_getBlockByNumber", ["0x64", false]);
-  assert.ok(!claimed.transactions.includes(sent.transactionHash));
-  const fabricated = { transactionHash: sent.transactionHash, transactionIndex: "0x0", blockHash: claimed.hash, blockNumber: claimed.number,
-    from: SUBMITTER.toLowerCase(), to: bridge.vault.toLowerCase(), contractAddress: null, cumulativeGasUsed: "0x186a0", gasUsed: "0x186a0",
-    effectiveGasPrice: "0x3b9aca00", logs: [], logsBloom: `0x${"0".repeat(512)}`, status: "0x1", type: "0x0" };
-  proxies[1].hook = async ({ message, forward }) => (message.method === "eth_getTransactionReceipt" && message.params[0] === sent.transactionHash
-    ? JSON.stringify({ jsonrpc: "2.0", id: message.id, result: fabricated }) : forward());
+  assert.equal((await rt.runOnce()).action, "submitted");
+  await facts.settle();
+  await chain.rpc("anvil_mine", ["0x514"]); // downtime beyond releaseLookbackBlocks
+  pruneOwnHistory(proxies[1], Number.parseInt(await chain.rpc("eth_blockNumber"), 16) - 1_000, { blocks: true });
+  // One origin shows the block with our transaction, the other refuses it: no strict majority.
   await assert.rejects(rt.runOnce(), (error) => error instanceof SubmissionHalt && error.code === "nonce_consumed_without_receipt");
   const ledger = facts.ledger();
+  try { assert.equal(ledger.blocking()[0].reasonCode, "nonce_consumed_without_receipt"); } finally { ledger.close(); }
+}));
+
+// Rewrites the transaction list of one block in an origin's answers.
+const rewriteBlock = (number, transform) => async ({ message, forward }) => (message.method === "eth_getBlockByNumber" && message.params[0] === number
+  ? rewriteResult(await forward(), (block) => ({ ...block, transactions: transform(block.transactions) })) : undefined);
+
+for (const origins of [2, 3]) {
+  test(`one of ${origins} origins fabricating an old receipt and block for a send that never landed cannot turn a foreign use of our nonce into an alert`, options, () => scenario(async ({ chain, bridge, proxies, runtime, facts, burns, approve }) => {
+    for (const proxy of proxies) proxy.hook = async ({ message, forward, response }) => {
+      if (message.method === "eth_sendRawTransaction") { response.destroy(); return undefined; }
+      return forward();
+    };
+    const rt = await runtime();
+    const sent = await rt.runOnce();
+    assert.equal(sent.action, "submitted"); // our bytes never reach the chain
+    for (const proxy of proxies) proxy.hook = null;
+    // Our key is used elsewhere at the reserved nonce.
+    await included(chain, await signedCall(chain, localKeys.submitter, { to: localAddress(localKeys.deployer), data: "0x", gasLimit: 21_000n, nonce: 0 }));
+    assert.equal(await facts.nonce(), 1);
+    // One origin claims our hash was mined in an old block and shows that block
+    // with it; the honest origins still serve the block, without it.
+    const claimed = await chain.rpc("eth_getBlockByNumber", ["0x64", false]);
+    assert.ok(!claimed.transactions.includes(sent.transactionHash));
+    const fabricated = { transactionHash: sent.transactionHash, transactionIndex: "0x0", blockHash: claimed.hash, blockNumber: claimed.number,
+      from: SUBMITTER.toLowerCase(), to: bridge.vault.toLowerCase(), contractAddress: null, cumulativeGasUsed: "0x186a0", gasUsed: "0x186a0",
+      effectiveGasPrice: "0x3b9aca00", logs: [], logsBloom: `0x${"0".repeat(512)}`, status: "0x1", type: "0x0" };
+    const forged = rewriteBlock(claimed.number, (transactions) => [...transactions, sent.transactionHash]);
+    proxies.at(-1).hook = async (call) => (call.message.method === "eth_getTransactionReceipt" && call.message.params[0] === sent.transactionHash
+      ? JSON.stringify({ jsonrpc: "2.0", id: call.message.id, result: fabricated }) : (await forged(call)) ?? call.forward());
+    await assert.rejects(rt.runOnce(), (error) => error instanceof SubmissionHalt && error.code === "nonce_consumed_without_receipt");
+    const ledger = facts.ledger();
+    try {
+      const [row] = ledger.blocking();
+      assert.equal(row.state, "halted"); assert.equal(row.reasonCode, "nonce_consumed_without_receipt");
+      assert.equal(ledger.attention().releaseUnverified, 0);
+    } finally { ledger.close(); }
+    await approve(burns[1]);
+    await assert.rejects(rt.runOnce(), (error) => error.code === "ledger_requires_review"); // the next transfer is never signed
+    assert.equal(await facts.nonce(), 1);
+    assert.equal(facts.relay(burns[1]).state, "approved");
+  }, { burns: 2, approved: 1, history: 1_500, origins }));
+}
+
+test("with three origins one origin hiding our old transaction from its block cannot force the halt: the receipt stays a non-blocking alert", options, () => scenario(async ({ chain, proxies, runtime, facts, burns }) => {
+  const rt = await runtime();
+  const sent = await rt.runOnce();
+  assert.equal(sent.action, "submitted");
+  await facts.settle();
+  const mined = await chain.rpc("eth_getTransactionReceipt", [sent.transactionHash]);
+  await chain.rpc("anvil_mine", ["0x514"]); // downtime beyond releaseLookbackBlocks
+  // An honest origin with a pruned transaction index still serves the block with our transaction.
+  pruneOwnHistory(proxies[1], Number.parseInt(await chain.rpc("eth_blockNumber"), 16) - 1_000);
+  // The lying origin denies our receipt and serves the block without our transaction.
+  const hidden = rewriteBlock(mined.blockNumber, (transactions) => transactions.filter((hash) => hash !== sent.transactionHash));
+  proxies[2].hook = async (call) => (["eth_getTransactionReceipt", "eth_getTransactionByHash"].includes(call.message.method)
+    && call.message.params[0] === sent.transactionHash
+    ? JSON.stringify({ jsonrpc: "2.0", id: call.message.id, result: null }) : (await hidden(call)) ?? call.forward());
+  const alert = await rt.runOnce();
+  assert.equal(alert.action, "release_unverified"); assert.equal(alert.code, "receipt_history_unserved");
+  const ledger = facts.ledger();
   try {
-    const [row] = ledger.blocking();
-    assert.equal(row.state, "halted"); assert.equal(row.reasonCode, "nonce_consumed_without_receipt");
-    assert.equal(ledger.attention().releaseUnverified, 0);
+    assert.equal(ledger.inspect(burns[0].requestId).state, "release_unverified"); assert.equal(ledger.blocking().length, 0);
   } finally { ledger.close(); }
-  await approve(burns[1]);
-  await assert.rejects(rt.runOnce(), (error) => error.code === "ledger_requires_review"); // the next transfer is never signed
-  assert.equal(await facts.nonce(), 1);
-  assert.equal(facts.relay(burns[1]).state, "approved");
-}, { burns: 2, approved: 1, history: 1_500 }));
+}, { origins: 3 }));
 
 test("a revert whose cause an origin can no longer read after long downtime is a non-blocking alert, never an endless temporary stop", options, () => scenario(async ({ chain, bridge, store, proxies, runtime, facts, burns, approve }) => {
   await assert.rejects((await runtime(stopAtSigned)).runOnce(), /stop/);
