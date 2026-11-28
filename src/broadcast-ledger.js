@@ -15,7 +15,12 @@ import { PrivateJournalPath } from "./journal-path.js";
 //   - one transaction per transfer and per account nonce, forever;
 //   - strictly sequential nonces and at most one unfinished transfer;
 //   - forward-only states with no delete, reset, replacement or retry API;
-//   - halted and failed rows block every new claim until offline review.
+//   - halted and failed rows block every new claim until offline review;
+//   - `released_elsewhere` (the destination already released this transfer in
+//     another transaction) and `rejected` (this transfer can never be sent, for
+//     example an invalid recipient) are permanent but never block the queue;
+//   - deferrals are durable scheduling hints, so a transfer that cannot proceed
+//     yet is retried later without starving the transfers behind it.
 // Destination adapters validate the bytes; this module treats them as opaque.
 const failure = () => new Error("broadcast ledger unavailable or conflicting");
 const HASH = /^0x[0-9a-f]{64}$/;
@@ -25,7 +30,10 @@ const CODE = /^[a-z][a-z0-9_]{0,63}$/;
 const OWNER = /^[0-9a-f]{32}$/;
 export const LEDGER_MAX_BROADCAST_ATTEMPTS = 32;
 const MAX_SIGNED_HEX = 65_536;
-const TERMINAL = Object.freeze(["finalized", "failed", "halted"]);
+const TERMINAL = Object.freeze(["finalized", "failed", "halted", "released_elsewhere", "rejected"]);
+const SOURCE = /^(?:0x)?[0-9a-f]{64}$/;
+const DEFER_BASE_MS = 60_000;
+const DEFER_MAX_MS = 3_600_000;
 
 const SCHEMA = `CREATE TABLE ledger_binding (id INTEGER PRIMARY KEY CHECK(id = 1), binding TEXT NOT NULL) STRICT;
 CREATE TABLE worker_lease (
@@ -35,27 +43,40 @@ CREATE TABLE worker_lease (
 CREATE TABLE account_nonce (id INTEGER PRIMARY KEY CHECK(id = 1), next_nonce INTEGER NOT NULL CHECK(next_nonce >= 1)) STRICT;
 CREATE TABLE transfers (
   transfer_id TEXT PRIMARY KEY NOT NULL CHECK(length(transfer_id) = 66),
+  source_ref TEXT NOT NULL UNIQUE CHECK(length(source_ref) IN (64, 66)),
   approval_digest TEXT NOT NULL CHECK(length(approval_digest) = 66),
   request_hash TEXT NOT NULL CHECK(length(request_hash) = 66),
-  state TEXT NOT NULL CHECK(state IN ('claimed', 'signed', 'broadcast', 'finalized', 'failed', 'halted')),
+  state TEXT NOT NULL CHECK(state IN ('claimed', 'signed', 'broadcast', 'finalized', 'failed', 'halted', 'released_elsewhere', 'rejected')),
   claim_epoch INTEGER NOT NULL CHECK(claim_epoch >= 1),
   nonce INTEGER UNIQUE CHECK(nonce >= 0),
   signed_hex TEXT CHECK(length(signed_hex) BETWEEN 4 AND ${MAX_SIGNED_HEX}),
   transaction_digest TEXT UNIQUE CHECK(length(transaction_digest) = 66),
   transaction_hash TEXT UNIQUE CHECK(length(transaction_hash) = 66),
   broadcast_attempts INTEGER NOT NULL CHECK(broadcast_attempts BETWEEN 0 AND ${LEDGER_MAX_BROADCAST_ATTEMPTS}),
+  release_hash TEXT CHECK(length(release_hash) = 66),
   block_number INTEGER CHECK(block_number >= 0),
   block_hash TEXT CHECK(length(block_hash) = 66),
-  halt_code TEXT CHECK(length(halt_code) BETWEEN 1 AND 64),
+  reason_code TEXT CHECK(length(reason_code) BETWEEN 1 AND 64),
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
   CHECK((signed_hex IS NULL) = (nonce IS NULL) AND (nonce IS NULL) = (transaction_hash IS NULL)
     AND (transaction_hash IS NULL) = (transaction_digest IS NULL)),
-  CHECK(state IN ('claimed', 'halted') OR signed_hex IS NOT NULL),
-  CHECK(state <> 'claimed' OR signed_hex IS NULL),
-  CHECK((block_hash IS NULL) = (block_number IS NULL) AND (state IN ('finalized', 'failed')) = (block_hash IS NOT NULL)),
-  CHECK((state = 'halted') = (halt_code IS NOT NULL)),
-  CHECK(state IN ('broadcast', 'finalized', 'failed', 'halted') OR broadcast_attempts = 0),
-  CHECK(state NOT IN ('broadcast', 'finalized', 'failed') OR broadcast_attempts >= 1)
+  CHECK(state IN ('claimed', 'halted', 'released_elsewhere', 'rejected') OR signed_hex IS NOT NULL),
+  CHECK(state NOT IN ('claimed', 'rejected') OR signed_hex IS NULL),
+  CHECK((block_hash IS NULL) = (block_number IS NULL)
+    AND (state IN ('finalized', 'failed', 'released_elsewhere')) = (block_hash IS NOT NULL)),
+  CHECK((state = 'released_elsewhere') = (release_hash IS NOT NULL)),
+  CHECK(release_hash IS NULL OR transaction_hash IS NULL OR release_hash <> transaction_hash),
+  CHECK((state IN ('halted', 'rejected')) = (reason_code IS NOT NULL)),
+  CHECK(state IN ('broadcast', 'finalized', 'failed', 'halted', 'released_elsewhere') OR broadcast_attempts = 0),
+  CHECK(state NOT IN ('broadcast', 'finalized', 'failed') OR broadcast_attempts >= 1),
+  CHECK(state <> 'released_elsewhere' OR signed_hex IS NULL OR broadcast_attempts >= 1)
+) STRICT;
+CREATE TABLE deferrals (
+  source_ref TEXT PRIMARY KEY NOT NULL CHECK(length(source_ref) IN (64, 66)),
+  transfer_id TEXT NOT NULL CHECK(length(transfer_id) = 66),
+  code TEXT NOT NULL CHECK(length(code) BETWEEN 1 AND 64),
+  until_ms INTEGER NOT NULL CHECK(until_ms >= 0),
+  count INTEGER NOT NULL CHECK(count >= 1)
 ) STRICT;
 CREATE TABLE transfer_events (
   seq INTEGER PRIMARY KEY, transfer_id TEXT NOT NULL, state TEXT NOT NULL, code TEXT NOT NULL,
@@ -74,17 +95,18 @@ CREATE TRIGGER events_no_delete BEFORE DELETE ON transfer_events BEGIN SELECT RA
 CREATE TRIGGER events_no_update BEFORE UPDATE ON transfer_events BEGIN SELECT RAISE(ABORT, 'permanent'); END;
 CREATE TRIGGER transfers_no_delete BEFORE DELETE ON transfers BEGIN SELECT RAISE(ABORT, 'permanent'); END;
 CREATE TRIGGER transfers_insert BEFORE INSERT ON transfers
-  WHEN new.state NOT IN ('claimed', 'halted') OR new.signed_hex IS NOT NULL OR new.broadcast_attempts <> 0
+  WHEN new.state NOT IN ('claimed', 'halted', 'released_elsewhere', 'rejected') OR new.signed_hex IS NOT NULL
+    OR new.broadcast_attempts <> 0
   BEGIN SELECT RAISE(ABORT, 'insert'); END;
 CREATE TRIGGER transfers_terminal BEFORE UPDATE ON transfers
-  WHEN old.state IN ('finalized', 'failed', 'halted') BEGIN SELECT RAISE(ABORT, 'terminal'); END;
+  WHEN old.state IN ('finalized', 'failed', 'halted', 'released_elsewhere', 'rejected') BEGIN SELECT RAISE(ABORT, 'terminal'); END;
 CREATE TRIGGER transfers_progress BEFORE UPDATE ON transfers
-  WHEN NOT ((old.state = 'claimed' AND new.state IN ('claimed', 'signed', 'halted'))
+  WHEN NOT ((old.state = 'claimed' AND new.state IN ('claimed', 'signed', 'halted', 'released_elsewhere', 'rejected'))
     OR (old.state = 'signed' AND new.state IN ('broadcast', 'halted'))
-    OR (old.state = 'broadcast' AND new.state IN ('broadcast', 'finalized', 'failed', 'halted')))
+    OR (old.state = 'broadcast' AND new.state IN ('broadcast', 'finalized', 'failed', 'halted', 'released_elsewhere')))
   BEGIN SELECT RAISE(ABORT, 'transition'); END;
 CREATE TRIGGER transfers_immutable BEFORE UPDATE ON transfers
-  WHEN new.transfer_id IS NOT old.transfer_id OR new.claim_epoch IS NOT old.claim_epoch
+  WHEN new.transfer_id IS NOT old.transfer_id OR new.source_ref IS NOT old.source_ref OR new.claim_epoch IS NOT old.claim_epoch
     OR new.created_at IS NOT old.created_at
     OR new.broadcast_attempts < old.broadcast_attempts OR new.broadcast_attempts > old.broadcast_attempts + 1
     OR (old.signed_hex IS NOT NULL AND (new.signed_hex IS NOT old.signed_hex OR new.nonce IS NOT old.nonce
@@ -98,6 +120,7 @@ const EXPECTED_SCHEMA = JSON.stringify(reference.prepare(SCHEMA_QUERY).all());
 reference.close();
 
 const hash = (value) => typeof value === "string" && HASH.test(value) && value !== ZERO_HASH;
+const sourceRef = (value) => typeof value === "string" && SOURCE.test(value);
 const sha256 = (hex) => `0x${createHash("sha256").update(Buffer.from(hex.slice(2), "hex")).digest("hex")}`;
 function plain(value, fields) {
   if (!value || typeof value !== "object" || types.isProxy(value) || Array.isArray(value)
@@ -108,6 +131,11 @@ function plain(value, fields) {
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (!descriptor.enumerable || !Object.hasOwn(descriptor, "value")) throw failure();
   }
+  return value;
+}
+function identityOf(input, extra) {
+  const value = plain(input, ["transferId", "sourceRef", "approvalDigest", "requestHash", ...extra]);
+  if (![value.transferId, value.approvalDigest, value.requestHash].every(hash) || !sourceRef(value.sourceRef)) throw failure();
   return value;
 }
 function evmAccount(value) {
@@ -260,7 +288,7 @@ export class BroadcastLedger {
   }
 
   #snapshot(row) {
-    if (!row || !hash(row.transfer_id) || !hash(row.approval_digest) || !hash(row.request_hash)
+    if (!row || !hash(row.transfer_id) || !sourceRef(row.source_ref) || !hash(row.approval_digest) || !hash(row.request_hash)
         || !["claimed", "signed", "broadcast", ...TERMINAL].includes(row.state)
         || !Number.isSafeInteger(row.claim_epoch) || row.claim_epoch < 1
         || !Number.isSafeInteger(row.broadcast_attempts) || row.broadcast_attempts < 0
@@ -272,12 +300,13 @@ export class BroadcastLedger {
           || sha256(row.signed_hex) !== row.transaction_digest) throw failure();
     } else if (row.nonce !== null || row.transaction_hash !== null || row.transaction_digest !== null) throw failure();
     if (row.block_hash !== null && (!hash(row.block_hash) || !Number.isSafeInteger(row.block_number))) throw failure();
-    if (row.halt_code !== null && (typeof row.halt_code !== "string" || !CODE.test(row.halt_code))) throw failure();
-    return Object.freeze({ found: true, transferId: row.transfer_id, approvalDigest: row.approval_digest,
+    if (row.release_hash !== null && !hash(row.release_hash)) throw failure();
+    if (row.reason_code !== null && (typeof row.reason_code !== "string" || !CODE.test(row.reason_code))) throw failure();
+    return Object.freeze({ found: true, transferId: row.transfer_id, sourceRef: row.source_ref, approvalDigest: row.approval_digest,
       requestHash: row.request_hash, state: row.state, claimEpoch: row.claim_epoch, nonce: row.nonce,
       signedHex: row.signed_hex, transactionDigest: row.transaction_digest, transactionHash: row.transaction_hash,
-      broadcastAttempts: row.broadcast_attempts, blockNumber: row.block_number, blockHash: row.block_hash,
-      haltCode: row.halt_code, mayRetry: false });
+      broadcastAttempts: row.broadcast_attempts, releaseHash: row.release_hash, blockNumber: row.block_number,
+      blockHash: row.block_hash, reasonCode: row.reason_code, mayRetry: false });
   }
 
   inspect(transferId) {
@@ -318,10 +347,9 @@ export class BroadcastLedger {
   // Exclusive claim. A claimed row has no bytes and was never sent, so it may be
   // rebound to a re-issued approval; once bytes exist the approval is permanent.
   claim(lease, input) {
-    const { transferId, approvalDigest, requestHash } = plain(input, ["transferId", "approvalDigest", "requestHash"]);
-    if (![transferId, approvalDigest, requestHash].every(hash)) throw failure();
+    const { transferId, sourceRef: source, approvalDigest, requestHash } = identityOf(input, []);
     return this.#transaction(() => {
-      const existing = this.#raw(transferId);
+      const existing = this.#existing(transferId, source);
       if (existing) {
         if (existing.approval_digest === approvalDigest && existing.request_hash === requestHash) return this.#snapshot(existing);
         if (existing.state !== "claimed") throw failure();
@@ -330,15 +358,24 @@ export class BroadcastLedger {
         this.#event(transferId, "claimed", "rebound", lease.epoch);
         return this.#snapshot(this.#raw(transferId));
       }
-      const open = this.#database.prepare("SELECT count(*) AS n FROM transfers WHERE state <> 'finalized'").get().n;
+      const open = this.#database.prepare(`SELECT count(*) AS n FROM transfers
+        WHERE state NOT IN ('finalized', 'released_elsewhere', 'rejected')`).get().n;
       if (open !== 0) throw failure();
       const now = Math.floor(Date.now() / 1000);
-      this.#database.prepare(`INSERT INTO transfers (transfer_id, approval_digest, request_hash, state, claim_epoch,
-        broadcast_attempts, created_at, updated_at) VALUES (?, ?, ?, 'claimed', ?, 0, ?, ?)`)
-        .run(transferId, approvalDigest, requestHash, lease.epoch, now, now);
+      this.#database.prepare(`INSERT INTO transfers (transfer_id, source_ref, approval_digest, request_hash, state, claim_epoch,
+        broadcast_attempts, created_at, updated_at) VALUES (?, ?, ?, ?, 'claimed', ?, 0, ?, ?)`)
+        .run(transferId, source, approvalDigest, requestHash, lease.epoch, now, now);
       this.#event(transferId, "claimed", "claimed", lease.epoch);
       return this.#snapshot(this.#raw(transferId));
     }, lease);
+  }
+
+  // One row per transfer and per source reference; both are immutable.
+  #existing(transferId, source) {
+    const existing = this.#raw(transferId);
+    const bySource = this.#database.prepare("SELECT transfer_id FROM transfers WHERE source_ref = ?").get(source);
+    if ((existing && existing.source_ref !== source) || (bySource && bySource.transfer_id !== transferId)) throw failure();
+    return existing;
   }
 
   // Commit exact bytes, transaction hash and the next account nonce BEFORE send.
@@ -398,28 +435,122 @@ export class BroadcastLedger {
 
   markFailed(lease, transferId, inclusion) { return this.#conclude(lease, transferId, "failed", inclusion); }
 
-  // Halting is permanent. Without a row, a halted row is created so restart
-  // never resumes automatically (for example, replay processed elsewhere).
+  // Halting is permanent and blocks the queue. Without a row, a halted row is
+  // created so restart never resumes automatically.
   halt(lease, input) {
-    const { transferId, approvalDigest, requestHash, code } = plain(input, ["transferId", "approvalDigest", "requestHash", "code"]);
-    if (![transferId, approvalDigest, requestHash].every(hash) || typeof code !== "string" || !CODE.test(code)) throw failure();
+    const { transferId, sourceRef: source, approvalDigest, requestHash, code } = identityOf(input, ["code"]);
+    if (typeof code !== "string" || !CODE.test(code)) throw failure();
     return this.#transaction(() => {
-      const existing = this.#raw(transferId);
+      const existing = this.#existing(transferId, source);
       const now = Math.floor(Date.now() / 1000);
       if (!existing) {
-        this.#database.prepare(`INSERT INTO transfers (transfer_id, approval_digest, request_hash, state, claim_epoch,
-          broadcast_attempts, halt_code, created_at, updated_at) VALUES (?, ?, ?, 'halted', ?, 0, ?, ?, ?)`)
-          .run(transferId, approvalDigest, requestHash, lease.epoch, code, now, now);
+        this.#database.prepare(`INSERT INTO transfers (transfer_id, source_ref, approval_digest, request_hash, state, claim_epoch,
+          broadcast_attempts, reason_code, created_at, updated_at) VALUES (?, ?, ?, ?, 'halted', ?, 0, ?, ?, ?)`)
+          .run(transferId, source, approvalDigest, requestHash, lease.epoch, code, now, now);
       } else if (existing.state === "halted") {
         return this.#snapshot(existing);
       } else {
         if (TERMINAL.includes(existing.state)) throw failure();
-        this.#database.prepare("UPDATE transfers SET state = 'halted', halt_code = ?, updated_at = ? WHERE transfer_id = ?")
+        this.#database.prepare("UPDATE transfers SET state = 'halted', reason_code = ?, updated_at = ? WHERE transfer_id = ?")
           .run(code, now, transferId);
       }
       this.#event(transferId, "halted", code, lease.epoch);
       return this.#snapshot(this.#raw(transferId));
     }, lease);
+  }
+
+  // This transfer alone can never be sent (for example an invalid recipient).
+  // Only a row without bytes may be rejected; rejection never blocks others.
+  reject(lease, input) {
+    const { transferId, sourceRef: source, approvalDigest, requestHash, code } = identityOf(input, ["code"]);
+    if (typeof code !== "string" || !CODE.test(code)) throw failure();
+    return this.#transaction(() => {
+      const existing = this.#existing(transferId, source);
+      const now = Math.floor(Date.now() / 1000);
+      if (existing?.state === "rejected") return this.#snapshot(existing);
+      if (existing && existing.state !== "claimed") throw failure();
+      if (existing) {
+        this.#database.prepare(`UPDATE transfers SET state = 'rejected', reason_code = ?, approval_digest = ?, request_hash = ?,
+          updated_at = ? WHERE transfer_id = ? AND state = 'claimed'`).run(code, approvalDigest, requestHash, now, transferId);
+      } else {
+        this.#database.prepare(`INSERT INTO transfers (transfer_id, source_ref, approval_digest, request_hash, state, claim_epoch,
+          broadcast_attempts, reason_code, created_at, updated_at) VALUES (?, ?, ?, ?, 'rejected', ?, 0, ?, ?, ?)`)
+          .run(transferId, source, approvalDigest, requestHash, lease.epoch, code, now, now);
+      }
+      this.#event(transferId, "rejected", code, lease.epoch);
+      return this.#snapshot(this.#raw(transferId));
+    }, lease);
+  }
+
+  // The destination released this transfer in another, finalized transaction
+  // (verified by the adapter on every origin). Allowed without bytes, or after
+  // our identical bytes were sent (their nonce is then consumed on chain);
+  // never from `signed`, whose nonce would otherwise stay unused.
+  releasedElsewhere(lease, input) {
+    const { transferId, sourceRef: source, approvalDigest, requestHash, releaseHash, blockNumber, blockHash } =
+      identityOf(input, ["releaseHash", "blockNumber", "blockHash"]);
+    if (!hash(releaseHash) || !hash(blockHash) || !Number.isSafeInteger(blockNumber) || blockNumber < 0) throw failure();
+    return this.#transaction(() => {
+      const existing = this.#existing(transferId, source);
+      const now = Math.floor(Date.now() / 1000);
+      if (existing?.state === "released_elsewhere") {
+        if (existing.release_hash !== releaseHash || existing.block_hash !== blockHash || existing.block_number !== blockNumber) throw failure();
+        return this.#snapshot(existing);
+      }
+      if (!existing) {
+        this.#database.prepare(`INSERT INTO transfers (transfer_id, source_ref, approval_digest, request_hash, state, claim_epoch,
+          broadcast_attempts, release_hash, block_number, block_hash, created_at, updated_at)
+          VALUES (?, ?, ?, ?, 'released_elsewhere', ?, 0, ?, ?, ?, ?, ?)`)
+          .run(transferId, source, approvalDigest, requestHash, lease.epoch, releaseHash, blockNumber, blockHash, now, now);
+      } else if (existing.state === "claimed" || existing.state === "broadcast") {
+        if (existing.transaction_hash === releaseHash) throw failure();
+        this.#database.prepare(`UPDATE transfers SET state = 'released_elsewhere', release_hash = ?, block_number = ?, block_hash = ?,
+          updated_at = ? WHERE transfer_id = ?`).run(releaseHash, blockNumber, blockHash, now, transferId);
+      } else throw failure();
+      this.#event(transferId, "released_elsewhere", "released_elsewhere", lease.epoch);
+      return this.#snapshot(this.#raw(transferId));
+    }, lease);
+  }
+
+  // Durable scheduling hint with bounded exponential backoff. It never changes
+  // a transfer row and is never permission to send.
+  defer(lease, input, { nowMs = Date.now() } = {}) {
+    const { transferId, sourceRef: source, code } = plain(input, ["transferId", "sourceRef", "code"]);
+    if (!hash(transferId) || !sourceRef(source) || typeof code !== "string" || !CODE.test(code)
+        || !Number.isSafeInteger(nowMs) || nowMs < 0) throw failure();
+    return this.#transaction(() => {
+      const existing = this.#database.prepare("SELECT * FROM deferrals WHERE source_ref = ?").get(source);
+      if (existing && existing.transfer_id !== transferId) throw failure();
+      const count = Math.min((existing?.count ?? 0) + 1, 64);
+      const untilMs = nowMs + Math.min(DEFER_BASE_MS * 2 ** Math.min(count - 1, 16), DEFER_MAX_MS);
+      this.#database.prepare(`INSERT INTO deferrals VALUES (?, ?, ?, ?, ?) ON CONFLICT(source_ref)
+        DO UPDATE SET code = excluded.code, until_ms = excluded.until_ms, count = excluded.count`).run(source, transferId, code, untilMs, count);
+      return Object.freeze({ sourceRef: source, transferId, code, untilMs, count });
+    }, lease);
+  }
+
+  // Cheap per-source lookup for queue scheduling (no byte rehash).
+  scheduling(source) {
+    try {
+      if (!sourceRef(source)) throw failure();
+      this.#path.verify();
+      const row = this.#database.prepare("SELECT transfer_id, state FROM transfers WHERE source_ref = ?").get(source);
+      const deferral = this.#database.prepare("SELECT transfer_id, code, until_ms FROM deferrals WHERE source_ref = ?").get(source);
+      if (row && (!hash(row.transfer_id) || ![...TERMINAL, "claimed", "signed", "broadcast"].includes(row.state))) throw failure();
+      if (deferral && (!hash(deferral.transfer_id) || !Number.isSafeInteger(deferral.until_ms))) throw failure();
+      return Object.freeze({ transferId: row?.transfer_id ?? deferral?.transfer_id ?? null, state: row?.state ?? null,
+        deferredUntilMs: deferral?.until_ms ?? null, deferralCode: deferral?.code ?? null });
+    } catch { throw failure(); }
+  }
+
+  deferrals({ limit = 64 } = {}) {
+    try {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_024) throw failure();
+      this.#path.verify();
+      return Object.freeze(this.#database.prepare("SELECT source_ref, transfer_id, code, until_ms, count FROM deferrals ORDER BY until_ms, source_ref LIMIT ?")
+        .all(limit).map((row) => Object.freeze({ sourceRef: row.source_ref, transferId: row.transfer_id, code: row.code,
+          untilMs: row.until_ms, count: row.count })));
+    } catch { throw failure(); }
   }
 
   close() { try { this.#database.close(); } finally { this.#path.close(); } }

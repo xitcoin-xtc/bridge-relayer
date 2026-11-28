@@ -204,7 +204,10 @@ observation or by resending only those identical bytes; it is not yet connected
 to a startup path. Never delete, copy between hosts or restore an old copy of a
 broadcast ledger: like a signer journal, it is what prevents a second
 transaction. Back it up like a key. A `failed` or `halted` ledger row blocks the
-submitter until an offline review. Both public submitter startup paths fail
+submitter until an offline review. `rejected` rows (a transfer that can never be
+sent) and deferred transfers do not block other transfers; review them from the
+ledger, they remain `approved` in RelayStore. A transfer released by another
+transaction is recorded as `released_elsewhere` with that transaction. Both public submitter startup paths fail
 closed; [SUBMITTERS.md](SUBMITTERS.md) lists the exact adapter gaps.
 
 ## Testnet preflight

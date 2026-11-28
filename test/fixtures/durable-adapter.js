@@ -16,7 +16,7 @@ const decode = (hex) => JSON.parse(Buffer.from(hex.slice(2), "hex").toString());
 export class ModelChain {
   constructor() {
     Object.assign(this, { height: 100, nonce: 0, paused: false, mempool: new Map(), receipts: new Map(),
-      processed: new Map(), deliveries: [], foreign: 0, failNext: false, sendMode: "deliver" });
+      processed: new Map(), deliveries: [], foreign: 0, failNext: false, sendMode: "deliver", invalid: new Set() });
   }
   receive(signedHex) {
     const hash = keccak256(signedHex);
@@ -47,19 +47,37 @@ export class ModelChain {
     this.nonce -= 1;
   }
   foreignTransaction() { this.nonce += 1; this.foreign += 1; }
+  // Anyone may call the vault with valid approvals, e.g. by copying pending calldata.
+  foreignRelease(transferId) {
+    this.height += 1;
+    const hash = keccak256(Buffer.from(`foreign release ${transferId} ${this.height}`));
+    this.receipts.set(hash, { blockNumber: this.height, blockHash: `0x${this.height.toString(16).padStart(64, "0")}`, status: 1 });
+    this.processed.set(transferId, hash);
+    return hash;
+  }
   distinctDeliveries() { return new Set(this.deliveries).size; }
 }
 
 export function modelAdapter(destination, chain, { maxBroadcastAttempts = 3, confirmations = 3, marginSeconds = 60, ledger } = {}) {
   const transferId = (request) => request.direction === DIRECTION_OUTBOUND ? request.payload.sourceBurnId : attestationId(request.payload);
+  const final = (receipt) => chain.height - receipt.blockNumber + 1 >= confirmations;
+  // A release by another transaction, proven by its finalized receipt.
+  const elsewhere = (id, ours) => {
+    const hash = chain.processed.get(id);
+    if (!hash || hash === ours) return null;
+    const receipt = chain.receipts.get(hash);
+    return final(receipt) ? { action: "released_elsewhere", releaseHash: hash, blockNumber: receipt.blockNumber, blockHash: receipt.blockHash }
+      : { action: "wait", code: "release_elsewhere_not_final", defer: true };
+  };
   return {
     destination, maxBroadcastAttempts,
     transferId,
     async assess({ request, transferId: id, nowUnix }) {
       if (chain.rpcFailure) throw new Error("rpc_disagreement");
       if (chain.paused) return { action: "wait", code: "route_paused" };
-      if (chain.processed.has(id)) return { action: "halt", code: "processed_without_local_transaction" };
-      if (request.deadlineUnix < nowUnix + marginSeconds) return { action: "wait", code: "approval_expired_awaiting_reissue" };
+      if (chain.invalid.has(id)) return { action: "reject", code: "invalid_recipient" };
+      if (chain.processed.has(id)) return elsewhere(id, null);
+      if (request.deadlineUnix < nowUnix + marginSeconds) return { action: "wait", code: "approval_expired_awaiting_reissue", defer: true };
       return { action: "sign", context: { ok: true } };
     },
     async sign({ request, transferId: id, expectedNonce, context }) {
@@ -77,8 +95,9 @@ export function modelAdapter(destination, chain, { maxBroadcastAttempts = 3, con
     },
     async beforeFirstSend({ row }) {
       if (chain.nonce !== row.nonce) return { action: "halt", code: "nonce_consumed_before_send" };
-      if (chain.processed.has(row.transferId)) return { action: "halt", code: "processed_by_foreign_transaction" };
       if (chain.paused) return { action: "wait", code: "route_paused" };
+      // Released elsewhere: still send the identical bytes once so their
+      // reserved nonce is consumed (they revert); then observe the release.
       return { action: "send" };
     },
     async send({ row }) {
@@ -94,12 +113,15 @@ export function modelAdapter(destination, chain, { maxBroadcastAttempts = 3, con
       if (chain.rpcFailure) throw new Error("rpc_disagreement");
       const receipt = chain.receipts.get(row.transactionHash);
       if (receipt) {
-        if (chain.height - receipt.blockNumber + 1 < confirmations) return { action: "pending" };
+        if (!final(receipt)) return { action: "pending" };
+        if (receipt.status === 0 && chain.processed.has(row.transferId)) {
+          const released = elsewhere(row.transferId, row.transactionHash);
+          return released?.action === "released_elsewhere" ? released : { action: "pending" };
+        }
         return { action: receipt.status === 1 ? "finalized" : "failed", blockNumber: receipt.blockNumber, blockHash: receipt.blockHash };
       }
       if (chain.mempool.has(row.transactionHash)) return { action: "pending" };
       if (chain.nonce > row.nonce) return { action: "halt", code: "nonce_consumed_without_receipt" };
-      if (chain.processed.has(row.transferId)) return { action: "halt", code: "processed_by_foreign_transaction" };
       if (chain.paused) return { action: "wait", code: "route_paused" };
       if (row.broadcastAttempts >= maxBroadcastAttempts) return { action: "halt", code: "broadcast_attempts_exhausted" };
       return { action: "rebroadcast" };
