@@ -236,7 +236,14 @@ transaction is recorded as `released_elsewhere` with that transaction.
   liquidity or a failing simulation is deferred (1 minute, doubling, at most 1
   hour) while the next transfers proceed.
 - A release of a burn by another transaction (for example a front-run) is
-  recorded as `released_elsewhere` and is not an error. A transfer to an
+  recorded as `released_elsewhere` and is not an error; RelayStore
+  `release_ref` names the releasing transaction.
+- Every cycle report carries `attention` counts (`rejected`, `expired`,
+  `releaseUnverified`). These never block other transfers but need review:
+  `expired` burns need a new approval and transaction (procedure not defined
+  yet); `release_unverified` means the vault reports the burn processed but no
+  matching `Released` event was found, which the reconciler will also show as
+  a discrepancy. A transfer to an
   invalid recipient is `rejected` and needs an operator decision (refund
   procedure); it does not block other transfers.
 - Logs contain only stable codes, transfer IDs and transaction hashes.

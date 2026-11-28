@@ -315,7 +315,7 @@ test("only conditions that persist nothing are temporary stops; halts and identi
   const { RpcDisagreement, RpcInvalid } = await import("../src/cronos-rpc.js");
   const busy = Object.assign(new Error("database is locked"), { errcode: 5 });
   for (const error of [new TransportError("timeout"), new RpcDisagreement(), new RpcInvalid(), busy,
-    new SubmissionUnavailable("deadline_evidence_disagreement"), new SubmissionUnavailable("release_evidence_unavailable")]) {
+    new SubmissionUnavailable("rpc_transaction_mismatch"), new SubmissionUnavailable("source_finality_unverified")]) {
     assert.equal(isTemporaryStop(error), true);
   }
   for (const error of [new SubmissionHalt("approval_expired_before_broadcast"), new SubmissionHalt("ledger_requires_review"),

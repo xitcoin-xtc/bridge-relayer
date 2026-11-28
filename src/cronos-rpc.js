@@ -12,6 +12,9 @@ export class RpcInvalid extends Error {
   constructor() { super("Cronos RPC response invalid"); this.code = "rpc_invalid_response"; }
 }
 export const CRONOS_TESTNET_CHAIN_ID = 338n;
+// JSON-RPC codes nodes use for an execution revert (3 with revert data; -32000
+// and -32015 on some clients). Everything else is a provider-side condition.
+const EXECUTION_ERRORS = new Set([3, -32000, -32015]);
 export const CRONOS_MAINNET_CHAIN_ID = 25n;
 
 const invalid = () => new RpcInvalid();
@@ -113,15 +116,21 @@ export class CronosRpcQuorum {
     });
   }
 
-  // Like `each`, but reports JSON-RPC errors (for example an execution revert)
-  // separately from transport failures, which still throw.
-  async eachOrRpcError(method, params, normalize) {
+  // Execution verdict for calls that may revert. A revert counts only when
+  // every origin reports an execution error; a rate limit (-32005), any other
+  // provider error, a transport failure or mixed answers is a temporary
+  // disagreement, never a decision about the transfer.
+  async verdictEach(method, params, normalize) {
     const settled = await Promise.allSettled(this.#clients.map((client) => client.call(method, params)));
-    return settled.map((result) => {
+    const results = settled.map((result) => {
       if (result.status === "fulfilled") return { ok: true, value: normalize(result.value) };
-      if (result.reason instanceof TransportError && result.reason.code === "rpc_error") return { ok: false };
+      if (result.reason instanceof TransportError && result.reason.code === "rpc_error"
+          && EXECUTION_ERRORS.has(result.reason.rpcCode)) return { ok: false };
       throw result.reason instanceof TransportError ? result.reason : new TransportError("unavailable");
     });
+    if (results.every((result) => result.ok)) return Object.freeze({ reverted: false, values: results.map((result) => result.value) });
+    if (results.every((result) => !result.ok)) return Object.freeze({ reverted: true, values: [] });
+    throw new RpcDisagreement();
   }
 
   async agree(method, params, normalize) {
@@ -159,9 +168,9 @@ export class CronosRpcQuorum {
     return this.agree("eth_call", [request, typeof blockTag === "number" ? hex(blockTag) : blockTag], data);
   }
 
-  callEach(request, blockTag = "latest") { return this.eachOrRpcError("eth_call", [request, blockTag], data); }
+  callVerdict(request, blockTag = "latest") { return this.verdictEach("eth_call", [request, blockTag], data); }
 
-  estimateEach(request) { return this.eachOrRpcError("eth_estimateGas", [request], quantity); }
+  estimateVerdict(request) { return this.verdictEach("eth_estimateGas", [request], quantity); }
 
   gasPrices() { return this.each("eth_gasPrice", [], quantity); }
 

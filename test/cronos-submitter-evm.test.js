@@ -147,7 +147,7 @@ async function scenario(run, { version = "testnet", chainId = 338, burns = 1, ap
       ledger: () => new BroadcastLedger(paths.ledger, cronosLedgerBinding(manifest), journalOptions("cronos")),
     };
     await run({ chain, proxies, bridge, burns: allBurns, store, manifest, paths, runtime, facts, directory,
-      approve: (burn) => approve(store, burn, bridge.vault, deadlineUnix, signerSet?.services) });
+      approve: (burn, deadline = deadlineUnix) => approve(store, burn, bridge.vault, deadline, signerSet?.services) });
   } finally {
     for (const step of cleanup.reverse()) { try { await step(); } catch { /* best effort */ } }
     rmSync(directory, { recursive: true, force: true });
@@ -195,6 +195,7 @@ for (const version of ["testnet", "main"]) {
     const final = await rt.runOnce();
     assert.equal(final.action, "finalized"); assert.equal(final.transactionHash, first.transactionHash);
     await assertSingleRelease(facts, burns[0]);
+    assert.equal(facts.relay().release_ref, first.transactionHash);
     assert.equal(await facts.balance(), AMOUNT);
     assert.equal(await facts.nonce(), 1);
     for (let i = 0; i < 3; i++) assert.equal((await rt.runOnce()).action, "idle");
@@ -482,6 +483,7 @@ test("a front-run copying our pending calldata is recorded as released elsewhere
   assert.equal(outcome.action, "released_elsewhere"); assert.equal(outcome.releaseHash, attacker);
   assert.equal(facts.relay(burns[0]).state, "completed");
   assert.equal(facts.relay(burns[0]).destination_ref, sent.transactionHash);
+  assert.equal(facts.relay(burns[0]).release_ref, attacker); // the real release, where a reconciler reads it
   const ledger = facts.ledger();
   try {
     const row = ledger.inspect(burns[0].requestId);
@@ -501,6 +503,7 @@ test("a third-party release before any claim completes the transfer without any 
   const outcome = await rt.runOnce();
   assert.equal(outcome.action, "released_elsewhere"); assert.equal(outcome.releaseHash, release);
   assert.equal(facts.relay(burns[0]).state, "completed"); assert.equal(facts.relay(burns[0]).destination_ref, null);
+  assert.equal(facts.relay(burns[0]).release_ref, release);
   assert.equal(await facts.nonce(), 0);
   await approve(burns[1]);
   await completes(rt, facts, burns[1]);
@@ -539,15 +542,16 @@ test("an invalid recipient is rejected for that transfer only and never blocks t
   assert.equal((await rt.runOnce()).action, "idle");
 }, { burns: 2, approvals: "direct", recipientFor: (index, bridge) => (index === 1 ? bridge.vault : recipient) }));
 
-test("one origin with a far-future timestamp stops temporarily and never persists a halt", options, () => scenario(async ({ proxies, runtime, facts, burns }) => {
+test("one origin with a far-future timestamp never persists a halt: the identical bytes are sent and complete", options, () => scenario(async ({ proxies, runtime, facts, burns }) => {
   await assert.rejects((await runtime({ boundary: async (name) => { if (name === "signed") throw new Error("stop"); } })).runOnce(), /stop/);
   proxies[1].hook = async ({ message, forward }) => (message.method === "eth_getBlockByNumber" && message.params[0] === "latest"
     ? rewriteResult(await forward(), (block) => ({ ...block, timestamp: `0x${(Math.floor(Date.now() / 1000) + 365 * 86400).toString(16)}` }))
     : forward());
   const rt = await runtime({ offsetMs: 10 * 60_000 });
-  await assert.rejects(rt.runOnce(), (error) => error.code === "deadline_evidence_disagreement" && isTemporaryStop(error));
+  // Sending our own committed bytes is never unsafe; no halt is recorded.
+  assert.equal((await rt.runOnce()).action, "submitted");
   const ledger = facts.ledger();
-  try { assert.equal(ledger.blocking().length, 0); assert.equal(ledger.inspect(burns[0].requestId).state, "signed"); } finally { ledger.close(); }
+  try { assert.equal(ledger.blocking().length, 0); } finally { ledger.close(); }
   proxies[1].hook = null;
   await completes(rt, facts, burns[0]);
   await assertSingleRelease(facts, burns[0]);
@@ -600,9 +604,11 @@ test("two submitter processes contest the lease: exactly one sends", options, ()
 }));
 
 test("a RelayStore locked by the coordinator pauses run() temporarily instead of ending it", options, () => scenario(async ({ runtime, facts, burns, paths }) => {
+  // The coordinator holds a write lock until the submitter has visibly paused,
+  // so the scenario does not depend on how long the runtime takes to start.
   const holder = spawn(process.execPath, ["--input-type=module", "-e", `import { DatabaseSync } from "node:sqlite";
     const db = new DatabaseSync(${JSON.stringify(paths.store)}); db.exec("BEGIN IMMEDIATE"); process.stdout.write("locked");
-    setTimeout(() => { db.exec("COMMIT"); db.close(); }, 1_500);`], { stdio: ["ignore", "pipe", "inherit"] });
+    process.stdin.once("data", () => { db.exec("COMMIT"); db.close(); process.exit(0); });`], { stdio: ["pipe", "pipe", "inherit"] });
   await new Promise((resolve) => holder.stdout.once("data", resolve));
   const logs = [];
   const controller = new AbortController();
@@ -611,7 +617,11 @@ test("a RelayStore locked by the coordinator pauses run() temporarily instead of
     makeStore: (path) => openExistingRelayStore(path, { busyTimeoutMs: 100 }),
     loadSigner: (input) => createEncryptedKeystoreDigestSigner({ ...input, expectedCredentialOwnerUid: process.geteuid() }),
     now: () => Date.now() + 10 * 60_000,
-    log: (report) => { logs.push(report); if (report.action === "submitted") controller.abort(); } });
+    log: (report) => {
+      logs.push(report);
+      if (report.action === "temporarily_stopped" && !holder.stdin.writableEnded) holder.stdin.end("release\n");
+      if (report.action === "submitted") controller.abort();
+    } });
   try { await rt.run({ signal: controller.signal }); } finally { rt.close(); }
   assert.ok(logs.some((report) => report.action === "temporarily_stopped" && report.code === "relay_store_busy"));
   assert.equal(logs.at(-1).action, "submitted");
@@ -619,3 +629,101 @@ test("a RelayStore locked by the coordinator pauses run() temporarily instead of
   await facts.settle();
   assert.equal(await facts.nonce(), 1);
 }));
+
+const warp = async (chain, seconds) => { await chain.rpc("evm_increaseTime", [seconds]); await chain.rpc("evm_mine", []); };
+const PROCESSED_SELECTOR = VAULT.getFunction("processedBurns").selector;
+const stopAtSigned = { boundary: async (name) => { if (name === "signed") throw new Error("stop"); } };
+
+for (const fault of ["rate-limited simulation", "false replay flag"]) {
+  test(`one origin with a ${fault} cannot block the queue: the expired signed bytes are sent once and recorded as expired`, options, () => scenario(async ({ chain, proxies, runtime, facts, burns, approve }) => {
+    await assert.rejects((await runtime(stopAtSigned)).runOnce(), /stop/);
+    proxies[1].hook = async ({ message, forward }) => {
+      const call = message.method === "eth_call" ? message.params[0] : null;
+      if (fault === "rate-limited simulation" && call?.from) {
+        return JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code: -32005, message: "limit exceeded" } });
+      }
+      if (fault === "false replay flag" && call?.data?.startsWith(PROCESSED_SELECTOR)) return rewriteResult(await forward(), () => `0x${"0".repeat(63)}1`);
+      return forward();
+    };
+    const before = await runtime({ offsetMs: 10 * 60_000 });
+    if (fault === "rate-limited simulation") await assert.rejects(before.runOnce(), (error) => ["rpc_error", "rpc_disagreement"].includes(error.code) && isTemporaryStop(error));
+    else assert.equal((await before.runOnce()).code, "replay_state_unsettled");
+    assert.equal(await facts.nonce(), 0);
+    // The provider fault outlasts the approval: the deadline passes on chain and locally.
+    await warp(chain, 1_300);
+    const after = await runtime({ offsetMs: 10 * 60_000 + 1_300_000 });
+    const sent = await after.runOnce();
+    assert.equal(sent.action, "submitted"); // stored bytes, no simulation
+    proxies[1].hook = null;
+    await facts.mine(3);
+    assert.equal((await chain.rpc("eth_getTransactionReceipt", [sent.transactionHash])).status, "0x0");
+    const expired = await after.runOnce();
+    assert.equal(expired.action, "expired");
+    const ledger = facts.ledger();
+    try {
+      assert.equal(ledger.inspect(burns[0].requestId).state, "expired"); assert.equal(ledger.blocking().length, 0);
+    } finally { ledger.close(); }
+    assert.equal(facts.relay(burns[0]).state, "submitted"); // still in flight: the burn awaits a new approval
+    assert.equal(await facts.processed(burns[0]), false);
+    await approve(burns[1], Math.floor(Date.now() / 1000) + 1_300 + 600 + 1_800);
+    await completes(after, facts, burns[1]);
+    await assertSingleRelease(facts, burns[1]);
+    assert.equal(await facts.nonce(), 2);
+  }, { burns: 2, approved: 1, deadlineOffset: 1_200 }));
+}
+
+test("a claimed row whose approval expires during downtime is released without a nonce and the queue moves on", options, () => scenario(async ({ chain, runtime, facts, burns, approve }) => {
+  await assert.rejects((await runtime({ boundary: async (name) => { if (name === "claimed") throw new Error("stop"); } })).runOnce(), /stop/);
+  await warp(chain, 1_300);
+  const rt = await runtime({ offsetMs: 10 * 60_000 + 1_300_000 });
+  const released = await rt.runOnce();
+  assert.equal(released.action, "waiting"); assert.equal(released.unclaimed, true);
+  const ledger = facts.ledger();
+  try {
+    const row = ledger.inspect(burns[0].requestId);
+    assert.equal(row.state, "unclaimed"); assert.equal(row.nonce, null); assert.equal(ledger.nextNonce(), null);
+  } finally { ledger.close(); }
+  await approve(burns[1], Math.floor(Date.now() / 1000) + 1_300 + 600 + 1_800);
+  await completes(rt, facts, burns[1]);
+  assert.equal(await facts.nonce(), 1);
+  assert.equal(facts.relay(burns[0]).state, "approved");
+}, { burns: 2, approved: 1, deadlineOffset: 1_200 }));
+
+test("release evidence after a front-run is found from the deadline and our receipt, even after long downtime", options, () => scenario(async ({ chain, bridge, runtime, facts, burns }) => {
+  await chain.rpc("evm_setAutomine", [false]);
+  const rt = await runtime();
+  const sent = await rt.runOnce();
+  const ours = await chain.rpc("eth_getTransactionByHash", [sent.transactionHash]);
+  const attacker = await chain.rpc("eth_sendRawTransaction", [await signedCall(chain, localKeys.guardian, { to: bridge.vault,
+    data: ours.input, gasPrice: 50_000_000_000n, gasLimit: 400_000n })]);
+  await chain.rpc("evm_mine", []);
+  await chain.rpc("evm_setAutomine", [true]);
+  // Downtime: past the approval deadline and far beyond releaseLookbackBlocks (1000).
+  await warp(chain, 4_000);
+  await chain.rpc("anvil_mine", ["0x514"]);
+  const later = await runtime({ offsetMs: 4_000_000 + 10 * 60_000 });
+  const outcome = await later.runOnce();
+  assert.equal(outcome.action, "released_elsewhere"); assert.equal(outcome.releaseHash, attacker);
+  assert.equal(facts.relay(burns[0]).release_ref, attacker);
+}));
+
+test("processed without findable release evidence is a persistent non-blocking alert, never a completion", options, () => scenario(async ({ chain, bridge, store, runtime, facts, burns, approve }) => {
+  await assert.rejects((await runtime(stopAtSigned)).runOnce(), /stop/);
+  await thirdPartyRelease(chain, bridge, store, burns[0]);
+  await chain.rpc("anvil_mine", ["0x514"]); // the release falls outside every search window
+  const rt = await runtime({ offsetMs: 10 * 60_000 });
+  const sent = await rt.runOnce();
+  assert.equal(sent.action, "submitted"); // consumes the reserved nonce; it reverts
+  await facts.mine(3);
+  const alert = await rt.runOnce();
+  assert.equal(alert.action, "release_unverified");
+  assert.equal(facts.relay(burns[0]).state, "submitted"); assert.equal(facts.relay(burns[0]).release_ref, null);
+  await approve(burns[1]);
+  const reports = [];
+  for (let i = 0; i < 8 && facts.relay(burns[1]).state !== "completed"; i++) { reports.push(await rt.runOnce()); await facts.mine(3); }
+  assert.equal(facts.relay(burns[1]).state, "completed");
+  assert.ok(reports.every((report) => report.attention.releaseUnverified === 1));
+  const ledger = facts.ledger();
+  try { assert.equal(ledger.blocking().length, 0); } finally { ledger.close(); }
+  assert.equal(await facts.nonce(), 2);
+}, { burns: 2, approved: 1 }));

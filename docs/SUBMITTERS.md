@@ -197,7 +197,18 @@ The ledger enforces, in one fenced immediate transaction per change:
   doubling, at most 1 hour). A deferral is a scheduling hint only: it never
   changes a transfer row and is never permission to send;
 - a claimed row has no bytes and was never sent, so it may be rebound to a
-  re-issued approval. Once bytes exist the approval digest is permanent.
+  re-issued approval. Once bytes exist the approval digest is permanent;
+- `unclaimed`: a claimed row (no bytes, no nonce) whose transfer cannot
+  proceed yet, for example because its approval expired during downtime, is
+  released and deferred so it never holds the single unfinished slot. It may
+  be claimed again later;
+- two more permanent states that never block the queue and are counted in
+  every cycle report (`attention`) until an operator reviews them: `expired`
+  (our identical bytes were mined and reverted after the approval deadline,
+  consuming their nonce; the burn still awaits a new approval and RelayStore
+  keeps it `submitted`, in flight) and `release_unverified` (the destination
+  reports the transfer processed but no matching release was found; never a
+  completion, RelayStore unchanged). `rejected` rows are counted too.
 
 SQLite triggers repeat these rules (no delete, no regression, no replacement,
 immutable source reference, sequential nonce, monotonic lease epoch) as defense in depth against
@@ -222,8 +233,9 @@ ordering:
    revalidates the request against the transfer, route and authorized quorum
    and decides `sign`; `wait` scoped to the route (for example a paused vault:
    the cycle stops) or to the transfer (it is deferred and the walk moves on);
-   `reject`; `released_elsewhere`; or `halt`. Nothing is claimed unless it
-   decides `sign`;
+   `reject`; `released_elsewhere`; `release_unverified`; or `halt`. Nothing is
+   claimed unless it decides `sign`, and a transfer-scoped wait on a claimed
+   row releases the claim (`unclaimed`);
 4. claim, sign, and commit the bytes before anything else;
 5. bind RelayStore to that single transaction hash (`approved -> submitted`);
 6. commit the broadcast marker, then send the identical bytes. Send errors are
@@ -232,11 +244,14 @@ ordering:
    adapter proves the transaction is unknown and its nonce unused),
    `released_elsewhere` (our bytes reverted because another finalized
    transaction released the transfer first, for example by copying our
-   pending calldata), `failed` (any other finalized failed execution;
-   permanent and blocking), `finalized`, or a persisted `halt`;
+   pending calldata), `expired` (our bytes reverted after the approval
+   deadline), `release_unverified`, `failed` (any other finalized failed
+   execution; permanent and blocking), `finalized`, or a persisted `halt`;
 8. complete RelayStore only after the ledger records finality or a verified
-   release elsewhere. RelayStore keeps referencing only our own transaction
-   (or none if we never signed); the ledger records the releasing transaction.
+   release elsewhere. `destination_ref` keeps referencing only our own
+   transaction (or none if we never signed); the new `release_ref` column
+   records the transaction that actually executed the release (ours, or the
+   other transaction), where a reconciler reads RelayStore.
 
 RelayStore opens with a bounded 5-second busy timeout because the coordinator
 and the Cronos submitter both write it; a longer lock fails with `SQLITE_BUSY`,
@@ -395,7 +410,10 @@ the same transport.
 - gas price (maximum across origins) within `maxGasPrice` and the submitter
   balance covers `gasLimit * gasPrice` (otherwise the cycle waits);
   `eth_estimateGas` within `gasLimit` and an `eth_call` simulation of the exact
-  release succeed on every origin (otherwise this transfer is deferred);
+  release succeed on every origin. A revert counts only when every origin
+  reports an execution error (the transfer is then deferred); a rate limit
+  (for example `-32005`), any other provider error or mixed answers is a
+  temporary stop, never a decision about the transfer;
 - account nonce: `latest` equals `pending` on every origin (no foreign pending
   transaction) and equals the ledger's next nonce (after the first transfer).
 
@@ -405,7 +423,11 @@ plan and signed-byte inspector re-check every field before the ledger commits
 the bytes, hash and nonce. Then RelayStore records `submitted` with that hash,
 the broadcast marker is committed, and the identical bytes are sent to every
 origin. Before the first send the nonce, pause, replay flag, deadline and a
-simulation of the exact signed transaction are checked again.
+simulation of the exact signed transaction are checked again. If, by any clock
+or origin, the approval deadline margin is already lost (for example after a
+provider fault or downtime), the stored bytes are sent once without a
+simulation so that their reserved nonce is consumed; if they revert after the
+deadline the ledger records `expired` and the queue moves on.
 
 ### Confirmation
 
@@ -426,7 +448,11 @@ release a burn first, for example by copying our pending calldata with a higher
 gas price. That is not a failure: the recipient received exactly the approved
 amount. When every origin reports the burn processed, the submitter searches
 the vault's `Released` event for that burn ID backwards over at most
-`releaseLookbackBlocks`, in `logRangeBlocks` chunks, and requires on every
+`releaseLookbackBlocks`, in `logRangeBlocks` chunks, from the highest block at
+or before the approval deadline (no release using this request or an earlier
+one can be later; re-issues only extend the deadline) and, when our own
+transaction was mined, also from its block. Downtime therefore never pushes
+the evidence out of the window. It requires on every
 origin: an identical log whose topics and data match source burn ID, recipient,
 amount and signer version; a successful receipt containing it; a canonical
 block; and finality depth. The ledger then records `released_elsewhere` with
@@ -442,8 +468,9 @@ only our own transaction, or none), and the queue moves on.
   released elsewhere instead of `failed`.
 - A `Released` event for the burn that does not match the approved fields halts
   (`processed_with_mismatching_release`). Evidence not yet final defers the
-  transfer; evidence not found in the window defers it before claiming and
-  stops temporarily once bytes exist.
+  transfer. If the burn is processed at a finalized height and no matching
+  release is found, the ledger records `release_unverified`: a persistent,
+  non-blocking alert reported in every cycle, never a completion.
 
 Recovery decisions (all from canonical observations, never from send errors):
 
@@ -452,19 +479,21 @@ Recovery decisions (all from canonical observations, never from send errors):
 | receipt absent on some origins | wait (indexing lag) |
 | receipts or included transactions differ between origins, or content disagrees | temporary stop (`rpc_disagreement`), retried |
 | transaction pending on any origin | wait |
-| unknown everywhere, nonce unused, not processed, not paused, deadline margin intact, attempts left | resend the identical persisted bytes |
+| unknown everywhere, nonce unused, not processed, not paused, attempts left | resend the identical persisted bytes (also after the deadline: they then revert and consume the nonce) |
 | unknown everywhere and the account nonce advanced | halt `nonce_consumed_without_receipt` |
 | a foreign pending transaction from the account | halt `foreign_pending_transaction` |
 | unknown everywhere, nonce unused, released by another transaction | resend the identical bytes once (they revert and consume the nonce), then record `released_elsewhere` |
-| every origin's latest block says the deadline margin is lost before inclusion | halt `approval_expired_before_inclusion` |
-| only some origins (or only the local clock) say so | temporary stop (`deadline_evidence_disagreement`), retried |
 | receipt, event or input mismatch returned identically by every origin | halt |
 | reorganized block | wait, then observe again (resend identical bytes if dropped) |
-| finalized revert because another transaction released the burn | `released_elsewhere`; RelayStore `completed`; queue continues |
+| finalized revert because another transaction released the burn | `released_elsewhere`; RelayStore `completed` with `release_ref`; queue continues |
+| finalized revert, burn processed, no matching release found | `release_unverified` alert; queue continues |
+| finalized revert in a block later than the approval deadline | `expired`; queue continues |
 | any other finalized failed execution (status `0`) | ledger `failed`; stop; never retried |
 
 Every persisted halt is based on evidence that every origin returns
-identically; a single origin can only cause a temporary stop.
+identically; a single origin (stalling, rate limiting or lying) can only cause
+a temporary stop, and no approval deadline can turn a provider fault into a
+queue-wide halt.
 
 ### Tests
 
@@ -484,8 +513,13 @@ worker and an independent ledger (no second release; the independent ledger
 records `released_elsewhere`); a front-run copying our pending calldata; a
 third-party release before any claim and after our bytes were committed; an
 invalid recipient rejected without blocking the next transfer; a far-future
-timestamp and a different included transaction from a single origin (temporary
-stops, no halt); a RelayStore locked by another process (temporary stop, then
+timestamp and a different included transaction from a single origin (no
+halt); one origin rate-limiting the simulation or falsely reporting the replay
+flag until the approval expires (the stored bytes are sent once and recorded
+`expired`; the queue continues); a claimed row whose approval expires during
+downtime (released without a nonce); release evidence found from the deadline
+and our receipt after a front-run and downtime beyond the lookback; a release
+outside every window (`release_unverified` alert); a RelayStore locked by another process (temporary stop, then
 progress); SIGKILL in a child process at every boundary (claimed, signed,
 RelayStore submitted, broadcast marker, sent, ledger finalized, RelayStore
 completed) followed by recovery with exactly one transaction; a reorganization

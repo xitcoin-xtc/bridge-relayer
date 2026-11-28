@@ -198,6 +198,52 @@ for (const destination of ["cronos", "xitcoin"]) {
     ledger.close();
   }));
 
+  test(`${destination}: an unclaimed row has no bytes or nonce, frees the queue and can be claimed again`, () => fixture((path) => {
+    const ledger = open(path, destination);
+    const lease = ledger.acquireLease(owner(1));
+    ledger.claim(lease, claimOf(hash("1")));
+    const released = ledger.unclaim(lease, hash("1"));
+    assert.equal(released.state, "unclaimed"); assert.equal(released.nonce, null);
+    assert.deepEqual(ledger.unclaim(lease, hash("1")), released);
+    assert.deepEqual(ledger.active(), []); assert.equal(ledger.blocking().length, 0);
+    ledger.claim(lease, claimOf(hash("2")));
+    assert.throws(() => ledger.claim(lease, claimOf(hash("1"), "e")), failure); // still one unfinished transfer at a time
+    ledger.recordSigned(lease, signed(hash("2"), 0));
+    assert.throws(() => ledger.unclaim(lease, hash("2")), failure); // bytes exist: never released
+    ledger.markBroadcast(lease, hash("2"), { maxAttempts: 1 });
+    ledger.finalize(lease, hash("2"), { blockNumber: 3, blockHash: hash("f") });
+    const again = ledger.claim(lease, claimOf(hash("1"), "e")); // re-issued approval
+    assert.equal(again.state, "claimed"); assert.equal(again.approvalDigest, hash("e"));
+    assert.equal(ledger.recordSigned(lease, signed(hash("1"), 1)).nonce, 1);
+    ledger.close();
+  }));
+
+  test(`${destination}: expired and unverified-release rows are permanent, non-blocking and reported for attention`, () => fixture((path) => {
+    const ledger = open(path, destination);
+    const lease = ledger.acquireLease(owner(1));
+    ledger.claim(lease, claimOf(hash("1")));
+    ledger.recordSigned(lease, signed(hash("1"), 0));
+    assert.throws(() => ledger.markExpired(lease, hash("1"), { blockNumber: 2, blockHash: hash("f") }), failure); // never sent
+    ledger.markBroadcast(lease, hash("1"), { maxAttempts: 1 });
+    const expired = ledger.markExpired(lease, hash("1"), { blockNumber: 2, blockHash: hash("f") });
+    assert.equal(expired.state, "expired"); assert.equal(expired.nonce, 0);
+    assert.throws(() => ledger.markBroadcast(lease, hash("1"), { maxAttempts: 5 }), failure);
+    const unverified = ledger.releaseUnverified(lease, { ...claimOf(hash("2")), blockNumber: null, blockHash: null });
+    assert.equal(unverified.state, "release_unverified"); assert.equal(unverified.signedHex, null);
+    ledger.claim(lease, claimOf(hash("3")));
+    ledger.recordSigned(lease, signed(hash("3"), 1));
+    assert.throws(() => ledger.releaseUnverified(lease, { ...claimOf(hash("3")), blockNumber: null, blockHash: null }), failure);
+    ledger.markBroadcast(lease, hash("3"), { maxAttempts: 1 });
+    assert.throws(() => ledger.releaseUnverified(lease, { ...claimOf(hash("3")), blockNumber: null, blockHash: null }), failure);
+    assert.equal(ledger.releaseUnverified(lease, { ...claimOf(hash("3")), blockNumber: 5, blockHash: hash("e") }).blockNumber, 5);
+    ledger.reject(lease, { ...claimOf(hash("4")), code: "invalid_recipient" });
+    assert.deepEqual({ ...ledger.attention() }, { rejected: 1, expired: 1, releaseUnverified: 2 });
+    assert.equal(ledger.blocking().length, 0);
+    assert.equal(ledger.claim(lease, claimOf(hash("5"))).state, "claimed");
+    assert.equal(ledger.recordSigned(lease, signed(hash("5"), 2)).nonce, 2);
+    ledger.close();
+  }));
+
   test(`${destination}: lease fencing rejects every write from a previous holder`, () => fixture((path) => {
     const first = open(path, destination), second = open(path, destination);
     const now = 1_000_000;
@@ -368,6 +414,7 @@ test("schema triggers reject raw deletion, regression, replacement and nonce reu
       "UPDATE transfers SET claim_epoch = 2", "DELETE FROM worker_lease", "UPDATE worker_lease SET epoch = 3",
       `UPDATE worker_lease SET owner = '${owner(9)}'`, "UPDATE ledger_binding SET binding = '{}'", "DELETE FROM ledger_binding",
       `UPDATE transfers SET source_ref = '${hash("9")}'`, "UPDATE transfers SET state = 'rejected', reason_code = 'x'",
+      "UPDATE transfers SET state = 'unclaimed'", "UPDATE transfers SET state = 'expired', block_number = NULL, block_hash = NULL",
       `INSERT INTO transfers (transfer_id, approval_digest, request_hash, state, claim_epoch, nonce, signed_hex, transaction_digest,
         transaction_hash, broadcast_attempts, created_at, updated_at) VALUES ('${hash("2")}', '${hash("b")}', '${hash("d")}',
         'signed', 1, 6, '0x00', '${hash("3")}', '${hash("4")}', 0, 0, 0)`]) {
