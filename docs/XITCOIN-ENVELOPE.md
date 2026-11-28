@@ -11,7 +11,7 @@ it never loads a key or signs a transaction.
   Cosmos SDK v0.54.4. `encoding/config.go` and `evmd/app.go` enable the SDK's
   default signing modes, including SIGN_MODE_DIRECT.
 - Cosmos SDK v0.54.4 resolves to `dedeb7c80a91c47ae83f5352e29c3dd34e4a3fc6`.
-  Its `proto/cosmos/tx/v1beta1/tx.proto` is copied in `docs/evidence/` for
+  Its `proto/cosmos/tx/v1beta1/tx.proto` is copied in `test/fixtures/proto/` for
   review (upstream Cosmos SDK Apache-2.0 source). `x/auth/tx/config.go` declares
   DIRECT among the enabled defaults. The proto specifies SHA-256 of TxRaw as
   the transaction hash.

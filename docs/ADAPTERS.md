@@ -10,10 +10,12 @@ statements describe those offline APIs, which remain unchanged.
 ## Verified source evidence
 
 The chain source at commit
-[`5ec8692e8fc1813d0892ee535af1a73953a1c4fb`](https://github.com/xitcoin-org/pos-chain/tree/5ec8692e8fc1813d0892ee535af1a73953a1c4fb/proto/cosmos/evm/bridge/v1)
+[`5ec8692e8fc1813d0892ee535af1a73953a1c4fb`](https://github.com/xitcoin-xtc/pos-chain/tree/5ec8692e8fc1813d0892ee535af1a73953a1c4fb/proto/cosmos/evm/bridge/v1)
 contains `MsgSubmitAttestation` in `tx.proto` and `AttestationStatus` in
-`query.proto`. A verbatim query schema is checked in at
-[evidence/xitcoin-query.proto](evidence/xitcoin-query.proto). The status response
+`query.proto`. The query schema is checked in as a test fixture at
+[test/fixtures/proto/xitcoin-query.proto](../test/fixtures/proto/xitcoin-query.proto),
+verbatim except for its `go_package` option, which names the current
+`xitcoin-xtc` organization. The status response
 contains only `attestation_id` and `processed`. It provides no transaction
 reference, approved payload, block identity, pending state or finality proof.
 The offline status inspector validates an explicit two-field response and never
@@ -21,7 +23,7 @@ authorizes sending or completion. Omitted protobuf JSON default fields fail
 closed; gateway compatibility has not been verified.
 
 The vault ABI is checked against
-[`contracts` at d3ae7058d4c6697a9ec079864e1891b661de5b3e](https://github.com/xitcoin-org/contracts/blob/d3ae7058d4c6697a9ec079864e1891b661de5b3e/contracts/cronos/bridge/CronosBridgeVault.sol).
+[`contracts` at d3ae7058d4c6697a9ec079864e1891b661de5b3e](https://github.com/xitcoin-xtc/contracts/blob/d3ae7058d4c6697a9ec079864e1891b661de5b3e/contracts/cronos/bridge/CronosBridgeVault.sol).
 Source availability does not prove the identity or state of a deployed contract.
 
 The `AttestationStatus` query takes the attestation ID, which since attestation
@@ -138,8 +140,9 @@ adapters. It supplies no broadcast permission and leaves startup disabled.
 ## Offline Xitcoin message construction (operational-v1)
 
 `prepareXitcoinAttestation` builds only
-`/cosmos.evm.bridge.v1.MsgSubmitAttestation`, using the verbatim pinned
-[transaction schema](evidence/xitcoin-tx.proto) and the generated `tx.pb.go`
+`/cosmos.evm.bridge.v1.MsgSubmitAttestation`, using the pinned
+[transaction schema](../test/fixtures/proto/xitcoin-tx.proto) (verbatim except
+for `go_package`) and the generated `tx.pb.go`
 marshal tags at the same pos-chain commit. It binds the local plan to
 `xitcoin-testnet-v2-1`, source chain `338`, and the disabled manifest route.
 It verifies every signature against an explicitly supplied three-member set,
@@ -152,7 +155,7 @@ requirement is the relayer approval protocol's stricter policy.
 
 Raw signatures must be exactly 65 bytes, with fixed-width big-endian scalars
 `1 <= r < n`, `1 <= s <= n/2`, and recovery byte `0`, `1`, `27` or `28`, matching
-[pinned recoverSigner](https://github.com/xitcoin-org/pos-chain/blob/5ec8692e8fc1813d0892ee535af1a73953a1c4fb/x/bridge/types/signatures.go)
+[pinned recoverSigner](https://github.com/xitcoin-xtc/pos-chain/blob/5ec8692e8fc1813d0892ee535af1a73953a1c4fb/x/bridge/types/signatures.go)
 and its `ValidateSignatureValues(..., true)` call. Original bytes are checked
 before ethers recovery and preserved in the message; unsupported recovery IDs
 (including `0x24` and `0x26`) and high-s signatures are rejected. That supplied set still requires authenticated

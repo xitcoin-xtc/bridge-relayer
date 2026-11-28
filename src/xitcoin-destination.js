@@ -27,7 +27,7 @@ function field(number, value) {
   return Buffer.concat([varint(BigInt(number * 8 + 2)), varint(BigInt(bytes.length)), bytes]);
 }
 
-// Exact message bytes only, from docs/evidence/xitcoin-tx.proto. NOT TxRaw or sign bytes.
+// Exact message bytes only, from test/fixtures/proto/xitcoin-tx.proto. NOT TxRaw or sign bytes.
 export function prepareXitcoinAttestation(input) {
   try {
     const value = destinationSnapshot(input);
