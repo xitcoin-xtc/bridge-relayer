@@ -447,9 +447,21 @@ Resolve, by owner decision and without touching the broadcast ledger:
   one version at a time, only when its schema and binding are exact; back it up
   before upgrading, like any ledger, and never restore an older copy over a
   migrated one.
-- Anyone who has seen our bytes can re-wrap the same signed content with
-  another signature encoding (the chain's eth_secp256k1 verifier ignores the
-  65th byte and accepts 64-byte signatures). Such a copy that lands first is
+- Cosmos transactions are signed with 64-byte `R || S` (low S, no recovery
+  byte), the only encoding `xitcoin-security-hardening-v2` accepts and one
+  the current binary accepts too: deploy this release before the upgrade
+  height. Its broadcast ledger is bound to the new `chainSchemaCommit`, so it
+  refuses, unchanged, a ledger created by an earlier release, which may hold
+  65-byte signatures. Before the upgrade height, stop the earlier submitter,
+  check its ledger read-only for unfinished rows, discard (never send) any
+  65-byte transaction that was signed but never sent, keep the old ledger
+  file archived and unedited, and start this release with a new `ledgerPath`.
+  Follow [the switch procedure](SUBMITTERS.md#switching-to-64-byte-signatures-before-the-hardening-v2-upgrade)
+  step by step, including the offline review of a transfer whose RelayStore
+  row names such a transaction.
+- Before that upgrade, anyone who had seen our bytes could append a byte to
+  our signature (earlier binaries ignored a 65th byte); a repeated `TxRaw`
+  body field is another possible re-wrapping. Such a copy that lands first is
   recognised by signed content and recorded as `released_elsewhere` with its
   hash.
 - A paused or disabled route, a fee above the cap or an insufficient balance

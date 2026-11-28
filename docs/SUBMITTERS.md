@@ -795,7 +795,7 @@ password.
       { "rpcUrl": "http://127.0.0.1:26677", "restUrl": "http://127.0.0.1:1337" }
     ],
     "allowLoopbackHttp": true,
-    "chainSchemaCommit": "c006842b4f02c68055b47690ef144df408b7f962",
+    "chainSchemaCommit": "cfe743d4f39d4f9e77ba4f0257ea3e3f21800dff",
     "signerSetVersion": "1",
     "authorizedSigners": ["SIGNER_1", "SIGNER_2", "SIGNER_3"],
     "submitter": "SUBMITTER_XTC_ACCOUNT",
@@ -939,10 +939,16 @@ source reference, nonce, destination, amount, deadline, the stored 65-byte
 approvals), no memo, timeout, extension option or unordered flag; one signer
 info with the `/cosmos.evm.crypto.v1.ethsecp256k1.PubKey` compressed key,
 `SIGN_MODE_DIRECT` and the account sequence; one `axtc` fee coin without payer
-or granter. The signature is the low-S `R || S || V` (V in {0, 1}) signature of
+or granter. The signature is exactly 64 bytes, the low-S `R || S` of
 Keccak-256 of the `SignDoc` (body, auth info, chain ID `xitcoin-testnet-v2-1`,
-account number), as the chain's eth_secp256k1 keyring produces. The
-transaction hash is SHA-256 of the `TxRaw` bytes (the CometBFT hash and the
+account number), without a recovery byte: from pos-chain
+`xitcoin-security-hardening-v2` (pos-chain #108) the chain accepts only this
+encoding for `SIGN_MODE_DIRECT` and rejects a 65-byte `R || S || V` with code
+4; earlier binaries accept both. The submitter checks that the recovery byte
+its key signer returns recovers the submitter key, then drops it; a stored
+transaction is re-verified by recovering the key from `R || S` with recovery
+byte 27 or 28. The approval signatures inside `MsgSubmitAttestation` are
+unchanged (65 bytes, V 27 or 28). The transaction hash is SHA-256 of the `TxRaw` bytes (the CometBFT hash and the
 `tx_hash` of the attestation record). The encoder is checked byte for byte
 against `test/fixtures/xitcoin-chain-vectors.json`, which CI regenerates with
 the chain's own Go code at the pinned commit.
@@ -969,15 +975,17 @@ signed transaction.
 
 ### Confirmation
 
-Our transaction is recognised by its signed content, not only by its hash:
-pos-chain's eth_secp256k1 verifier (`crypto/ethsecp256k1`,
-`verifySignatureECDSA`) drops a 65th signature byte without checking it and
-also accepts a 64-byte `R || S`, and the SDK's `TxRaw` decoder accepts a
-repeated `body_bytes` field (the last wins) and overlong field tags. Anyone who
-has seen our bytes can therefore re-wrap the same body, auth info and `R || S`
-into another `TxRaw` with another hash, which spends our sequence and fee
-exactly as ours would. Such a re-encoding is our signed transaction; when it
-lands first it is recognised in the block that consumed our sequence.
+Our transaction is recognised by its signed content (body, auth info and
+`R || S`), not only by its hash. Before `xitcoin-security-hardening-v2`,
+pos-chain's eth_secp256k1 verifier (`crypto/ethsecp256k1`) dropped a 65th
+signature byte without checking it, so a copy of our 64-byte signature with
+any byte appended verified; from that upgrade the chain refuses such a copy.
+The SDK's `TxRaw` decoder accepts a repeated `body_bytes` field (the last
+wins) and overlong field tags. Anyone who has seen our bytes may therefore be
+able to re-wrap the same body, auth info and `R || S` into another `TxRaw`
+with another hash, which spends our sequence and fee exactly as ours would.
+Such a re-encoding is our signed transaction; when it lands first it is
+recognised in the block that consumed our sequence.
 
 A transfer completes only when: the transaction that consumed our sequence
 carries our signed content, a strict majority of origins returns its
@@ -1126,16 +1134,16 @@ disagreement on the route, on the replay state and a stalled simulation
 quorum-signed resume; an approval too close to its deadline; signed bytes first
 sent after the deadline (`expired`, the next transfer proceeds); a third-party
 submission before any claim (no submitter transaction) and after we signed
-(our bytes consume the sequence once, then `released_elsewhere`); and a
-re-encoding of our signed bytes with another signature byte, which the chain
-accepts, landing first (recognised by signed content: `released_elsewhere`
-with its hash, never a halt).
+(our bytes consume the sequence once, then `released_elsewhere`); and our
+signed content with each recovery byte (0, 1, 27, 28) appended, which the
+chain refuses with code 4 while our 64-byte bytes land and complete.
 `test/xitcoin-adapter.test.js` covers the remaining decisions against a
 deterministic model of the origins: ante-handler failures, consumed and
 regressed sequences, failure classification at both heights, history no longer
 served, mismatching records from one origin, strict-majority sends with three
-origins, stored-byte tampering, re-encodings with any 65th byte or 64-byte
-signatures (also next to our own ante-rejected bytes in one block), resends
+origins, stored-byte tampering, re-encodings with a 65th byte (accepted by
+earlier binaries) or a repeated body field (also next to our own
+ante-rejected bytes in one block), resends
 gated on the fee, on nothing in flight and on the backoff, with no attempt
 cap past 32, re-encoded copies processed before the searched window, and
 old transaction results from a minority of origins that can never force a
@@ -1149,6 +1157,63 @@ These tests do not contact Xitcoin or Cronos testnet, use real keys or prove
 behaviour under power loss. The testnet's fee parameters, its REST and RPC
 providers and the v2 upgrade itself must still be confirmed in the controlled
 canary.
+
+### Switching to 64-byte signatures before the hardening-v2 upgrade
+
+This release signs Cosmos transactions with 64-byte `R || S`. That is the only
+form `xitcoin-security-hardening-v2` accepts, and the current testnet binary
+accepts it too, so deploy this release before the upgrade height. Its
+`chainSchemaCommit` (`XITCOIN_CHAIN_SCHEMA_COMMIT`) is pos-chain `cfe743d`
+(#108), and the broadcast ledger binding includes it. A ledger created by an
+earlier release, bound to `c006842`, is therefore refused unchanged, and its
+bytes are never verified, resent or migrated. This is deliberate: that ledger
+may hold 65-byte `R || S || V` transactions, which the chain rejects from the
+upgrade height. Never broadcast them once that height is reached.
+
+Earlier releases recorded every Cosmos transaction with a 65-byte signature.
+Find any such transaction that was signed but never sent:
+
+1. Stop the earlier submitter (SIGTERM; it releases its lease).
+2. As the submitter service user, read its ledger read-only, never with a
+   writable connection:
+
+   ```sh
+   sudo -u xitcoin-bridge-submitter-xitcoin sh -c 'umask 077; exec sqlite3 -readonly "$1"' sh \
+     /var/lib/xitcoin-bridge/submitter-xitcoin/<ledger file named by the manifest ledgerPath> <<'SQL'
+   SELECT transfer_id, source_ref, state, nonce, broadcast_attempts, transaction_hash,
+          substr(signed_hex, -134, 4) = '1a41' AS signature_65_bytes
+     FROM transfers WHERE state IN ('claimed', 'signed', 'broadcast');
+   SQL
+   ```
+
+   A row in `signed` state with `broadcast_attempts = 0` and
+   `signature_65_bytes = 1` is a 65-byte transaction that was signed but never
+   sent. Its sequence is unused on chain. The last bytes of `signed_hex` are
+   the `TxRaw` signature field: `1a41` and 65 bytes for the old form, `1a40`
+   and 64 bytes for the new one.
+3. Discard such bytes before the upgrade height. Do not send them, and do not
+   delete, edit or copy the ledger: keep the file, read-only, as the record of
+   what the earlier release signed. The coordinator store references that
+   transaction once the row reached RelayStore `submitted`
+   (`destination_ref`). A RelayStore reference to a transaction that the new
+   ledger does not hold halts the new submitter
+   (`submitted_without_ledger_custody`) by design. Resolve each such transfer
+   in the offline review before starting the new submitter. There is no tool
+   for this yet, and it needs owner approval. A row that was never bound to
+   RelayStore (`approved`, `destination_ref` empty) needs nothing: the new
+   submitter claims it under its own ledger and signs 64 bytes at the same,
+   still unused, sequence.
+4. Rows in `broadcast` state were sent. Before the upgrade height they can
+   still land and conclude under the earlier release: let them finish there,
+   then check again. From the upgrade height they can never land; treat them
+   like step 3.
+5. With no unfinished row left, start this release with a new `ledgerPath`
+   (the new file is created exclusively; the old one stays archived). The new
+   ledger takes its first sequence from verified chain state.
+
+On `xitcoin-testnet-v2-1` no Xitcoin submitter has run: it needs the typed
+bridge queries of the same upgrade. So no 65-byte ledger row is expected
+outside staging rehearsals with an earlier binary. Rehearse the steps there.
 
 ### Deployment requirements (not performed by this repository)
 

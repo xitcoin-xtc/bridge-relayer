@@ -6,7 +6,9 @@ Update: the runtime transaction of the
 by the chain's own Go code (`test/fixtures/xitcoin-chain-vectors.json`) and
 accepted by a real xitcoind node. The offline envelope below is unchanged and
 still not used at runtime; the blockers it lists are closed by that submitter,
-not by this module.
+not by this module. Its 65-byte `R || S || V` signature form is rejected by
+pos-chain from `xitcoin-security-hardening-v2`, which accepts only 64-byte
+`R || S` for `SIGN_MODE_DIRECT` (the form the submitter signs).
 
 This module is not connected to startup, a signer, a chain endpoint or a
 broadcaster. Every result keeps `mayBroadcast: false` and `finalized: false`.
