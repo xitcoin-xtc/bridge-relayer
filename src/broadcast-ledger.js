@@ -26,7 +26,12 @@ import { PrivateJournalPath } from "./journal-path.js";
 //   - `expired` (our identical bytes were mined and reverted after the approval
 //     deadline, consuming their nonce) and `release_unverified` (the destination
 //     reports the transfer processed but no matching release was found) are
-//     permanent, never block the queue and are reported for operator attention.
+//     permanent, never block the queue and are reported for operator attention;
+//   - `reverted`: our identical bytes were mined before the deadline and
+//     reverted for a lasting, transfer-specific vault condition (daily limit,
+//     liquidity, release limit, signer rotation). Their nonce is
+//     consumed; permanent, non-blocking and reported for attention. Any other
+//     revert stays `failed`, which blocks.
 // Destination adapters validate the bytes; this module treats them as opaque.
 const failure = () => new Error("broadcast ledger unavailable or conflicting");
 const HASH = /^0x[0-9a-f]{64}$/;
@@ -36,7 +41,7 @@ const CODE = /^[a-z][a-z0-9_]{0,63}$/;
 const OWNER = /^[0-9a-f]{32}$/;
 export const LEDGER_MAX_BROADCAST_ATTEMPTS = 32;
 const MAX_SIGNED_HEX = 65_536;
-const TERMINAL = Object.freeze(["finalized", "failed", "halted", "released_elsewhere", "rejected", "expired", "release_unverified"]);
+const TERMINAL = Object.freeze(["finalized", "failed", "halted", "released_elsewhere", "rejected", "expired", "release_unverified", "reverted"]);
 const STATES = Object.freeze(["claimed", "unclaimed", "signed", "broadcast", ...TERMINAL]);
 const SOURCE = /^(?:0x)?[0-9a-f]{64}$/;
 const DEFER_BASE_MS = 60_000;
@@ -54,7 +59,7 @@ CREATE TABLE transfers (
   approval_digest TEXT NOT NULL CHECK(length(approval_digest) = 66),
   request_hash TEXT NOT NULL CHECK(length(request_hash) = 66),
   state TEXT NOT NULL CHECK(state IN ('claimed', 'unclaimed', 'signed', 'broadcast', 'finalized', 'failed', 'halted',
-    'released_elsewhere', 'rejected', 'expired', 'release_unverified')),
+    'released_elsewhere', 'rejected', 'expired', 'release_unverified', 'reverted')),
   claim_epoch INTEGER NOT NULL CHECK(claim_epoch >= 1),
   nonce INTEGER UNIQUE CHECK(nonce >= 0),
   signed_hex TEXT CHECK(length(signed_hex) BETWEEN 4 AND ${MAX_SIGNED_HEX}),
@@ -71,14 +76,14 @@ CREATE TABLE transfers (
   CHECK(state IN ('claimed', 'unclaimed', 'halted', 'released_elsewhere', 'rejected', 'release_unverified') OR signed_hex IS NOT NULL),
   CHECK(state NOT IN ('claimed', 'unclaimed', 'rejected') OR signed_hex IS NULL),
   CHECK((block_hash IS NULL) = (block_number IS NULL)
-    AND (state IN ('finalized', 'failed', 'released_elsewhere', 'expired')
+    AND (state IN ('finalized', 'failed', 'released_elsewhere', 'expired', 'reverted')
       OR (state = 'release_unverified' AND signed_hex IS NOT NULL)) = (block_hash IS NOT NULL)),
   CHECK((state = 'released_elsewhere') = (release_hash IS NOT NULL)),
   CHECK(release_hash IS NULL OR transaction_hash IS NULL OR release_hash <> transaction_hash),
-  CHECK((state IN ('halted', 'rejected')) = (reason_code IS NOT NULL)),
-  CHECK(state IN ('broadcast', 'finalized', 'failed', 'halted', 'released_elsewhere', 'expired', 'release_unverified')
+  CHECK((state IN ('halted', 'rejected', 'reverted')) = (reason_code IS NOT NULL)),
+  CHECK(state IN ('broadcast', 'finalized', 'failed', 'halted', 'released_elsewhere', 'expired', 'release_unverified', 'reverted')
     OR broadcast_attempts = 0),
-  CHECK(state NOT IN ('broadcast', 'finalized', 'failed', 'expired') OR broadcast_attempts >= 1),
+  CHECK(state NOT IN ('broadcast', 'finalized', 'failed', 'expired', 'reverted') OR broadcast_attempts >= 1),
   CHECK(state NOT IN ('released_elsewhere', 'release_unverified') OR signed_hex IS NULL OR broadcast_attempts >= 1)
 ) STRICT;
 CREATE TABLE deferrals (
@@ -109,7 +114,7 @@ CREATE TRIGGER transfers_insert BEFORE INSERT ON transfers
     OR new.broadcast_attempts <> 0
   BEGIN SELECT RAISE(ABORT, 'insert'); END;
 CREATE TRIGGER transfers_terminal BEFORE UPDATE ON transfers
-  WHEN old.state IN ('finalized', 'failed', 'halted', 'released_elsewhere', 'rejected', 'expired', 'release_unverified')
+  WHEN old.state IN ('finalized', 'failed', 'halted', 'released_elsewhere', 'rejected', 'expired', 'release_unverified', 'reverted')
   BEGIN SELECT RAISE(ABORT, 'terminal'); END;
 CREATE TRIGGER transfers_progress BEFORE UPDATE ON transfers
   WHEN NOT ((old.state = 'claimed' AND new.state IN ('claimed', 'unclaimed', 'signed', 'halted', 'released_elsewhere', 'rejected',
@@ -117,7 +122,7 @@ CREATE TRIGGER transfers_progress BEFORE UPDATE ON transfers
     OR (old.state = 'unclaimed' AND new.state IN ('claimed', 'halted', 'released_elsewhere', 'rejected', 'release_unverified'))
     OR (old.state = 'signed' AND new.state IN ('broadcast', 'halted'))
     OR (old.state = 'broadcast' AND new.state IN ('broadcast', 'finalized', 'failed', 'halted', 'released_elsewhere', 'expired',
-      'release_unverified')))
+      'release_unverified', 'reverted')))
   BEGIN SELECT RAISE(ABORT, 'transition'); END;
 CREATE TRIGGER transfers_immutable BEFORE UPDATE ON transfers
   WHEN new.transfer_id IS NOT old.transfer_id OR new.source_ref IS NOT old.source_ref OR new.claim_epoch IS NOT old.claim_epoch
@@ -440,15 +445,16 @@ export class BroadcastLedger {
     }, lease);
   }
 
-  #conclude(lease, transferId, state, { blockNumber, blockHash } = {}) {
+  #conclude(lease, transferId, state, { blockNumber, blockHash } = {}, reason = null) {
     if (!hash(transferId) || !hash(blockHash) || !Number.isSafeInteger(blockNumber) || blockNumber < 0) throw failure();
     return this.#transaction(() => {
       const existing = this.#raw(transferId);
-      if (existing?.state === state && existing.block_hash === blockHash && existing.block_number === blockNumber) return this.#snapshot(existing);
+      if (existing?.state === state && existing.block_hash === blockHash && existing.block_number === blockNumber
+          && existing.reason_code === reason) return this.#snapshot(existing);
       if (existing?.state !== "broadcast") throw failure();
-      this.#database.prepare("UPDATE transfers SET state = ?, block_number = ?, block_hash = ?, updated_at = ? WHERE transfer_id = ? AND state = 'broadcast'")
-        .run(state, blockNumber, blockHash, Math.floor(Date.now() / 1000), transferId);
-      this.#event(transferId, state, state, lease.epoch);
+      this.#database.prepare(`UPDATE transfers SET state = ?, block_number = ?, block_hash = ?, reason_code = ?, updated_at = ?
+        WHERE transfer_id = ? AND state = 'broadcast'`).run(state, blockNumber, blockHash, reason, Math.floor(Date.now() / 1000), transferId);
+      this.#event(transferId, state, reason ?? state, lease.epoch);
       return this.#snapshot(this.#raw(transferId));
     }, lease);
   }
@@ -461,6 +467,13 @@ export class BroadcastLedger {
   // their nonce is consumed, the transfer needs a new approval, and the queue
   // moves on. Permanent and reported for attention, never blocking.
   markExpired(lease, transferId, inclusion) { return this.#conclude(lease, transferId, "expired", inclusion); }
+
+  // Mined before the deadline and reverted for a lasting vault condition that
+  // belongs to this transfer: its nonce is consumed and the queue moves on.
+  markReverted(lease, transferId, { blockNumber, blockHash, code } = {}) {
+    if (typeof code !== "string" || !CODE.test(code)) throw failure();
+    return this.#conclude(lease, transferId, "reverted", { blockNumber, blockHash }, code);
+  }
 
   // Release a claimed row that has no bytes and no nonce (for example its
   // approval expired), so it no longer holds the single unfinished slot. It may
@@ -510,8 +523,9 @@ export class BroadcastLedger {
     try {
       this.#path.verify();
       const counts = Object.fromEntries(this.#database.prepare(`SELECT state, count(*) AS n FROM transfers
-        WHERE state IN ('rejected', 'expired', 'release_unverified') GROUP BY state`).all().map((row) => [row.state, row.n]));
-      return Object.freeze({ rejected: counts.rejected ?? 0, expired: counts.expired ?? 0, releaseUnverified: counts.release_unverified ?? 0 });
+        WHERE state IN ('rejected', 'expired', 'release_unverified', 'reverted') GROUP BY state`).all().map((row) => [row.state, row.n]));
+      return Object.freeze({ rejected: counts.rejected ?? 0, expired: counts.expired ?? 0, releaseUnverified: counts.release_unverified ?? 0,
+        reverted: counts.reverted ?? 0 });
     } catch { throw failure(); }
   }
 

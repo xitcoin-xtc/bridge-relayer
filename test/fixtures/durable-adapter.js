@@ -127,6 +127,9 @@ export function modelAdapter(destination, chain, { maxBroadcastAttempts = 3, con
         if (receipt.status === 0 && receipt.timestamp > decode(row.signedHex).deadline) {
           return { action: "expired", blockNumber: receipt.blockNumber, blockHash: receipt.blockHash };
         }
+        if (receipt.status === 0 && chain.lastingCause) {
+          return { action: "reverted", code: chain.lastingCause, blockNumber: receipt.blockNumber, blockHash: receipt.blockHash };
+        }
         return { action: receipt.status === 1 ? "finalized" : "failed", blockNumber: receipt.blockNumber, blockHash: receipt.blockHash };
       }
       if (chain.mempool.has(row.transactionHash)) return { action: "pending" };

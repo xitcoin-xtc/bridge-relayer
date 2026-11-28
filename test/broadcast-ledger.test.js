@@ -237,7 +237,7 @@ for (const destination of ["cronos", "xitcoin"]) {
     assert.throws(() => ledger.releaseUnverified(lease, { ...claimOf(hash("3")), blockNumber: null, blockHash: null }), failure);
     assert.equal(ledger.releaseUnverified(lease, { ...claimOf(hash("3")), blockNumber: 5, blockHash: hash("e") }).blockNumber, 5);
     ledger.reject(lease, { ...claimOf(hash("4")), code: "invalid_recipient" });
-    assert.deepEqual({ ...ledger.attention() }, { rejected: 1, expired: 1, releaseUnverified: 2 });
+    assert.deepEqual({ ...ledger.attention() }, { rejected: 1, expired: 1, releaseUnverified: 2, reverted: 0 });
     assert.equal(ledger.blocking().length, 0);
     assert.equal(ledger.claim(lease, claimOf(hash("5"))).state, "claimed");
     assert.equal(ledger.recordSigned(lease, signed(hash("5"), 2)).nonce, 2);

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { BoundedJsonRpcClient, TransportError, boundedRequest, createBoundedGetFetch, endpoint, independentEndpoints,
   parseBoundedJson } from "../src/bounded-transport.js";
-import { CronosRpcQuorum, normalizeReceipt, normalizeTransaction, normalizeBlock } from "../src/cronos-rpc.js";
+import { CronosRpcQuorum, normalizeReceipt, normalizeTransaction, normalizeBlock, safeQuantity } from "../src/cronos-rpc.js";
 import { CometBftHttpClient, decodeXitcoinOutboundBlock, decodeXitcoinOutboundTransaction } from "../src/network.js";
 
 const code = (expected) => (error) => error instanceof TransportError && error.code === expected
@@ -178,4 +178,29 @@ test("a revert counts only when every origin reports an execution error; rate li
     await assert.rejects(quorum({ "a.example": fault, "b.example": revert }).callVerdict({}), (error) => error instanceof TransportError);
     await assert.rejects(quorum({ "a.example": { result: "0x5208" }, "b.example": fault }).estimateVerdict({}), (error) => error instanceof TransportError);
   }
+});
+
+test("strict-majority reads tolerate one faulty origin among three, never among two", async () => {
+  const build = (answers) => new CronosRpcQuorum({ urls: Object.keys(answers).map((host) => `https://${host}`), fetchImpl: async (target, init) => {
+    const { id } = JSON.parse(init.body);
+    const answer = answers[new URL(target).host];
+    if (answer === "down") throw new Error("connection refused");
+    return json({ jsonrpc: "2.0", id, ...answer });
+  } });
+  const three = (a, b, c) => build({ "a.example": a, "b.example": b, "c.example": c });
+  const n = (value) => ({ result: value });
+  const revert = { error: { code: 3, message: "execution reverted" } }, limited = { error: { code: -32005 } };
+  assert.deepEqual({ ...await three(n("0x5"), n("0x5"), n("0x7")).majority("eth_getTransactionCount", [], safeQuantity) }, { value: 5, unanimous: false });
+  assert.deepEqual({ ...await three(n("0x5"), n("0x5"), "down").majority("eth_getTransactionCount", [], safeQuantity) }, { value: 5, unanimous: false });
+  assert.deepEqual({ ...await three(n("0x5"), n("0x5"), n("0x5")).majority("eth_getTransactionCount", [], safeQuantity) }, { value: 5, unanimous: true });
+  await assert.rejects(three(n("0x5"), n("0x6"), n("0x7")).majority("eth_getTransactionCount", [], safeQuantity), (error) => error.code === "rpc_disagreement");
+  await assert.rejects(build({ "a.example": n("0x5"), "b.example": "down" }).majority("eth_getTransactionCount", [], safeQuantity),
+    (error) => error.code === "rpc_disagreement");
+  assert.equal((await three(n("0x"), n("0x"), limited).callMajorityVerdict({})).reverted, false);
+  assert.equal((await three(revert, revert, n("0x")).callMajorityVerdict({})).reverted, true);
+  await assert.rejects(three(revert, n("0x"), limited).callMajorityVerdict({}), (error) => error.code === "rpc_disagreement");
+  assert.equal(await three(n("0x152"), n("0x152"), "down").chainIdMajority(), 338n);
+  await assert.rejects(three(n("0x152"), n("0x152"), n("0x19")).chainIdMajority(), (error) => error.code === "cronos_mainnet_rejected");
+  await assert.rejects(build({ "a.example": n("0x152"), "b.example": "down" }).chainIdMajority(), (error) => error.code === "rpc_disagreement");
+  assert.deepEqual(await three(n("0x5"), n("0x6"), "down").majorityAnswers("eth_blockNumber", [], safeQuantity), [5, 6]);
 });

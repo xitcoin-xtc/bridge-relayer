@@ -208,7 +208,15 @@ The ledger enforces, in one fenced immediate transaction per change:
   consuming their nonce; the burn still awaits a new approval and RelayStore
   keeps it `submitted`, in flight) and `release_unverified` (the destination
   reports the transfer processed but no matching release was found; never a
-  completion, RelayStore unchanged). `rejected` rows are counted too.
+  completion, RelayStore unchanged). `rejected` rows are counted too, and so
+  are `reverted` rows: our bytes were mined before the deadline and reverted
+  for a lasting condition of this transfer (daily release limit exhausted,
+  insufficient liquidity, amount above the release limit, signer-set
+  rotation), as shown by vault state at the inclusion block on every origin.
+  Their nonce is consumed and retrying would need a second transaction for
+  the transfer, which the ledger forbids, so the transfer is parked without
+  blocking the queue. Out of gas, a revert under a guardian pause or any
+  unexplained revert stays `failed` (blocking).
 
 SQLite triggers repeat these rules (no delete, no regression, no replacement,
 immutable source reference, sequential nonce, monotonic lease epoch) as defense in depth against
@@ -222,8 +230,10 @@ self-consistency guarantees and is not detected.
 destination adapter (chain reads, signing and byte validation). It owns the
 ordering:
 
-1. reject any blocking ledger row; reconcile RelayStore `submitted` rows,
-   which must reference a transaction the ledger holds; find an unfinished
+1. reject any blocking ledger row; reconcile every RelayStore `submitted` row
+   (keyset pages, never a fixed window, because expired, reverted and
+   unverified rows stay `submitted`), each of which must reference a
+   transaction the ledger holds; find an unfinished
    transfer by the source reference stored in its ledger row (never by a
    bounded window over RelayStore rows);
 2. otherwise walk all `approved` transfers in order with keyset pagination,
@@ -245,7 +255,8 @@ ordering:
    `released_elsewhere` (our bytes reverted because another finalized
    transaction released the transfer first, for example by copying our
    pending calldata), `expired` (our bytes reverted after the approval
-   deadline), `release_unverified`, `failed` (any other finalized failed
+   deadline), `reverted` (before the deadline, for a lasting condition of this
+   transfer), `release_unverified`, `failed` (any other finalized failed
    execution; permanent and blocking), `finalized`, or a persisted `halt`;
 8. complete RelayStore only after the ledger records finality or a verified
    release elsewhere. `destination_ref` keeps referencing only our own
@@ -422,12 +433,25 @@ The submitter signs one legacy (type 0) EIP-155 transaction for chain `338` with
 plan and signed-byte inspector re-check every field before the ledger commits
 the bytes, hash and nonce. Then RelayStore records `submitted` with that hash,
 the broadcast marker is committed, and the identical bytes are sent to every
-origin. Before the first send the nonce, pause, replay flag, deadline and a
-simulation of the exact signed transaction are checked again. If, by any clock
-or origin, the approval deadline margin is already lost (for example after a
-provider fault or downtime), the stored bytes are sent once without a
-simulation so that their reserved nonce is consumed; if they revert after the
-deadline the ledger records `expired` and the queue moves on.
+origin. Before the first send the deadline is checked first: once the local
+clock says the margin is lost, the stored bytes are sent at once, without any
+origin read or simulation, so their reserved nonce is consumed whatever the
+origins do (sending our own committed bytes is never unsafe). Otherwise the
+nonce, pause, replay flag, latest block time and a simulation of the exact
+signed transaction are read from a strict majority of origins: with three or
+more origins one faulty origin no longer holds the row until its approval
+expires. These reads only decide to send or wait; a persisted halt
+(`nonce_consumed_before_send`, `account_nonce_regressed`,
+`foreign_pending_transaction`) still requires every origin to agree. If the
+origins report the burn processed or the deadline margin lost, the stored bytes
+are sent without simulation; a revert after the deadline is then recorded as
+`expired`.
+
+Remaining exposure: with two origins (the minimum) a strict majority is both,
+so one faulty origin still holds a signed row until the local deadline margin
+is lost, at which point its bytes are sent and the transfer typically ends
+`expired`, needing a new approval. Configure three or more independent
+origins. Confirmation, completion and every halt still need all origins.
 
 ### Confirmation
 
@@ -448,11 +472,16 @@ release a burn first, for example by copying our pending calldata with a higher
 gas price. That is not a failure: the recipient received exactly the approved
 amount. When every origin reports the burn processed, the submitter searches
 the vault's `Released` event for that burn ID backwards over at most
-`releaseLookbackBlocks`, in `logRangeBlocks` chunks, from the highest block at
-or before the approval deadline (no release using this request or an earlier
-one can be later; re-issues only extend the deadline) and, when our own
-transaction was mined, also from its block. Downtime therefore never pushes
-the evidence out of the window. It requires on every
+`releaseLookbackBlocks`, in `logRangeBlocks` chunks: first back from our own
+receipt block when our transaction was mined (a front-run is mined no later
+than our revert), then back from the highest block at or before the approval
+deadline (no release using this request or an earlier one can be later;
+re-issues only extend the deadline). That deadline block is searched only
+within the last `releaseLookbackBlocks` blocks, never from block 0. Origins
+must serve at least that much recent block and log history. Older history that
+an origin explicitly cannot serve (a null block or a JSON-RPC error, as from a
+pruned or state-synced provider) makes the search unreachable rather than
+temporarily failing forever; transport failures remain temporary. It requires on every
 origin: an identical log whose topics and data match source burn ID, recipient,
 amount and signer version; a successful receipt containing it; a canonical
 block; and finality depth. The ledger then records `released_elsewhere` with
@@ -469,8 +498,12 @@ only our own transaction, or none), and the queue moves on.
 - A `Released` event for the burn that does not match the approved fields halts
   (`processed_with_mismatching_release`). Evidence not yet final defers the
   transfer. If the burn is processed at a finalized height and no matching
-  release is found, the ledger records `release_unverified`: a persistent,
-  non-blocking alert reported in every cycle, never a completion.
+  release is found, or the history to search is no longer served, the ledger
+  records `release_unverified`: a persistent, non-blocking alert reported in
+  every cycle, never a completion. Observing our own receipt still needs its
+  block from every origin; a receipt older than the history an origin serves
+  stops temporarily until it is served (remaining exposure after downtime
+  longer than `releaseLookbackBlocks`).
 
 Recovery decisions (all from canonical observations, never from send errors):
 
@@ -488,7 +521,8 @@ Recovery decisions (all from canonical observations, never from send errors):
 | finalized revert because another transaction released the burn | `released_elsewhere`; RelayStore `completed` with `release_ref`; queue continues |
 | finalized revert, burn processed, no matching release found | `release_unverified` alert; queue continues |
 | finalized revert in a block later than the approval deadline | `expired`; queue continues |
-| any other finalized failed execution (status `0`) | ledger `failed`; stop; never retried |
+| finalized revert before the deadline explained by daily limit, liquidity, release limit or signer rotation at the inclusion block (every origin) | `reverted`; queue continues |
+| any other finalized failed execution (status `0`, including out of gas or a pause) | ledger `failed`; stop; never retried |
 
 Every persisted halt is based on evidence that every origin returns
 identically; a single origin (stalling, rate limiting or lying) can only cause

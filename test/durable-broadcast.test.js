@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { BroadcastLedger } from "../src/broadcast-ledger.js";
 import { runDurableSubmissionCycle, SubmissionHalt, SubmissionUnavailable } from "../src/durable-broadcast.js";
 import { evmAddressToBech32 } from "../src/address.js";
+import { keccak256 } from "ethers";
 import { journalOptions } from "./journal-fixture.js";
 import { signers } from "./fixtures/destination.js";
 import { ModelChain, modelAdapter, approvedTransfer, openStore } from "./fixtures/durable-adapter.js";
@@ -476,3 +477,43 @@ test("RelayStore waits a bounded interval for a concurrent writer instead of fai
     store.close(); impatient.close();
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+test("every submitted RelayStore row is reconciled, even behind more than 64 parked rows", () => harness("cronos", async ({ cycle, setup }) => {
+  const lease = setup.ledger.acquireLease(owner(9), { nowMs: NOW - 120_000, ttlMs: 60_000 });
+  let last;
+  for (let index = 1; index <= 70; index++) {
+    const { sourceChain, sourceRef, request } = approvedTransfer(setup.store, "cronos", index);
+    const transferId = request.payload.sourceBurnId;
+    setup.ledger.claim(lease, { transferId, sourceRef, approvalDigest: request.digest, requestHash: `0x${"d".repeat(64)}` });
+    const signedHex = `0x${Buffer.from(`parked transfer ${index}`).toString("hex")}`;
+    setup.ledger.recordSigned(lease, { transferId, nonce: index - 1, signedHex, transactionHash: keccak256(signedHex) });
+    setup.ledger.markBroadcast(lease, transferId, { maxAttempts: 3 });
+    const inclusion = { blockNumber: index, blockHash: `0x${index.toString(16).padStart(64, "0")}` };
+    // 69 expired rows stay `submitted`; the newest finalized one crashed before RelayStore completion.
+    if (index < 70) setup.ledger.markExpired(lease, transferId, inclusion); else setup.ledger.finalize(lease, transferId, inclusion);
+    setup.store.transition(sourceChain, sourceRef, "submitted", { destinationRef: keccak256(signedHex) });
+    last = { sourceChain, sourceRef };
+  }
+  setup.store.database.exec(`UPDATE transfers SET updated_at = updated_at - 100 WHERE source_ref <> '${last.sourceRef}'`);
+  const result = await cycle();
+  assert.equal(result.action, "finalized");
+  assert.equal(setup.store.get(last.sourceChain, last.sourceRef).state, "completed");
+  assert.equal(result.attention.expired, 69);
+}));
+
+for (const destination of ["cronos", "xitcoin"]) {
+  test(`${destination}: a pre-deadline revert for a lasting reason is recorded as reverted and never blocks the queue`, () => harness(destination, async ({ chain, cycle, setup }) => {
+    const first = approvedTransfer(setup.store, destination, 1);
+    setup.store.database.exec("UPDATE transfers SET updated_at = updated_at - 100");
+    const second = approvedTransfer(setup.store, destination, 2);
+    const sent = await cycle();
+    chain.failNext = true; chain.lastingCause = "daily_release_limit_exhausted"; chain.mine(); chain.confirm(3);
+    const reverted = await cycle();
+    assert.equal(reverted.action, "reverted"); assert.equal(reverted.code, "daily_release_limit_exhausted");
+    const row = setup.ledger.inspect(sent.transferId);
+    assert.equal(row.state, "reverted"); assert.equal(row.reasonCode, "daily_release_limit_exhausted");
+    assert.equal(setup.ledger.blocking().length, 0);
+    assert.equal(setup.store.get(first.sourceChain, first.sourceRef).state, "submitted");
+    await until(cycle, chain, () => setup.store.get(second.sourceChain, second.sourceRef).state === "completed");
+  }));
+}

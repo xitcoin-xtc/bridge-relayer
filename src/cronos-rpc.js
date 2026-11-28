@@ -133,6 +133,55 @@ export class CronosRpcQuorum {
     throw new RpcDisagreement();
   }
 
+  // Strict majority of origins (more than half). With two origins this is
+  // both; with three, two. Used only to decide whether to proceed or wait,
+  // never to persist a halt or a completion.
+  get majoritySize() { return Math.floor(this.#clients.length / 2) + 1; }
+
+  async #answers(method, params, normalize) {
+    const settled = await Promise.allSettled(this.#clients.map((client) => client.call(method, params)));
+    return settled.map((result) => {
+      if (result.status !== "fulfilled") {
+        const execution = result.reason instanceof TransportError && result.reason.code === "rpc_error"
+          && EXECUTION_ERRORS.has(result.reason.rpcCode);
+        return { ok: false, execution };
+      }
+      try { return { ok: true, value: normalize(result.value) }; } catch { return { ok: false, execution: false }; }
+    });
+  }
+
+  // The value a strict majority returns identically, and whether every origin
+  // did. A failing or disagreeing minority is tolerated; otherwise temporary.
+  async majority(method, params, normalize) {
+    const answers = await this.#answers(method, params, normalize);
+    const counts = new Map();
+    for (const answer of answers) {
+      if (!answer.ok) continue;
+      const key = stable(answer.value);
+      counts.set(key, { value: answer.value, count: (counts.get(key)?.count ?? 0) + 1 });
+    }
+    const best = [...counts.values()].sort((a, b) => b.count - a.count)[0];
+    if (!best || best.count < this.majoritySize) throw new RpcDisagreement();
+    return Object.freeze({ value: best.value, unanimous: best.count === this.#clients.length });
+  }
+
+  // Every answer from the origins that responded, when at least a strict
+  // majority did (values may differ, for example each origin's latest block).
+  async majorityAnswers(method, params, normalize) {
+    const answers = (await this.#answers(method, params, normalize)).filter((answer) => answer.ok);
+    if (answers.length < this.majoritySize) throw new RpcDisagreement();
+    return Object.freeze(answers.map((answer) => answer.value));
+  }
+
+  // Execution verdict decided by a strict majority of origins.
+  async majorityVerdict(method, params, normalize) {
+    const answers = await this.#answers(method, params, normalize);
+    const succeeded = answers.filter((answer) => answer.ok), reverted = answers.filter((answer) => !answer.ok && answer.execution);
+    if (succeeded.length >= this.majoritySize) return Object.freeze({ reverted: false, values: succeeded.map((answer) => answer.value) });
+    if (reverted.length >= this.majoritySize) return Object.freeze({ reverted: true, values: [] });
+    throw new RpcDisagreement();
+  }
+
   async agree(method, params, normalize) {
     const values = await this.each(method, params, normalize);
     if (values.some((value) => stable(value) !== stable(values[0]))) throw new RpcDisagreement();
@@ -169,6 +218,20 @@ export class CronosRpcQuorum {
   }
 
   callVerdict(request, blockTag = "latest") { return this.verdictEach("eth_call", [request, blockTag], data); }
+
+  callMajorityVerdict(request, blockTag = "latest") { return this.majorityVerdict("eth_call", [request, blockTag], data); }
+
+  // Chain identity from a strict majority; any origin naming another chain stops.
+  async chainIdMajority() {
+    const answers = await this.#answers("eth_chainId", [], quantity);
+    if (answers.some((answer) => answer.ok && answer.value !== CRONOS_TESTNET_CHAIN_ID)) {
+      const error = new Error("unexpected Cronos chain");
+      error.code = answers.some((answer) => answer.ok && answer.value === CRONOS_MAINNET_CHAIN_ID) ? "cronos_mainnet_rejected" : "unexpected_chain_id";
+      throw error;
+    }
+    if (answers.filter((answer) => answer.ok).length < this.majoritySize) throw new RpcDisagreement();
+    return CRONOS_TESTNET_CHAIN_ID;
+  }
 
   estimateVerdict(request) { return this.verdictEach("eth_estimateGas", [request], quantity); }
 
