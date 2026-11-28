@@ -39,6 +39,14 @@ the process must never select one provider silently.
   JSON instead of silently retrying a different interpretation.
 - Supply the Xitcoin outbound-message decoder from the canonical chain schema.
   The transport deliberately does not guess event attribute names.
+- A well-formed Xitcoin outbound event whose values are not canonical (for
+  example amount `010`, a nonce of `0` or an invalid destination) is skipped,
+  never turned into a transfer, and reported as an
+  `xitcoin_outbound_event_skipped` alert with its height, transaction hash,
+  message index and reason; the rest of the block is still processed. Every
+  party using the canonical decoder skips it the same way. Investigate each
+  alert: the burn may need a manual, reviewed resolution. Missing or duplicate
+  attributes still stop the scan.
 - Run the scan loop without signer or submitter credentials. A successful scan
   records only `observed`, `finalized` and checkpoint state.
 

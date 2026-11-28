@@ -202,3 +202,56 @@ test("canonical decoder rejects incomplete, duplicate and unbound results", () =
     }] } },
   }), /duplicate/);
 });
+
+test("non-canonical outbound values are skipped and reported without stalling the block", async () => {
+  const event = (overrides = {}) => ({ type: "bridge_outbound_burned", attributes: Object.entries({
+    request_id: blockHash.slice(2), route_id: "route", sender: "xtc1yg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3z97g2qj",
+    destination: "0x3333333333333333333333333333333333333333", amount: "900", nonce: "4", ...overrides,
+  }).map(([key, value]) => ({ key, value })) });
+  const alerts = [];
+  const other = `0x${"cd".repeat(32)}`;
+  const records = decodeXitcoinOutboundBlock({ height: 7, transactionHashes: [txHash, other], onSkip: (alert) => alerts.push(alert),
+    results: { txs_results: [
+      { code: 0, events: [event({ amount: "010" }), event({ msg_index: "1", nonce: "5" })] },
+      { code: 0, events: [event({ nonce: "0" }), event({ destination: "0x123" }), event({ request_id: "zz" }),
+        event({ msg_index: "01" }), event({ amount: "1".repeat(79) }), event({ destination: "0x0000000000000000000000000000000000000000" })] },
+    ] } });
+  assert.equal(records.length, 1);
+  assert.equal(records[0].nonce, "5"); assert.equal(records[0].messageIndex, 1);
+  assert.deepEqual(alerts.map((alert) => alert.reason), ["noncanonical_amount", "noncanonical_nonce", "noncanonical_destination",
+    "noncanonical_request_id", "noncanonical_message_index", "noncanonical_amount", "noncanonical_destination"]);
+  assert.ok(alerts.every((alert) => alert.alert === "xitcoin_outbound_event_skipped" && alert.height === 7 && Object.isFrozen(alert)));
+  assert.deepEqual([alerts[0].transactionHash, alerts[0].messageIndex], [txHash, 0]);
+  assert.deepEqual([alerts[1].transactionHash, alerts[1].messageIndex], [other, 0]);
+  const fromTransaction = [];
+  assert.deepEqual(decodeXitcoinOutboundTransaction({ transactionHash: txHash, onSkip: (alert) => fromTransaction.push(alert),
+    result: { tx_result: { code: 0, events: [event({ amount: "010" })] } } }), []);
+  assert.equal(fromTransaction[0].reason, "noncanonical_amount");
+  // Structural problems still stop the scan.
+  assert.throws(() => decodeXitcoinOutboundBlock({ transactionHashes: [txHash], onSkip: () => {},
+    results: { txs_results: [{ code: 0, events: [{ type: "bridge_outbound_burned", attributes: [{ key: "amount", value: "010" }] }] }] } }), /incomplete/);
+  // Without a handler the alert is still written, never dropped.
+  const written = [];
+  const original = process.stderr.write;
+  process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
+  try { decodeXitcoinOutboundBlock({ transactionHashes: [txHash], results: { txs_results: [{ code: 0, events: [event({ amount: "010" })] }] } }); }
+  finally { process.stderr.write = original; }
+  assert.match(written.join(""), /"alert":"xitcoin_outbound_event_skipped".*"reason":"noncanonical_amount"/);
+});
+
+test("CometBFT client passes its skipped-event handler to the canonical decoders", async () => {
+  const seen = [];
+  const decode = (input) => { seen.push(input.onSkip); return []; };
+  const onSkip = () => {};
+  const client = new CometBftHttpClient({ url: "https://xitcoin.example", chainId: "xitcoin-testnet-v2-1", decodeBlock: decode,
+    decodeTransaction: decode, onSkip, fetchImpl: async (target) => {
+      const path = new URL(target).pathname;
+      const result = path === "/block" ? { block: { header: { height: "3" }, data: { txs: [] } }, block_id: { hash: "AB".repeat(32) } }
+        : path === "/block_results" ? { height: "3", txs_results: [] } : { height: "3", tx_result: { code: 0, events: [] } };
+      return { ok: true, status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ jsonrpc: "2.0", id: -1, result }) };
+    } });
+  await client.outboundTransfers(3, 3);
+  await client.outboundTransfer(txHash, 0);
+  assert.deepEqual(seen, [onSkip, onSkip]);
+  assert.throws(() => new CometBftHttpClient({ url: "https://x.example", chainId: "c", decodeBlock: decode, decodeTransaction: decode, onSkip: 1 }));
+});

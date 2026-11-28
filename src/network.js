@@ -96,8 +96,11 @@ export class CometBftHttpClient {
     maxResponseBytes = 8 * 1024 * 1024,
     allowHttp = false,
     fetchImpl = null,
+    onSkip = reportSkippedOutboundEvent,
   }) {
     if (!chainId) throw new Error("Xitcoin chain ID is required");
+    if (typeof onSkip !== "function") throw new Error("skipped-event alert handler is invalid");
+    this.onSkip = onSkip;
     if (typeof decodeBlock !== "function" || typeof decodeTransaction !== "function") {
       throw new Error("canonical Xitcoin decoders are required");
     }
@@ -194,6 +197,7 @@ export class CometBftHttpClient {
         blockHash: block.hash,
         transactionHashes: block.transactionHashes,
         results,
+        onSkip: this.onSkip,
       });
       if (!Array.isArray(decoded)) throw new Error("Xitcoin block decoder must return an array");
       records.push(...decoded.map((item) => ({ ...item, blockHeight: height, blockHash: block.hash })));
@@ -207,7 +211,8 @@ export class CometBftHttpClient {
     const result = await this.request("/tx", { hash: transaction, prove: "false" });
     const height = positiveInteger(result.height, "Xitcoin transaction height", 0);
     const block = await this.block(height);
-    const decoded = await this.decodeTransaction({ transactionHash: transaction, height, blockHash: block.hash, result });
+    const decoded = await this.decodeTransaction({ transactionHash: transaction, height, blockHash: block.hash, result,
+      onSkip: this.onSkip });
     if (!Array.isArray(decoded)) throw new Error("Xitcoin transaction decoder must return an array");
     const record = decoded.find((item) => Number(item.messageIndex ?? 0) === index);
     return record ? { ...record, blockHeight: height, blockHash: block.hash, transactionHash: transaction } : null;
@@ -244,30 +249,54 @@ function attributes(event) {
   return result;
 }
 
-function outboundEvent(event, transactionHash, fallbackMessageIndex = 0) {
+// A well-formed outbound event whose values are not canonical (for example
+// amount "010") is skipped and reported instead of failing the whole block:
+// no transfer is created from it, every party using this decoder skips it the
+// same way, and the alert names it for an operator. Structural problems
+// (missing or duplicate attributes, unbound results) still stop the scan.
+export function reportSkippedOutboundEvent(alert) {
+  process.stderr.write(`${JSON.stringify(alert)}\n`);
+}
+
+function skipped(onSkip, details) {
+  const alert = Object.freeze({ alert: "xitcoin_outbound_event_skipped", ...details });
+  (typeof onSkip === "function" ? onSkip : reportSkippedOutboundEvent)(alert);
+  return null;
+}
+
+function outboundEvent(event, transactionHash, fallbackMessageIndex = 0, { height = null, onSkip } = {}) {
   if (textAttribute(event.type) !== "bridge_outbound_burned") return null;
   const values = attributes(event);
   const required = ["request_id", "route_id", "sender", "destination", "amount", "nonce"];
   if (required.some((key) => !values.has(key))) throw new Error("incomplete Xitcoin outbound event");
-  const requestId = hash(values.get("request_id"), "Xitcoin request ID");
+  const transaction = hash(transactionHash, "Xitcoin transaction hash");
+  const messageIndexText = values.get("msg_index") ?? String(fallbackMessageIndex);
+  const where = { height, transactionHash: transaction, messageIndex: /^(0|[1-9][0-9]{0,8})$/.test(messageIndexText) ? Number(messageIndexText) : null };
+  if (where.messageIndex === null) return skipped(onSkip, { ...where, reason: "noncanonical_message_index" });
   const amount = values.get("amount");
   const nonce = values.get("nonce");
-  if (!/^[1-9][0-9]*$/.test(amount)) throw new Error("invalid Xitcoin outbound amount");
-  if (!/^[1-9][0-9]*$/.test(nonce)) throw new Error("invalid Xitcoin outbound nonce");
-  const messageIndexText = values.get("msg_index") ?? String(fallbackMessageIndex);
+  if (!/^[1-9][0-9]{0,77}$/.test(amount)) return skipped(onSkip, { ...where, reason: "noncanonical_amount" });
+  if (!/^[1-9][0-9]{0,19}$/.test(nonce)) return skipped(onSkip, { ...where, reason: "noncanonical_nonce" });
+  let requestId, destination;
+  try { requestId = hash(values.get("request_id"), "Xitcoin request ID"); }
+  catch { return skipped(onSkip, { ...where, reason: "noncanonical_request_id" }); }
+  try {
+    destination = getAddress(values.get("destination"));
+    if (/^0x0{40}$/.test(destination)) throw new Error();
+  } catch { return skipped(onSkip, { ...where, reason: "noncanonical_destination" }); }
   return {
     routeId: values.get("route_id"),
-    transactionHash: hash(transactionHash, "Xitcoin transaction hash"),
-    messageIndex: positiveInteger(messageIndexText, "message index", 0),
+    transactionHash: transaction,
+    messageIndex: where.messageIndex,
     requestId,
     sender: values.get("sender"),
-    destination: getAddress(values.get("destination")),
+    destination,
     amount,
     nonce,
   };
 }
 
-export function decodeXitcoinOutboundBlock({ transactionHashes, results }) {
+export function decodeXitcoinOutboundBlock({ transactionHashes, results, height = null, onSkip }) {
   const txResults = results?.txs_results ?? [];
   if (!Array.isArray(txResults) || !Array.isArray(transactionHashes)) {
     throw new Error("invalid Xitcoin block results");
@@ -280,26 +309,24 @@ export function decodeXitcoinOutboundBlock({ transactionHashes, results }) {
     if (Number(result.code ?? 0) !== 0) return;
     let fallbackMessageIndex = 0;
     for (const event of result.events ?? []) {
-      const record = outboundEvent(event, transactionHashes[transactionIndex], fallbackMessageIndex);
-      if (record) {
-        decoded.push(record);
-        fallbackMessageIndex += 1;
-      }
+      if (textAttribute(event.type) !== "bridge_outbound_burned") continue;
+      const record = outboundEvent(event, transactionHashes[transactionIndex], fallbackMessageIndex, { height, onSkip });
+      fallbackMessageIndex += 1; // a skipped event still occupies its message position
+      if (record) decoded.push(record);
     }
   });
   return decoded;
 }
 
-export function decodeXitcoinOutboundTransaction({ transactionHash, result }) {
+export function decodeXitcoinOutboundTransaction({ transactionHash, result, height = null, onSkip }) {
   if (Number(result?.tx_result?.code ?? 0) !== 0) return [];
   const decoded = [];
   let fallbackMessageIndex = 0;
   for (const event of result?.tx_result?.events ?? []) {
-    const record = outboundEvent(event, transactionHash, fallbackMessageIndex);
-    if (record) {
-      decoded.push(record);
-      fallbackMessageIndex += 1;
-    }
+    if (textAttribute(event.type) !== "bridge_outbound_burned") continue;
+    const record = outboundEvent(event, transactionHash, fallbackMessageIndex, { height, onSkip });
+    fallbackMessageIndex += 1;
+    if (record) decoded.push(record);
   }
   return decoded;
 }
