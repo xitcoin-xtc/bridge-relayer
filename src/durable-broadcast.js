@@ -178,7 +178,7 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
       return report("submitted", { transferId: row.transferId, transactionHash: row.transactionHash });
     }
     const observed = decision(await adapter.observe({ row, ...stored, nowUnix }),
-      ["pending", "wait", "rebroadcast", "finalized", "failed", "released_elsewhere", "expired", "release_unverified", "halt"]);
+      ["pending", "wait", "rebroadcast", "finalized", "failed", "released_elsewhere", "expired", "release_unverified", "reverted", "halt"]);
     switch (observed.action) {
       case "pending": return report("pending", { transferId: row.transferId, transactionHash: row.transactionHash });
       case "wait": return report("waiting", { transferId: row.transferId, code: code(observed.code) });
@@ -188,6 +188,13 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
       case "finalized": return complete(stored, row, { blockNumber: observed.blockNumber, blockHash: observed.blockHash });
       case "released_elsewhere": return releasedElsewhere(stored, row.transferId, row, observed);
       case "release_unverified": return releaseUnverified(stored, row.transferId, observed);
+      case "reverted": {
+        // Mined before the deadline, reverted for a lasting condition of this
+        // transfer; nonce consumed. Non-blocking; RelayStore stays in flight.
+        ledger.markReverted(lease, row.transferId, { blockNumber: observed.blockNumber, blockHash: observed.blockHash, code: code(observed.code) });
+        await boundary("ledger-reverted");
+        return report("reverted", { transferId: row.transferId, transactionHash: row.transactionHash, code: code(observed.code) });
+      }
       case "expired": {
         // Our bytes were mined after the deadline and reverted; their nonce is
         // consumed. RelayStore stays `submitted` with our reference, so the
@@ -231,18 +238,30 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
   if (active.length > 1) throw new SubmissionHalt("ledger_invariant_violation");
 
   // RelayStore may never reference a transaction the ledger does not hold.
-  const submitted = store.database.prepare(`SELECT source_ref FROM transfers WHERE source_chain = ? AND state = 'submitted'
-    ORDER BY updated_at, source_ref LIMIT 64`).all(sourceChain);
-  for (const { source_ref: sourceRef } of submitted) {
-    const stored = storedRequest(store, sourceChain, sourceRef);
-    const transferId = transferIdOf(stored);
-    const row = ledger.inspect(transferId);
-    if (!row.found || row.sourceRef !== sourceRef || row.transactionHash !== stored.transfer.destination_ref) {
-      if (!row.found || ["claimed", "signed", "broadcast"].includes(row.state)) await halt(transferId, stored, "submitted_without_ledger_custody");
-      throw new SubmissionHalt("submitted_without_ledger_custody");
+  // Every `submitted` row is checked by keyset pages: rows parked as expired,
+  // reverted or unverified stay `submitted`, and must never hide a newer row
+  // whose ledger finalization still has to be mirrored into RelayStore.
+  const firstSubmitted = store.database.prepare(`SELECT source_ref, updated_at FROM transfers WHERE source_chain = ? AND state = 'submitted'
+    ORDER BY updated_at, source_ref LIMIT ${PAGE}`);
+  const nextSubmitted = store.database.prepare(`SELECT source_ref, updated_at FROM transfers WHERE source_chain = ? AND state = 'submitted'
+    AND (updated_at > ? OR (updated_at = ? AND source_ref > ?)) ORDER BY updated_at, source_ref LIMIT ${PAGE}`);
+  for (let position = null, checked = 0; checked < maximumScan;) {
+    const page = position ? nextSubmitted.all(sourceChain, position.updated_at, position.updated_at, position.source_ref) : firstSubmitted.all(sourceChain);
+    if (!page.length) break;
+    for (const submittedRow of page) {
+      position = submittedRow;
+      checked += 1;
+      const sourceRef = submittedRow.source_ref;
+      const stored = storedRequest(store, sourceChain, sourceRef);
+      const transferId = transferIdOf(stored);
+      const row = ledger.inspect(transferId);
+      if (!row.found || row.sourceRef !== sourceRef || row.transactionHash !== stored.transfer.destination_ref) {
+        if (!row.found || ["claimed", "signed", "broadcast"].includes(row.state)) await halt(transferId, stored, "submitted_without_ledger_custody");
+        throw new SubmissionHalt("submitted_without_ledger_custody");
+      }
+      if (row.state === "finalized") return complete(stored, row, { blockNumber: row.blockNumber, blockHash: row.blockHash });
+      if (row.state === "released_elsewhere") return releasedElsewhere(stored, transferId, row, row);
     }
-    if (row.state === "finalized") return complete(stored, row, { blockNumber: row.blockNumber, blockHash: row.blockHash });
-    if (row.state === "released_elsewhere") return releasedElsewhere(stored, transferId, row, row);
   }
 
   // The unfinished transfer is found by the source reference the ledger stores,

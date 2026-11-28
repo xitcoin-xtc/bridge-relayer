@@ -222,6 +222,10 @@ transaction is recorded as `released_elsewhere` with that transaction.
 - Keep the submitter key in an encrypted keystore owned by the submitter
   identity; pass its password only as the encrypted systemd credential
   `keystore-password`.
+- Prefer three or more independent Cronos RPC providers: with three, one
+  faulty provider can no longer hold a signed transaction until its approval
+  expires. Every provider must serve at least `releaseLookbackBlocks` of recent
+  block and log history.
 - Give it at least two independent RPC providers per chain (reviewed loopback
   tunnels with the provided template). It never acts on a disagreement: a
   disagreement, transport failure or a RelayStore locked by the coordinator is
@@ -239,7 +243,7 @@ transaction is recorded as `released_elsewhere` with that transaction.
   recorded as `released_elsewhere` and is not an error; RelayStore
   `release_ref` names the releasing transaction.
 - Every cycle report carries `attention` counts (`rejected`, `expired`,
-  `releaseUnverified`). These never block other transfers but need review:
+  `releaseUnverified`, `reverted`). These never block other transfers but need review:
   `expired` burns need a new approval and transaction (procedure not defined
   yet); `release_unverified` means the vault reports the burn processed but no
   matching `Released` event was found, which the reconciler will also show as

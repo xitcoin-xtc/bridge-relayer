@@ -78,15 +78,18 @@ function isolatedSigners({ vault, proxies, comets }) {
 }
 
 async function scenario(run, { version = "testnet", chainId = 338, burns = 1, approved = burns, deadlineOffset = 3_600,
-  patch = {}, cronosPatch = {}, cometBurns = (items) => [items, items], approvals = "signers", recipientFor = () => recipient } = {}) {
+  patch = {}, cronosPatch = {}, cometBurns = (items) => [items, items], approvals = "signers", recipientFor = () => recipient,
+  origins = 2, bridgeOptions = {}, history = 0 } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "cronos-submitter-"));
   const cleanup = [];
   try {
     const chain = await startAnvil(evm.anvil, { chainId });
     cleanup.push(chain.stop);
-    const proxies = [await startProxy(chain.url), await startProxy(chain.url)];
+    const proxies = [];
+    for (let index = 0; index < origins; index++) proxies.push(await startProxy(chain.url));
+    if (history) await chain.rpc("anvil_mine", [`0x${history.toString(16)}`]); // older history than the lookback window
     cleanup.push(...proxies.map((proxy) => proxy.stop));
-    const bridge = await deployBridge(chain, artifacts(version), { routeId: TESTNET_ROUTE_ID, signers, version });
+    const bridge = await deployBridge(chain, artifacts(version), { routeId: TESTNET_ROUTE_ID, signers, version, ...bridgeOptions });
     await chain.rpc("anvil_mine", ["0xa"]); // vault identity is read at a finalized height
     const allBurns = Array.from({ length: burns }, (_, index) => xitcoinBurn({ index: index + 1,
       recipient: recipientFor(index + 1, bridge), amount: AMOUNT.toString() }));
@@ -647,7 +650,8 @@ for (const fault of ["rate-limited simulation", "false replay flag"]) {
     };
     const before = await runtime({ offsetMs: 10 * 60_000 });
     if (fault === "rate-limited simulation") await assert.rejects(before.runOnce(), (error) => ["rpc_error", "rpc_disagreement"].includes(error.code) && isTemporaryStop(error));
-    else assert.equal((await before.runOnce()).code, "replay_state_unsettled");
+    // Origins disagreeing on the replay flag: the row is not sent (a temporary stop).
+    else await assert.rejects(before.runOnce(), (error) => error.code === "rpc_disagreement" && isTemporaryStop(error));
     assert.equal(await facts.nonce(), 0);
     // The provider fault outlasts the approval: the deadline passes on chain and locally.
     await warp(chain, 1_300);
@@ -727,3 +731,109 @@ test("processed without findable release evidence is a persistent non-blocking a
   try { assert.equal(ledger.blocking().length, 0); } finally { ledger.close(); }
   assert.equal(await facts.nonce(), 2);
 }, { burns: 2, approved: 1 }));
+
+// Pruned or state-synced origin: no block (null) or log (JSON-RPC error)
+// older than `oldest`; recent history is served normally.
+function pruneHistory(proxy, oldest, { blocks = true, logs = true } = {}) {
+  proxy.hook = async ({ message, forward }) => {
+    const number = (value) => (typeof value === "string" && value.startsWith("0x") ? Number.parseInt(value, 16) : Number.POSITIVE_INFINITY);
+    if (blocks && message.method === "eth_getBlockByNumber" && number(message.params[0]) < oldest) {
+      return JSON.stringify({ jsonrpc: "2.0", id: message.id, result: null });
+    }
+    if (logs && message.method === "eth_getLogs" && number(message.params[0].fromBlock) < oldest) {
+      return JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: "history pruned" } });
+    }
+    return forward();
+  };
+}
+
+async function frontRun(chain, bridge, rt) {
+  await chain.rpc("evm_setAutomine", [false]);
+  const sent = await rt.runOnce();
+  const ours = await chain.rpc("eth_getTransactionByHash", [sent.transactionHash]);
+  const attacker = await chain.rpc("eth_sendRawTransaction", [await signedCall(chain, localKeys.guardian, { to: bridge.vault,
+    data: ours.input, gasPrice: 50_000_000_000n, gasLimit: 400_000n })]);
+  await chain.rpc("evm_mine", []);
+  await chain.rpc("evm_setAutomine", [true]);
+  return { sent, attacker };
+}
+
+test("a pruned origin cannot stall release evidence after the deadline: our receipt is searched first, within recent history", options, () => scenario(async ({ chain, bridge, proxies, runtime, facts, burns }) => {
+  const rt = await runtime();
+  const { attacker } = await frontRun(chain, bridge, rt);
+  await warp(chain, 4_000); // the deadline has passed; our receipt is still recent
+  await chain.rpc("anvil_mine", ["0x5"]);
+  pruneHistory(proxies[1], Number.parseInt(await chain.rpc("eth_blockNumber"), 16) - 1_000);
+  const later = await runtime({ offsetMs: 4_000_000 + 10 * 60_000 });
+  const outcome = await later.runOnce();
+  assert.equal(outcome.action, "released_elsewhere"); assert.equal(outcome.releaseHash, attacker);
+  assert.equal(facts.relay(burns[0]).release_ref, attacker);
+}, { history: 1_500 }));
+
+test("history an origin no longer serves ends the search in a non-blocking alert, never an endless temporary stop", options, () => scenario(async ({ chain, bridge, proxies, runtime, facts, burns, approve }) => {
+  const rt = await runtime();
+  await frontRun(chain, bridge, rt);
+  await warp(chain, 4_000);
+  await chain.rpc("anvil_mine", ["0x514"]); // downtime beyond releaseLookbackBlocks
+  pruneHistory(proxies[1], Number.parseInt(await chain.rpc("eth_blockNumber"), 16) - 1_000, { blocks: false });
+  const later = await runtime({ offsetMs: 4_000_000 + 10 * 60_000 });
+  const alert = await later.runOnce();
+  assert.equal(alert.action, "release_unverified");
+  const ledger = facts.ledger();
+  try { assert.equal(ledger.blocking().length, 0); } finally { ledger.close(); }
+  await approve(burns[1], Math.floor(Date.now() / 1000) + 4_000 + 600 + 1_800);
+  const reports = [];
+  for (let i = 0; i < 8 && facts.relay(burns[1]).state !== "completed"; i++) { reports.push(await later.runOnce()); await facts.mine(3); }
+  assert.equal(facts.relay(burns[1]).state, "completed");
+  assert.ok(reports.every((report) => report.attention.releaseUnverified === 1));
+}, { burns: 2, approved: 1, history: 100, approvals: "direct" }));
+
+test("with three origins one origin's wrong nonce cannot hold a signed row: a strict majority sends it", options, () => scenario(async ({ proxies, runtime, facts, burns }) => {
+  await assert.rejects((await runtime(stopAtSigned)).runOnce(), /stop/);
+  proxies[2].hook = async ({ message, forward }) => (message.method === "eth_getTransactionCount"
+    ? rewriteResult(await forward(), () => "0x7") : forward());
+  const rt = await runtime({ offsetMs: 10 * 60_000 });
+  assert.equal((await rt.runOnce()).action, "submitted");
+  const ledger = facts.ledger();
+  try { assert.equal(ledger.blocking().length, 0); } finally { ledger.close(); }
+  await completes(rt, facts, burns[0]);
+  await assertSingleRelease(facts, burns[0]);
+}, { origins: 3 }));
+
+test("an origin outage cannot keep a signed row from consuming its nonce once the local deadline margin is lost", options, () => scenario(async ({ chain, proxies, runtime, facts, burns }) => {
+  await assert.rejects((await runtime(stopAtSigned)).runOnce(), /stop/);
+  const rt = await runtime({ offsetMs: 10 * 60_000 + 1_300_000 }); // running before the outage starts
+  proxies[1].hook = async ({ response }) => { response.destroy(); return undefined; }; // origin down
+  await warp(chain, 1_300);
+  const sent = await rt.runOnce();
+  assert.equal(sent.action, "submitted"); // no origin read needed to send our own bytes
+  proxies[1].hook = null;
+  await facts.mine(3);
+  assert.equal((await rt.runOnce()).action, "expired");
+  const ledger = facts.ledger();
+  try { assert.equal(ledger.inspect(burns[0].requestId).state, "expired"); } finally { ledger.close(); }
+}, { deadlineOffset: 1_200 }));
+
+test("an early send that reverts before the deadline for a lasting reason is transfer-specific, not a queue-wide failure", options, () => scenario(async ({ chain, bridge, store, runtime, facts, burns, approve }) => {
+  await assert.rejects((await runtime(stopAtSigned)).runOnce(), /stop/);
+  await approve(burns[1], Math.floor(Date.now() / 1000) + 7_000);
+  await thirdPartyRelease(chain, bridge, store, burns[1]); // exhausts the daily release limit
+  // Locally the deadline margin is lost, on chain the deadline has not passed.
+  const rt = await runtime({ offsetMs: (1_200 - 30) * 1_000 });
+  const sent = await rt.runOnce();
+  assert.equal(sent.action, "submitted");
+  await facts.mine(3);
+  assert.equal((await chain.rpc("eth_getTransactionReceipt", [sent.transactionHash])).status, "0x0");
+  const reverted = await rt.runOnce();
+  assert.equal(reverted.action, "reverted"); assert.equal(reverted.code, "daily_release_limit_exhausted");
+  const ledger = facts.ledger();
+  try {
+    const row = ledger.inspect(burns[0].requestId);
+    assert.equal(row.state, "reverted"); assert.equal(row.reasonCode, "daily_release_limit_exhausted");
+    assert.equal(ledger.blocking().length, 0);
+  } finally { ledger.close(); }
+  assert.equal(facts.relay(burns[0]).state, "submitted");
+  const next = await rt.runOnce(); // the queue moves on
+  assert.equal(next.action, "released_elsewhere");
+  assert.equal(next.attention.reverted, 1);
+}, { burns: 2, approved: 1, deadlineOffset: 1_200, bridgeOptions: { maxRelease: AMOUNT, dailyLimit: (AMOUNT * 3n) / 2n } }));
