@@ -2,7 +2,7 @@
 import json, re, pathlib
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 root = pathlib.Path(__file__).resolve().parents[2]
-schema = (root / 'docs/evidence/xitcoin-tx.proto').read_text()
+schema = (root / 'test/fixtures/proto/xitcoin-tx.proto').read_text()
 body = re.search(r'message MsgSubmitAttestation \{(.*?)\n\}', schema, re.S).group(1)
 file = descriptor_pb2.FileDescriptorProto(name='pinned-attestation.proto', package='cosmos.evm.bridge.v1', syntax='proto3')
 msg = file.message_type.add(name='MsgSubmitAttestation')
