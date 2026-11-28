@@ -65,3 +65,36 @@ jobs:
             fi
           done
           exit "$audit_status"
+
+  chain-fixtures:
+    name: Chain fixtures against the pinned pos-chain commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      # The single pin: test/fixtures/xitcoin-chain-vectors.json "posChainCommit".
+      - name: Read the pinned pos-chain commit
+        id: pin
+        shell: bash
+        run: |
+          commit="$(sed -n 's/^  "posChainCommit": "\([0-9a-f]\{40\}\)",$/\1/p' test/fixtures/xitcoin-chain-vectors.json)"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: xitcoin-xtc/pos-chain
+          ref: ${{ steps.pin.outputs.commit }}
+          path: pos-chain
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
+        with:
+          go-version-file: pos-chain/evmd/go.mod
+          cache-dependency-path: |
+            pos-chain/go.sum
+            pos-chain/evmd/go.sum
+      # Schemas byte-identical to pos-chain and its pinned Cosmos SDK; vectors
+      # byte-identical to what the chain's own Go code produces.
+      - name: Check proto fixtures and chain-generated vectors
+        run: bash scripts/check-chain-fixtures.sh pos-chain
