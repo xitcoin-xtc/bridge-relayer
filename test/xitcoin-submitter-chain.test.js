@@ -321,7 +321,8 @@ async function killedAt(boundary, manifest, paths) {
 test("the chain rejects the display label route and mints with the stored route ID", options, () => scenario(async ({ requests, store, records }) => {
   const approvals = store.approvals("cronos", records[0].sourceRef).map(({ signer, digest, signature }) => ({ signer, digest, signature }));
   const label = await foreignSubmission(THIRD_PARTY_KEY, requests[0], approvals, { routeId: "cronos-testnet-xitcoin-testnet" });
-  assert.equal(label.result.tx_result.code, 1);
+  // ErrAttestationRouteMismatch, registered in codespace "bridge" (pos-chain #108).
+  assert.deepEqual([label.result.tx_result.code, label.result.tx_result.codespace], [20, "bridge"]);
   assert.match(label.result.tx_result.log, /route does not match configuration/);
   const stored = await foreignSubmission(THIRD_PARTY_KEY, requests[0], approvals);
   assert.equal(stored.result.tx_result.code, 0);
@@ -538,7 +539,8 @@ test("a third-party submission after we signed still consumes our sequence once,
   // Our identical bytes were sent once, failed as already processed and
   // consumed the reserved sequence.
   const ours = await node.committed(row.transactionHash);
-  assert.equal(ours.tx_result.code, 1);
+  // ErrAttestationAlreadyProcessed, registered in codespace "bridge".
+  assert.deepEqual([ours.tx_result.code, ours.tx_result.codespace], [22, "bridge"]);
   assert.match(ours.tx_result.log, /already processed/);
   assert.equal(await facts.sequence(), 1);
   assert.equal(facts.relay().destination_ref, row.transactionHash);
@@ -546,30 +548,32 @@ test("a third-party submission after we signed still consumes our sequence once,
   assert.equal(await facts.balance(), AMOUNT);
 }));
 
-test("a re-encoding of our signed bytes that lands first is our inclusion, recorded by its hash, never a halt", options, () => scenario(async ({ runtime, facts, manifest, paths }) => {
+test("the chain refuses our signed content with any recovery byte appended; our 64-byte bytes land and complete", options, () => scenario(async ({ runtime, facts, manifest, paths }) => {
   // Killed after the broadcast marker, before our bytes were sent.
   await killedAt("broadcast-recorded", manifest, paths);
   const row = facts.row();
   assert.equal(row.state, "broadcast");
-  // Anyone who has seen our bytes can re-wrap the same signed content: the
-  // chain's eth_secp256k1 verifier drops the 65th signature byte unchecked.
+  // Earlier binaries accepted the same signed content with a 65th byte (and
+  // earlier releases signed with V 0 or 1). From xitcoin-security-hardening-v2
+  // the single accepted encoding is 64 bytes R || S: every such copy, under its
+  // own hash, is refused before it can spend our sequence.
   const decoded = decodeXitcoinTransaction(row.signedHex);
-  const signature = Buffer.from(decoded.signatureHex.slice(2), "hex");
-  signature[64] += 27;
+  const rs = Buffer.from(decoded.signatureHex.slice(2), "hex");
+  assert.equal(rs.length, 64);
   const field = (n, bytes) => Buffer.concat([Buffer.from([n * 8 + 2]), varint(bytes.length), bytes]);
-  const variant = Buffer.concat([field(1, decoded.bodyBytes), field(2, decoded.authInfoBytes), field(3, signature)]);
-  const variantHash = `0x${createHash("sha256").update(variant).digest("hex")}`;
-  assert.notEqual(variantHash, row.transactionHash);
-  assert.equal((await node.broadcast(`0x${variant.toString("hex")}`)).code, 0);
-  assert.equal((await node.committed(variantHash)).tx_result.code, 0);
+  for (const v of [0, 1, 27, 28]) {
+    const variant = Buffer.concat([field(1, decoded.bodyBytes), field(2, decoded.authInfoBytes), field(3, Buffer.concat([rs, Buffer.from([v])]))]);
+    const accepted = await node.broadcast(`0x${variant.toString("hex")}`);
+    assert.equal(accepted.code, 4, `V ${v}: ${accepted.log}`);
+  }
+  assert.equal(await facts.sequence(), 0);
   const rt = await runtime({ offsetMs: 2 * 60_000 }); // the killed worker's lease has expired
   const reports = await completes(rt, facts);
-  assert.deepEqual([reports.at(-1).action, reports.at(-1).releaseHash], ["released_elsewhere", variantHash]);
-  assert.equal(facts.row().state, "released_elsewhere");
-  assert.equal(facts.row().releaseHash, variantHash);
+  assert.equal(reports.at(-1).action, "finalized");
+  assert.equal(facts.row().state, "finalized");
   assert.equal(facts.relay().destination_ref, row.transactionHash);
-  assert.equal(facts.relay().release_ref, variantHash);
-  assert.equal(`0x${(await facts.attestation()).record.tx_hash.toLowerCase()}`, variantHash);
+  assert.equal(facts.relay().release_ref, row.transactionHash);
+  assert.equal(`0x${(await facts.attestation()).record.tx_hash.toLowerCase()}`, row.transactionHash);
   assert.equal(await facts.sequence(), 1);
   assert.equal(await facts.balance(), AMOUNT);
 }));

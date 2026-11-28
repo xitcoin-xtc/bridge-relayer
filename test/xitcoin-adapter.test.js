@@ -322,16 +322,20 @@ test("stored bytes are revalidated against the request, key, sequence and caps o
   assert.deepEqual(await tighter.adapter.verifyStored({ ...tighter.stored, row }), { action: "halt", code: "stored_transaction_mismatch" });
 });
 
-// Re-encodings of our signed content: pos-chain's eth_secp256k1 verifier drops a
-// 65th signature byte without checking it and accepts 64-byte R || S, so the
-// same body, auth info and R || S can be wrapped into another TxRaw (another
-// hash) that spends our sequence and fee.
+// Re-encodings of our signed content: the same body, auth info and R || S
+// wrapped into another TxRaw (another hash) that spends our sequence and fee.
+// Before xitcoin-security-hardening-v2, pos-chain's eth_secp256k1 verifier
+// dropped a 65th signature byte without checking it, so our 64-byte R || S
+// with any byte appended verified; "repeat" puts another body field first,
+// which the SDK's TxRaw decoder overrides with the last one.
 function reencode(signedHex, signature) {
   const decoded = decodeXitcoinTransaction(signedHex);
-  const r = Buffer.from(decoded.signatureHex.slice(2, 130), "hex");
-  const sig = signature === "rs" ? r : Buffer.concat([r, Buffer.from([signature])]);
+  const rs = Buffer.from(decoded.signatureHex.slice(2), "hex");
+  assert.equal(rs.length, 64);
   const field = (n, bytes) => Buffer.concat([Buffer.from([n * 8 + 2]), varint(bytes.length), bytes]);
-  return `0x${Buffer.concat([field(1, decoded.bodyBytes), field(2, decoded.authInfoBytes), field(3, sig)]).toString("hex")}`;
+  const sig = signature === "repeat" ? rs : Buffer.concat([rs, Buffer.from([signature])]);
+  const prefix = signature === "repeat" ? field(1, Buffer.from("another body")) : Buffer.alloc(0);
+  return `0x${Buffer.concat([prefix, field(1, decoded.bodyBytes), field(2, decoded.authInfoBytes), field(3, sig)]).toString("hex")}`;
 }
 function varint(value) {
   const bytes = [];
@@ -340,7 +344,7 @@ function varint(value) {
 }
 
 test("a re-encoding of our signed transaction that lands first is recognised by signed content, never a halt", async () => {
-  for (const signature of [27, 2, "rs"]) {
+  for (const signature of [27, 2, "repeat"]) {
     const context = setup();
     const { row } = await signed(context);
     const variant = reencode(row.signedHex, signature);
@@ -481,7 +485,7 @@ test("a re-encoded copy of our transaction that processed the attestation before
   let found = await outcome((row) => reencode(row.signedHex, 27), exact);
   assert.deepEqual(found.result, { action: "released_elsewhere", releaseHash: found.hash, blockNumber: 100,
     blockHash: found.context.model.blockHash(100) });
-  found = await outcome((row) => reencode(row.signedHex, "rs"), exact);
+  found = await outcome((row) => reencode(row.signedHex, "repeat"), exact);
   assert.equal(found.result.action, "released_elsewhere");
   // Our own bytes: finalized, as before.
   found = await outcome((row) => row.signedHex, exact);
