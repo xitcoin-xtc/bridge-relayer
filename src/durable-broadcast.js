@@ -15,6 +15,14 @@ import { RelayStore } from "./store.js";
 // identical persisted transaction under adapter-verified conditions, or halt.
 // A transfer that cannot proceed yet is deferred durably, and a transfer that
 // can never be sent is rejected; neither blocks the transfers behind it.
+//
+// Expired approvals: when the approval of a transfer without bytes is too
+// close to (or past) its deadline, or our bytes for it ended `expired`, the
+// engine records in RelayStore that it gives up that approval
+// (`requestReissue`) and never claims the transfer under it again. The
+// coordinator re-approves it only after the destination shows the approval
+// dead; an `expired` ledger row then continues as a new attempt
+// (`reopenExpired`). A `rejected` transfer is never re-issued.
 export class SubmissionHalt extends Error {
   constructor(code) { super("destination submission halted; offline review required"); this.code = code; }
 }
@@ -26,6 +34,8 @@ const HASH = /^0x[0-9a-f]{64}$/;
 const MAX_ROW_TEXT = 32_768;
 const PAGE = 256;
 const SOURCE = Object.freeze({ cronos: "xitcoin", xitcoin: "cronos" });
+// The adapters' transfer-scoped wait for an approval too close to its deadline.
+export const APPROVAL_EXPIRED_CODE = "approval_expired_awaiting_reissue";
 
 function code(value) { return typeof value === "string" && CODE.test(value) ? value : "invalid_adapter_result"; }
 function decision(value, allowed) {
@@ -75,6 +85,21 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
     ...details, attention });
   const identity = (stored, transferId) => ({ transferId, sourceRef: stored.transfer.source_ref,
     approvalDigest: stored.request.digest, requestHash: stored.requestHash });
+
+  // Gives up the stored approval of a transfer that holds no bytes for it
+  // (or only `expired` bytes): RelayStore records that this submitter will
+  // never send it, and the transfer waits for the coordinator instead of for
+  // a deferral. False when RelayStore no longer matches (then it is deferred).
+  async function requestReissue(stored, transferId, destinationRef) {
+    if (!store.requestReissue(sourceChain, stored.transfer.source_ref, { digest: stored.request.digest, destinationRef })) return false;
+    await boundary("reissue-requested");
+    ledger.clearDeferral(lease, { transferId, sourceRef: stored.transfer.source_ref });
+    return true;
+  }
+  const awaitingReissue = (transfer, digest) => {
+    const marker = transfer.reissue_requested ? store.reissueRequested(sourceChain, transfer.source_ref) : null;
+    return marker !== null && marker.digest === digest;
+  };
 
   async function halt(transferId, stored, haltCode) {
     ledger.halt(lease, { ...identity(stored, transferId), code: code(haltCode) });
@@ -268,6 +293,11 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
       }
       if (row.state === "finalized") return complete(stored, row, { blockNumber: row.blockNumber, blockHash: row.blockHash });
       if (row.state === "released_elsewhere") return releasedElsewhere(stored, transferId, row, row);
+      // Our bytes were mined after the deadline and reverted: give up this
+      // approval so the coordinator can re-issue it (idempotent).
+      if (row.state === "expired" && row.approvalDigest === stored.request.digest && !awaitingReissue(stored.transfer, stored.request.digest)) {
+        await requestReissue(stored, transferId, row.transactionHash);
+      }
     }
   }
 
@@ -286,8 +316,10 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
     // never holds the single unfinished slot.
     if (result.action === "waiting" && result.defer) {
       ledger.unclaim(lease, row.transferId);
-      ledger.defer(lease, { transferId: row.transferId, sourceRef: row.sourceRef, code: result.code }, { nowMs });
       await boundary("unclaimed");
+      if (result.code !== APPROVAL_EXPIRED_CODE || !(await requestReissue(stored, row.transferId, null))) {
+        ledger.defer(lease, { transferId: row.transferId, sourceRef: row.sourceRef, code: result.code }, { nowMs });
+      }
       return report("waiting", { transferId: row.transferId, code: result.code, unclaimed: true });
     }
     return result;
@@ -317,12 +349,32 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
         return row.state === "finalized" ? complete(stored, row, { blockNumber: row.blockNumber, blockHash: row.blockHash })
           : releasedElsewhere(stored, row.transferId, row, row);
       }
-      if (scheduled.state !== null && scheduled.state !== "unclaimed") throw new SubmissionHalt("ledger_invariant_violation");
-      if (scheduled.deferredUntilMs !== null && scheduled.deferredUntilMs > nowMs) continue;
+      if (scheduled.state !== null && !["unclaimed", "expired"].includes(scheduled.state)) throw new SubmissionHalt("ledger_invariant_violation");
+      const relay = store.get(sourceChain, candidate.source_ref);
+      if (relay.reissue_requested !== null) {
+        // Given up by this submitter: never claimed under that approval again.
+        // A stale scheduling hint must not delay the re-issued approval.
+        const stored = storedRequest(store, sourceChain, candidate.source_ref);
+        if (awaitingReissue(relay, stored.request.digest)) {
+          if (scheduled.deferredUntilMs !== null) ledger.clearDeferral(lease, { transferId: transferIdOf(stored), sourceRef: candidate.source_ref });
+          continue;
+        }
+      }
+      if (scheduled.state !== "expired" && scheduled.deferredUntilMs !== null && scheduled.deferredUntilMs > nowMs) continue;
       if (assessed >= maximumCandidates) break scan;
       const stored = storedRequest(store, sourceChain, candidate.source_ref);
       const transferId = transferIdOf(stored);
       if (scheduled.transferId !== null && scheduled.transferId !== transferId) throw new SubmissionHalt("ledger_invariant_violation");
+      if (scheduled.state === "expired") {
+        // Our expired bytes for an earlier approval; RelayStore now holds a
+        // re-issued one. The row continues as a new attempt.
+        const row = ledger.inspect(transferId);
+        if (row.approvalDigest === stored.request.digest || stored.transfer.destination_ref !== null) {
+          throw new SubmissionHalt("ledger_invariant_violation");
+        }
+        ledger.reopenExpired(lease, identity(stored, transferId));
+        await boundary("reopened");
+      }
       assessed += 1;
       const result = await start(stored, transferId);
       if (result.action === "rejected") { rejected.push(result.code); continue; }
@@ -330,6 +382,7 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
       if (result.action !== "waiting") return result;
       waiting.push(result.code);
       if (!result.defer) break scan;
+      if (result.code === APPROVAL_EXPIRED_CODE && await requestReissue(stored, transferId, null)) continue;
       ledger.defer(lease, { transferId, sourceRef: candidate.source_ref, code: result.code }, { nowMs });
     }
   }

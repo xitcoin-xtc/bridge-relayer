@@ -1,4 +1,5 @@
 import { FinalityViolation } from "./watchers.js";
+import { RetirementUnproven } from "./approval-retirement.js";
 import {
   APPROVAL_REISSUE_GRACE_SECONDS,
   approvalContentHash,
@@ -119,31 +120,72 @@ export async function approveFinalizedTransfer({
   if (transfer.state !== "finalized") throw new Error("only finalized transfers may be approved");
   const canonicalRequest = buildApprovalRequest(request);
   const persistedRequest = store.persistApprovalRequest(sourceChain, sourceRef, canonicalRequest);
+  // A re-issued request goes to every signer with its explicit declaration.
   const approvals = await collectApprovalQuorum({
-    clients, request: persistedRequest, authorizedSigners, threshold, nowUnix,
+    clients, request: persistedRequest, authorizedSigners, threshold, nowUnix, reissue: store.approvalReissue(sourceChain, sourceRef),
   });
   for (const approval of approvals) store.recordApproval(sourceChain, sourceRef, approval);
   const approved = store.transition(sourceChain, sourceRef, "approved");
   return { transfer: approved, approvals: store.approvals(sourceChain, sourceRef), idempotent: false };
 }
 
-// Returns the request to use for a finalized transfer this cycle, or null
-// when its persisted request expired less than the re-issue grace ago. An
-// expired request is re-issued with a new deadline for the same source event
-// (same source key and content); it is never reused after expiry and never
-// replaced while still valid.
-export function currentApprovalRequest({ store, transfer, build, nowUnix, windowSeconds,
-  graceSeconds = APPROVAL_REISSUE_GRACE_SECONDS }) {
+// Returns the request to use for a finalized transfer this cycle, or the
+// reason it waits ({ wait: code }). A persisted request is never replaced
+// while valid and never reused after expiry. An expired one is re-issued with
+// a new deadline for the same source event (same source key and content) only
+// after the re-issue grace by the local clock AND after `verifyRetired` proved
+// on the destination that it can never be used (approval-retirement.js).
+export async function currentApprovalRequest({ store, transfer, build, nowUnix, windowSeconds,
+  graceSeconds = APPROVAL_REISSUE_GRACE_SECONDS, verifyRetired }) {
   const persisted = store.approvalRequest(transfer.source_chain, transfer.source_ref);
-  if (!persisted) return build(nowUnix + windowSeconds);
-  if (persisted.deadlineUnix >= nowUnix) return persisted;
-  if (persisted.deadlineUnix + graceSeconds >= nowUnix) return null;
+  if (!persisted) return { request: build(nowUnix + windowSeconds) };
+  if (persisted.deadlineUnix >= nowUnix) return { request: persisted };
+  if (persisted.deadlineUnix + graceSeconds >= nowUnix) return { wait: "approval_reissue_grace" };
   const next = build(nowUnix + windowSeconds);
   if (approvalSourceKey(next) !== approvalSourceKey(persisted)
       || approvalContentHash(next) !== approvalContentHash(persisted)) {
     throw new Error("re-issued approval request does not match the persisted source event");
   }
-  return store.reissueApprovalRequest(transfer.source_chain, transfer.source_ref, persisted, next, { nowUnix });
+  const retired = await retirement(verifyRetired, next, persisted.deadlineUnix);
+  if (retired.wait) return retired;
+  return { request: store.reissueApprovalRequest(transfer.source_chain, transfer.source_ref, persisted, next, { nowUnix }) };
+}
+
+async function retirement(verifyRetired, request, previousDeadlineUnix) {
+  if (typeof verifyRetired !== "function") return { wait: "retirement_verifier_missing" };
+  try {
+    await verifyRetired({ request, previousDeadlineUnix });
+    return { retired: true };
+  } catch (error) {
+    if (error instanceof RetirementUnproven) return { wait: error.code };
+    throw error;
+  }
+}
+
+// Approved or submitted transfers whose destination submitter gave up their
+// expired approval (RelayStore `requestReissue`: it will never send it and
+// holds no other transaction for it). After the re-issue grace and a
+// destination proof that the approval can never be used, each returns to
+// `finalized` with a re-issued request for the same source event, and is
+// approved again through the normal path. A rejected transfer (for example an
+// invalid recipient) never asks for this: it stays rejected.
+export async function returnExpiredApprovals({ store, build, nowUnix, windowSeconds, graceSeconds = APPROVAL_REISSUE_GRACE_SECONDS,
+  verifyRetired, limit = 100 }) {
+  let returned = 0;
+  const waiting = [];
+  for (const transfer of store.reissueRequests({ limit })) {
+    const previous = store.approvalRequest(transfer.source_chain, transfer.source_ref);
+    if (!previous || previous.deadlineUnix + graceSeconds >= nowUnix) { waiting.push("approval_reissue_grace"); continue; }
+    const next = build(transfer, nowUnix + windowSeconds);
+    if (approvalSourceKey(next) !== approvalSourceKey(previous) || approvalContentHash(next) !== approvalContentHash(previous)) {
+      throw new Error("re-issued approval request does not match the persisted source event");
+    }
+    const retired = await retirement(verifyRetired, next, previous.deadlineUnix);
+    if (retired.wait) { waiting.push(retired.wait); continue; }
+    store.returnForReissue(transfer.source_chain, transfer.source_ref, previous, next, { nowUnix });
+    returned += 1;
+  }
+  return Object.freeze({ returned, waiting: Object.freeze(waiting) });
 }
 
 export async function scanFinalizedBatch({ watcher, store, sourceChain, startHeight = 1, maxBatch = 100 }) {
@@ -188,6 +230,7 @@ export async function runApprovalOnlyCycle({
   startHeights = { cronos: 1, xitcoin: 1 },
   maxBatch = 100,
   maximumApprovals = 100,
+  verifyRetired,
 }) {
   if (!store || !cronosWatcher || !xitcoinWatcher) throw new Error("approval-only coordinator dependencies are required");
   const now = height(nowUnix, "current time");
@@ -200,17 +243,20 @@ export async function runApprovalOnlyCycle({
     cronos: await scanFinalizedBatch({ watcher: cronosWatcher, store, sourceChain: "cronos", startHeight: startHeights.cronos, maxBatch }),
     xitcoin: await scanFinalizedBatch({ watcher: xitcoinWatcher, store, sourceChain: "xitcoin", startHeight: startHeights.xitcoin, maxBatch }),
   };
+  const build = (transfer, deadlineUnix) => buildTransferApprovalRequest({ transfer: { ...transfer, state: "finalized" },
+    routeId, cronosRouteId, cronosChainId, cronosVault, xitcoinChainId, signerSetVersion, deadlineUnix });
+  const returns = await returnExpiredApprovals({ store, build, nowUnix: now, windowSeconds: window, verifyRetired, limit });
   const finalized = store.pending().filter((transfer) => transfer.state === "finalized").slice(0, limit);
   const results = [];
+  const reissueWaiting = [...returns.waiting];
   let waiting = 0;
   for (const transfer of finalized) {
-    const request = currentApprovalRequest({
-      store, transfer, nowUnix: now, windowSeconds: window,
-      build: (deadlineUnix) => buildTransferApprovalRequest({
-        transfer, routeId, cronosRouteId, cronosChainId, cronosVault, xitcoinChainId, signerSetVersion, deadlineUnix,
-      }),
+    const current = await currentApprovalRequest({
+      store, transfer, nowUnix: now, windowSeconds: window, verifyRetired,
+      build: (deadlineUnix) => build(transfer, deadlineUnix),
     });
-    if (request === null) { waiting += 1; continue; }
+    if (current.wait) { waiting += 1; reissueWaiting.push(current.wait); continue; }
+    const request = current.request;
     results.push(await approveFinalizedTransfer({
       store,
       sourceChain: transfer.source_chain,
@@ -228,6 +274,8 @@ export async function runApprovalOnlyCycle({
     finalized: finalized.length,
     approved: results.length,
     awaitingReissue: waiting,
+    returnedForReissue: returns.returned,
+    reissueWaiting: Object.freeze(reissueWaiting),
     submissions: 0,
   });
 }

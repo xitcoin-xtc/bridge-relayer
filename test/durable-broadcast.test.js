@@ -9,8 +9,10 @@ import { evmAddressToBech32 } from "../src/address.js";
 import { keccak256 } from "ethers";
 import { journalOptions } from "./journal-fixture.js";
 import { signers } from "./fixtures/destination.js";
-import { ModelChain, modelAdapter, approvedTransfer, openStore } from "./fixtures/durable-adapter.js";
+import { ModelChain, modelAdapter, approvedTransfer, openStore, reapproveTransfer } from "./fixtures/durable-adapter.js";
 import { XITCOIN_TESTNET_ROUTE_ID } from "../src/protocol.js";
+import { buildTransferApprovalRequest } from "../src/coordinator.js";
+import { TESTNET_ROUTE_ID } from "../src/preflight.js";
 
 const bindings = {
   cronos: { destination: "cronos", chainId: "338", routeId: XITCOIN_TESTNET_ROUTE_ID,
@@ -429,7 +431,7 @@ test("a backlog of more than 256 older approved transfers never hides the unfini
 }));
 
 test("transfers that cannot proceed yet are deferred durably and never starve later transfers", () => harness("cronos", async ({ chain, cycle, setup, processHandle }) => {
-  for (let index = 1; index <= 12; index++) approvedTransfer(setup.store, "cronos", index, { deadlineUnix: 1_800_000_000 });
+  for (let index = 1; index <= 12; index++) chain.short.add(approvedTransfer(setup.store, "cronos", index).request.payload.sourceBurnId);
   setup.store.database.exec("UPDATE transfers SET updated_at = updated_at - 100");
   const valid = approvedTransfer(setup.store, "cronos", 13);
   const firstCycle = await cycle();
@@ -439,7 +441,7 @@ test("transfers that cannot proceed yet are deferred durably and never starve la
   assert.equal(setup.store.get(valid.sourceChain, valid.sourceRef).state, "submitted");
   const deferred = processHandle().ledger.deferrals();
   assert.equal(deferred.length, 12);
-  assert.ok(deferred.every((item) => item.code === "approval_expired_awaiting_reissue" && item.untilMs >= NOW + 60_000));
+  assert.ok(deferred.every((item) => item.code === "insufficient_vault_liquidity" && item.untilMs >= NOW + 60_000));
   // Deferred transfers are kept and retried after their backoff, with a longer backoff each time.
   chain.mine(); chain.confirm(3);
   assert.equal((await cycle({ nowMs: NOW + 2_000 })).action, "finalized");
@@ -540,3 +542,117 @@ test("a destination that paces its own resends records every send past 32 and re
     await assert.rejects(cycle({ adapter: { ...paced, ...patch }, nowMs: now }), SubmissionUnavailable);
   }
 }));
+
+for (const destination of ["cronos", "xitcoin"]) {
+  test(`${destination}: an approval that expired before submission is handed back for re-issue, never claimed, and the re-issued one proceeds at once`, () => harness(destination, async ({ chain, cycle, setup, processHandle }) => {
+    const late = approvedTransfer(setup.store, destination, 1, { deadlineUnix: 1_900_000_030 });
+    // A long-running deferral from an earlier wait must not delay the re-issued approval.
+    const { ledger } = processHandle();
+    const lease = ledger.acquireLease(owner(1), { nowMs: NOW });
+    const transferId = destination === "cronos" ? late.request.payload.sourceBurnId : modelAdapter(destination, chain).transferId(late.request);
+    for (let i = 0; i < 6; i++) ledger.defer(lease, { transferId, sourceRef: late.sourceRef, code: "insufficient_vault_liquidity" }, { nowMs: NOW - 120_000 });
+    ledger.releaseLease(lease);
+    setup.store.database.exec("UPDATE transfers SET updated_at = updated_at - 100");
+    const valid = approvedTransfer(setup.store, destination, 2);
+    // Deferred far beyond the approval window: nothing happens to it yet.
+    assert.equal((await cycle()).action, "submitted"); // the later transfer is not starved
+    assert.equal(setup.store.reissueRequested(late.sourceChain, late.sourceRef), null);
+    chain.mine(); chain.confirm(3);
+    assert.equal((await cycle({ nowMs: NOW + 1_000 })).action, "finalized");
+    assert.equal(setup.store.get(valid.sourceChain, valid.sourceRef).state, "completed");
+    // Once its deferral ends, the expired approval is given up, never claimed.
+    const handed = await cycle({ nowMs: NOW + 3_700_000 });
+    assert.deepEqual([handed.action, handed.waiting], ["waiting", ["approval_expired_awaiting_reissue"]]);
+    assert.deepEqual({ ...setup.store.reissueRequested(late.sourceChain, late.sourceRef) }, { digest: late.request.digest, destinationRef: null });
+    assert.equal(processHandle().ledger.scheduling(late.sourceRef).deferredUntilMs, null);
+    assert.equal(processHandle().ledger.scheduling(late.sourceRef).state, null);
+    for (let i = 0; i < 3; i++) assert.equal((await cycle({ nowMs: NOW + 3_800_000 + i })).action, "idle");
+    // Re-approved by the coordinator (after its destination proof): signed at once.
+    const next = reapproveTransfer(setup.store, late.sourceChain, late.sourceRef, { deadlineUnix: 1_900_007_200, nowUnix: 1_900_003_800 });
+    const resumed = await cycle({ nowMs: NOW + 3_801_000 });
+    assert.equal(resumed.action, "submitted");
+    assert.equal(processHandle().ledger.inspect(resumed.transferId).approvalDigest, next.digest);
+    chain.mine(); chain.confirm(3);
+    assert.equal((await cycle({ nowMs: NOW + 3_802_000 })).action, "finalized");
+    assert.equal(setup.store.get(late.sourceChain, late.sourceRef).state, "completed");
+    assert.equal(chain.distinctDeliveries(), 2);
+  }));
+
+  test(`${destination}: expired bytes are handed back for re-issue and continue as a new attempt with the next nonce`, () => harness(destination, async ({ chain, cycle, setup, processHandle }) => {
+    const late = approvedTransfer(setup.store, destination, 1, { deadlineUnix: 1_900_000_120 });
+    const first = await cycle();
+    assert.equal(first.action, "submitted");
+    chain.time = 1_900_000_200; // mined after the deadline: reverts
+    chain.mine(); chain.confirm(3);
+    const expired = await cycle({ nowMs: NOW + 200_000 });
+    assert.equal(expired.action, "expired");
+    assert.equal(setup.store.get(late.sourceChain, late.sourceRef).state, "submitted");
+    // The next cycle gives the approval up, naming the expired transaction.
+    await cycle({ nowMs: NOW + 201_000 });
+    assert.deepEqual({ ...setup.store.reissueRequested(late.sourceChain, late.sourceRef) },
+      { digest: late.request.digest, destinationRef: first.transactionHash });
+    assert.equal((await cycle({ nowMs: NOW + 202_000 })).attention.expired, 1);
+    const next = reapproveTransfer(setup.store, late.sourceChain, late.sourceRef, { deadlineUnix: 1_900_003_600, nowUnix: 1_900_000_400 });
+    const relay = setup.store.get(late.sourceChain, late.sourceRef);
+    assert.deepEqual([relay.state, relay.destination_ref, relay.reissue_requested], ["approved", null, null]);
+    assert.equal(setup.store.approvalHistory(late.sourceChain, late.sourceRef)[0].destination_ref, first.transactionHash);
+    const second = await cycle({ nowMs: NOW + 400_000 });
+    assert.equal(second.action, "submitted");
+    assert.notEqual(second.transactionHash, first.transactionHash);
+    const ledger = processHandle().ledger;
+    const row = ledger.inspect(second.transferId);
+    assert.deepEqual([row.state, row.nonce, row.approvalDigest], ["broadcast", 1, next.digest]);
+    assert.deepEqual(ledger.superseded(second.transferId).map((item) => [item.nonce, item.transactionHash, item.supersededBy]),
+      [[0, first.transactionHash, next.digest]]);
+    chain.mine(); chain.confirm(3);
+    const final = await cycle({ nowMs: NOW + 401_000 });
+    assert.deepEqual([final.action, final.transactionHash, final.attention.expired], ["finalized", second.transactionHash, 0]);
+    const completed = setup.store.get(late.sourceChain, late.sourceRef);
+    assert.deepEqual([completed.state, completed.destination_ref, completed.release_ref], ["completed", second.transactionHash, second.transactionHash]);
+    assert.equal(chain.distinctDeliveries(), 2);
+  }));
+}
+
+test("a rejected transfer is never handed back for re-issue and stays rejected", () => harness("cronos", async ({ chain, cycle, setup, processHandle }) => {
+  const bad = approvedTransfer(setup.store, "cronos", 1, { deadlineUnix: 1_900_000_030 });
+  chain.invalid.add(bad.request.payload.sourceBurnId);
+  const result = await cycle();
+  assert.deepEqual(result.rejected, ["invalid_recipient"]);
+  for (let i = 1; i < 4; i++) await cycle({ nowMs: NOW + i * 3_700_000 });
+  assert.equal(setup.store.reissueRequested(bad.sourceChain, bad.sourceRef), null);
+  assert.equal(processHandle().ledger.scheduling(bad.sourceRef).state, "rejected");
+  assert.throws(() => setup.store.returnForReissue(bad.sourceChain, bad.sourceRef, bad.request, bad.request, { nowUnix: 1_900_003_800 }));
+}));
+
+test("RelayStore re-issue requests and returns are conditional on the exact row, archived, and never possible for unrelated digests", () => harness("cronos", async ({ setup }) => {
+  const { store } = setup;
+  const { sourceChain, sourceRef, request } = approvedTransfer(store, "cronos", 1, { deadlineUnix: 1_900_000_030 });
+  const other = `0x${"ee".repeat(32)}`;
+  assert.equal(store.requestReissue(sourceChain, sourceRef, { digest: other }), false);
+  assert.equal(store.requestReissue(sourceChain, sourceRef, { digest: request.digest, destinationRef: other }), false);
+  assert.throws(() => store.requestReissue(sourceChain, sourceRef, { digest: "0x12" }), /invalid/);
+  // Without the submitter's request, the coordinator cannot return it.
+  const build = (deadlineUnix) => buildRequest(store, sourceChain, sourceRef, deadlineUnix);
+  assert.throws(() => store.returnForReissue(sourceChain, sourceRef, request, build(1_900_003_600), { nowUnix: 1_900_000_400 }), /not awaiting/);
+  assert.equal(store.requestReissue(sourceChain, sourceRef, { digest: request.digest }), true);
+  assert.equal(store.requestReissue(sourceChain, sourceRef, { digest: request.digest }), true); // idempotent
+  // Only an expired request, a later deadline and the same source event and content.
+  assert.throws(() => store.returnForReissue(sourceChain, sourceRef, request, build(1_900_003_600), { nowUnix: 1_900_000_020 }), /only an expired/);
+  assert.throws(() => store.returnForReissue(sourceChain, sourceRef, request, build(1_900_000_029), { nowUnix: 1_900_000_000 }), /only an expired/);
+  const tampered = { ...build(1_900_003_600), payload: { ...build(1_900_003_600).payload, amount: "11" } };
+  assert.throws(() => store.returnForReissue(sourceChain, sourceRef, request, tampered, { nowUnix: 1_900_000_400 }), /does not match/);
+  const returned = store.returnForReissue(sourceChain, sourceRef, request, build(1_900_003_600), { nowUnix: 1_900_000_400 });
+  assert.deepEqual([returned.state, returned.reissue_requested, store.approvals(sourceChain, sourceRef).length], ["finalized", null, 0]);
+  assert.deepEqual({ ...store.approvalReissue(sourceChain, sourceRef) }, { previousDigest: request.digest, previousDeadlineUnix: 1_900_000_030 });
+  const [archived] = store.approvalHistory(sourceChain, sourceRef);
+  assert.deepEqual([archived.state, JSON.parse(archived.approval_request).digest, JSON.parse(archived.approvals).length],
+    ["approved", request.digest, 2]);
+  assert.throws(() => store.database.exec("DELETE FROM approval_history"), /permanent/);
+  assert.throws(() => store.database.exec("UPDATE approval_history SET replaced_by = 'x'"), /permanent/);
+}));
+
+function buildRequest(store, sourceChain, sourceRef, deadlineUnix) {
+  return buildTransferApprovalRequest({ transfer: { ...store.get(sourceChain, sourceRef), state: "finalized" }, routeId: XITCOIN_TESTNET_ROUTE_ID,
+    cronosRouteId: TESTNET_ROUTE_ID, cronosChainId: 338, cronosVault: "0x1c94273C0b199b139D82da3786C9eCbE189D5919",
+    xitcoinChainId: "xitcoin-testnet-v2-1", signerSetVersion: 1, deadlineUnix });
+}

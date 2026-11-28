@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { keccak256, sha256 } from "ethers";
-import { BroadcastLedger, ledgerBinding, LEDGER_MAX_BROADCAST_ATTEMPTS, LEDGER_SCHEMA_V1, LEDGER_SCHEMA_VERSION } from "../src/broadcast-ledger.js";
+import { BroadcastLedger, ledgerBinding, LEDGER_MAX_BROADCAST_ATTEMPTS, LEDGER_SCHEMA_V1, LEDGER_SCHEMA_V2, LEDGER_SCHEMA_VERSION } from "../src/broadcast-ledger.js";
 import { evmAddressToBech32 } from "../src/address.js";
 import { journalOptions } from "./journal-fixture.js";
 import { signers } from "./fixtures/destination.js";
@@ -409,7 +409,8 @@ test("reopening requires the identical binding, schema, triggers and version", (
   assert.throws(() => ledger.assertBinding({ ...bindings.cronos, targetIdentity: hash("e") }), failure);
   ledger.assertBinding(bindings.cronos);
   ledger.close();
-  for (const sql of ["DROP TRIGGER transfers_no_delete", "PRAGMA user_version = 1", "PRAGMA user_version = 3",
+  for (const sql of ["DROP TRIGGER transfers_no_delete", "PRAGMA user_version = 1", "PRAGMA user_version = 2", "PRAGMA user_version = 4",
+    "DROP TRIGGER transfers_reopen", "DROP TRIGGER superseded_no_delete", "DROP TABLE superseded_attempts",
     "CREATE INDEX unexpected ON transfers(state)", "DROP TABLE transfer_events",
     "CREATE TABLE extra (id INTEGER) STRICT"]) {
     await fixture((copy) => {
@@ -517,15 +518,16 @@ test("ledger filesystem rejects symlinks, shared parents and foreign identities"
   assert.throws(() => new BroadcastLedger("relative.sqlite", bindings.cronos, journalOptions("cronos")), failure);
 }));
 
-// A version 1 ledger as the previous release created it: exact DDL, binding,
-// rows in every state that can exist, and the 32-attempt cap in a CHECK.
-function versionOneLedger(path, destination, populate) {
+// A version 1 (or 2) ledger as an earlier release created it: exact DDL,
+// binding, rows in every state that can exist (and, in version 1, the
+// 32-attempt cap in a CHECK).
+function versionOneLedger(path, destination, populate, { version = 1 } = {}) {
   closeSync(openSync(path, "wx", 0o600));
   const raw = new DatabaseSync(path);
   try {
     raw.exec("BEGIN IMMEDIATE");
-    raw.exec(LEDGER_SCHEMA_V1);
-    raw.exec("PRAGMA user_version = 1");
+    raw.exec(version === 1 ? LEDGER_SCHEMA_V1 : LEDGER_SCHEMA_V2);
+    raw.exec(`PRAGMA user_version = ${version}`);
     raw.prepare("INSERT INTO ledger_binding VALUES (1, ?)").run(ledgerBinding(bindings[destination]));
     populate?.(raw);
     raw.exec("COMMIT");
@@ -536,7 +538,7 @@ const insert = (raw, values) => raw.prepare(`INSERT INTO transfers (transfer_id,
   VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?, 10, 10)`).run(...values);
 
 test("a version 1 ledger is migrated forward once, keeping every row and rule; attempts are no longer capped at 32", () => fixture((path) => {
-  assert.equal(LEDGER_SCHEMA_VERSION, 2);
+  assert.equal(LEDGER_SCHEMA_VERSION, 3);
   versionOneLedger(path, "xitcoin", (raw) => {
     raw.prepare("INSERT INTO worker_lease VALUES (1, ?, 3, 0)").run(owner(1));
     raw.prepare("INSERT INTO account_nonce VALUES (1, 8)").run();
@@ -568,8 +570,9 @@ test("a version 1 ledger is migrated forward once, keeping every row and rule; a
   ledger.close();
   const after = new DatabaseSync(path);
   try {
-    assert.equal(after.prepare("PRAGMA user_version").get().user_version, 2);
+    assert.equal(after.prepare("PRAGMA user_version").get().user_version, 3);
     assert.equal(JSON.stringify(rows(after)), original); // every row unchanged
+    assert.equal(after.prepare("SELECT count(*) AS n FROM superseded_attempts").get().n, 0);
   } finally { after.close(); }
   ledger = open(path, "xitcoin"); // reopening a migrated ledger is idempotent
   try {
@@ -583,7 +586,7 @@ test("a version 1 ledger is migrated forward once, keeping every row and rule; a
       assert.equal(ledger.markBroadcast(lease, hash("1"), { maxAttempts: null }).broadcastAttempts, attempt);
     }
   } finally { ledger.close(); }
-  // The migrated schema keeps every trigger of version 2.
+  // The migrated schema keeps every trigger of version 2 (and 3).
   const raw = new DatabaseSync(path);
   try {
     for (const sql of ["DELETE FROM transfers", "UPDATE transfers SET broadcast_attempts = 0", "UPDATE transfers SET broadcast_attempts = 50",
@@ -627,5 +630,151 @@ test("uncapped destinations record every send; stalled unfinished rows are count
   }
   ledger.finalize(lease, hash("1"), { blockNumber: 3, blockHash: hash("f") });
   assert.equal(ledger.attention({ nowMs: now + 3_601_000, stalledAfterSeconds: 3_600 }).stalled, 0);
+  ledger.close();
+}));
+
+// An expired row as the engine leaves it: our bytes mined after the approval
+// deadline and reverted.
+function expiredRow(ledger, lease, transferId, nonce, approval = "b") {
+  ledger.claim(lease, claimOf(transferId, approval));
+  ledger.recordSigned(lease, signed(transferId, nonce));
+  ledger.markBroadcast(lease, transferId, { maxAttempts: null });
+  return ledger.markExpired(lease, transferId, { blockNumber: 9, blockHash: hash("9") });
+}
+
+test("a version 2 ledger is migrated forward to version 3 without touching a row; an expired row may then reopen", () => fixture((path) => {
+  versionOneLedger(path, "cronos", (raw) => {
+    raw.prepare("INSERT INTO worker_lease VALUES (1, ?, 2, 0)").run(owner(1));
+    raw.prepare("INSERT INTO account_nonce VALUES (1, 8)").run();
+    insert(raw, [hash("1"), hash("1"), hash("b"), hash("d"), "claimed", null, null, null, null]);
+    raw.exec(`UPDATE transfers SET state = 'signed', nonce = 7, signed_hex = '${bytes("1")}', transaction_digest = '${sha256(bytes("1"))}',
+      transaction_hash = '${keccak256(bytes("1"))}' WHERE transfer_id = '${hash("1")}'`);
+    for (let attempt = 0; attempt < 40; attempt++) {
+      raw.exec(`UPDATE transfers SET state = 'broadcast', broadcast_attempts = broadcast_attempts + 1 WHERE transfer_id = '${hash("1")}'`);
+    }
+    raw.exec(`UPDATE transfers SET state = 'expired', block_number = 9, block_hash = '${hash("9")}' WHERE transfer_id = '${hash("1")}'`);
+    // Version 2 never lets an expired row change.
+    assert.throws(() => raw.exec(`UPDATE transfers SET state = 'unclaimed' WHERE transfer_id = '${hash("1")}'`));
+    insert(raw, [hash("2"), hash("2"), hash("b"), hash("d"), "rejected", "invalid_recipient", null, null, null]);
+  }, { version: 2 });
+  const snapshot = (db) => JSON.stringify(db.prepare("SELECT * FROM transfers ORDER BY transfer_id").all());
+  const before = new DatabaseSync(path);
+  const original = snapshot(before);
+  before.close();
+  assert.throws(() => new BroadcastLedger(path, { ...bindings.cronos, targetIdentity: hash("e") }, journalOptions("cronos")), failure);
+  let ledger = open(path, "cronos");
+  ledger.close();
+  const after = new DatabaseSync(path);
+  try {
+    assert.equal(after.prepare("PRAGMA user_version").get().user_version, 3);
+    assert.equal(snapshot(after), original);
+  } finally { after.close(); }
+  ledger = open(path, "cronos");
+  try {
+    const lease = ledger.acquireLease(owner(1));
+    assert.equal(ledger.attention().expired, 1);
+    const reopened = ledger.reopenExpired(lease, claimOf(hash("1"), "e"));
+    assert.deepEqual([reopened.state, reopened.nonce, reopened.signedHex, reopened.broadcastAttempts, reopened.approvalDigest],
+      ["unclaimed", null, null, 0, hash("e")]);
+    assert.equal(ledger.attention().expired, 0);
+    assert.deepEqual(ledger.superseded(hash("1")).map((row) => [row.nonce, row.transactionHash, row.approvalDigest, row.supersededBy]),
+      [[7, keccak256(bytes("1")), hash("b"), hash("e")]]);
+    // A rejected row never reopens.
+    assert.throws(() => ledger.reopenExpired(lease, claimOf(hash("2"), "e")), failure);
+  } finally { ledger.close(); }
+}));
+
+test("only an expired row reopens, only under a new approval, and archived bytes, nonces and hashes are never used again", () => fixture((path) => {
+  const ledger = open(path, "xitcoin");
+  const lease = ledger.acquireLease(owner(1));
+  ledger.claim(lease, claimOf(hash("1")));
+  ledger.recordSigned(lease, signed(hash("1"), 0));
+  ledger.markBroadcast(lease, hash("1"), { maxAttempts: null });
+  // Unfinished, finalized, failed, reverted or released rows never reopen.
+  assert.throws(() => ledger.reopenExpired(lease, claimOf(hash("1"), "e")), failure);
+  ledger.markExpired(lease, hash("1"), { blockNumber: 9, blockHash: hash("9") });
+  // The same approval digest cannot reopen it, nor can a stale lease.
+  assert.throws(() => ledger.reopenExpired(lease, claimOf(hash("1"), "b")), failure);
+  assert.throws(() => ledger.reopenExpired({ ...lease, epoch: lease.epoch + 1 }, claimOf(hash("1"), "e")), failure);
+  assert.throws(() => ledger.reopenExpired(lease, { ...claimOf(hash("1"), "e"), sourceRef: hash("2") }), failure);
+  const reopened = ledger.reopenExpired(lease, claimOf(hash("1"), "e"));
+  assert.equal(reopened.state, "unclaimed");
+  assert.equal(ledger.reopenExpired(lease, claimOf(hash("1"), "e")).state, "unclaimed"); // idempotent
+  assert.throws(() => ledger.reopenExpired(lease, claimOf(hash("1"), "f")), failure);
+  // The new attempt follows every rule of a new claim and takes the next nonce.
+  assert.equal(ledger.claim(lease, claimOf(hash("1"), "e")).state, "claimed");
+  assert.throws(() => ledger.recordSigned(lease, signed(hash("1"), 0, "second")), failure);
+  const second = ledger.recordSigned(lease, signed(hash("1"), 1, "second"));
+  assert.deepEqual([second.nonce, second.approvalDigest], [1, hash("e")]);
+  ledger.markBroadcast(lease, hash("1"), { maxAttempts: null });
+  ledger.finalize(lease, hash("1"), { blockNumber: 12, blockHash: hash("c") });
+  assert.throws(() => ledger.reopenExpired(lease, claimOf(hash("1"), "f")), failure);
+  const events = ledger.superseded(hash("1"));
+  assert.equal(events.length, 1);
+  ledger.close();
+
+  const raw = new DatabaseSync(path);
+  try {
+    // The archive is append-only and only ever copies an expired row exactly.
+    for (const sql of ["DELETE FROM superseded_attempts", "UPDATE superseded_attempts SET superseded_by = '" + hash("a") + "'",
+      `INSERT INTO superseded_attempts (transfer_id, source_ref, approval_digest, request_hash, claim_epoch, nonce, signed_hex,
+        transaction_digest, transaction_hash, broadcast_attempts, block_number, block_hash, superseded_by, superseded_at)
+        VALUES ('${hash("3")}', '${hash("3")}', '${hash("b")}', '${hash("d")}', 1, 5, '${bytes("3")}', '${sha256(bytes("3"))}',
+        '${keccak256(bytes("3"))}', 1, 1, '${hash("9")}', '${hash("e")}', 1)`,
+      // A finalized row can never be turned back into a new attempt, even raw.
+      `UPDATE transfers SET state = 'unclaimed', approval_digest = '${hash("f")}', nonce = NULL, signed_hex = NULL, transaction_digest = NULL,
+        transaction_hash = NULL, broadcast_attempts = 0, block_number = NULL, block_hash = NULL WHERE transfer_id = '${hash("1")}'`]) {
+      assert.throws(() => raw.exec(sql), Error, sql);
+    }
+  } finally { raw.close(); }
+}));
+
+test("a raw reopen without the exact archived attempt, or reusing an archived nonce, is refused by the schema", () => fixture((path) => {
+  let ledger = open(path, "cronos");
+  const lease = ledger.acquireLease(owner(1));
+  expiredRow(ledger, lease, hash("1"), 4);
+  ledger.close();
+  const raw = new DatabaseSync(path);
+  const reset = (digest) => `UPDATE transfers SET state = 'unclaimed', approval_digest = '${digest}', nonce = NULL, signed_hex = NULL,
+    transaction_digest = NULL, transaction_hash = NULL, broadcast_attempts = 0, block_number = NULL, block_hash = NULL
+    WHERE transfer_id = '${hash("1")}'`;
+  try {
+    assert.throws(() => raw.exec(reset(hash("e"))), /reopen/); // nothing archived
+    raw.exec(`INSERT INTO superseded_attempts (transfer_id, source_ref, approval_digest, request_hash, claim_epoch, nonce, signed_hex,
+      transaction_digest, transaction_hash, broadcast_attempts, block_number, block_hash, superseded_by, superseded_at)
+      SELECT transfer_id, source_ref, approval_digest, request_hash, claim_epoch, nonce, signed_hex, transaction_digest, transaction_hash,
+        broadcast_attempts, block_number, block_hash, '${hash("e")}', 1 FROM transfers WHERE transfer_id = '${hash("1")}'`);
+    assert.throws(() => raw.exec(reset(hash("f"))), /reopen/); // archived for another approval
+    assert.throws(() => raw.exec(reset(hash("b"))), /reopen|superseded/); // same approval
+    assert.throws(() => raw.exec(`UPDATE transfers SET state = 'unclaimed', approval_digest = '${hash("e")}', broadcast_attempts = 0,
+      block_number = NULL, block_hash = NULL WHERE transfer_id = '${hash("1")}'`)); // bytes kept
+    raw.exec(reset(hash("e")));
+    raw.exec(`UPDATE transfers SET state = 'claimed' WHERE transfer_id = '${hash("1")}'`);
+    // Neither the archived nonce nor its bytes or hash can be recorded again.
+    assert.throws(() => raw.exec(`UPDATE transfers SET state = 'signed', nonce = 4, signed_hex = '${bytes("other")}',
+      transaction_digest = '${sha256(bytes("other"))}', transaction_hash = '${keccak256(bytes("other"))}' WHERE transfer_id = '${hash("1")}'`), /superseded/);
+    assert.throws(() => raw.exec(`UPDATE transfers SET state = 'signed', nonce = 5, signed_hex = '${bytes(hash("1"))}',
+      transaction_digest = '${sha256(bytes(hash("1")))}', transaction_hash = '${keccak256(bytes(hash("1")))}' WHERE transfer_id = '${hash("1")}'`), /superseded/);
+  } finally { raw.close(); }
+  ledger = open(path, "cronos");
+  ledger.close();
+}));
+
+test("stalled counts the current attempt and a cleared deferral lets a re-issued approval proceed at once", () => fixture((path) => {
+  const ledger = open(path, "xitcoin");
+  const lease = ledger.acquireLease(owner(1));
+  expiredRow(ledger, lease, hash("1"), 0);
+  const now = Date.now();
+  ledger.reopenExpired(lease, claimOf(hash("1"), "e"));
+  ledger.claim(lease, claimOf(hash("1"), "e"));
+  ledger.recordSigned(lease, signed(hash("1"), 1, "second"));
+  assert.equal(ledger.attention({ nowMs: now, stalledAfterSeconds: 60 }).stalled, 0);
+  assert.equal(ledger.attention({ nowMs: now + 61_000, stalledAfterSeconds: 60 }).stalled, 1);
+  ledger.defer(lease, { transferId: hash("2"), sourceRef: hash("2"), code: "approval_expired_awaiting_reissue" }, { nowMs: now });
+  assert.ok(ledger.scheduling(hash("2")).deferredUntilMs > now);
+  assert.throws(() => ledger.clearDeferral(lease, { transferId: hash("3"), sourceRef: hash("2") }), failure);
+  assert.equal(ledger.clearDeferral(lease, { transferId: hash("2"), sourceRef: hash("2") }).cleared, true);
+  assert.equal(ledger.scheduling(hash("2")).deferredUntilMs, null);
+  assert.equal(ledger.clearDeferral(lease, { transferId: hash("2"), sourceRef: hash("2") }).cleared, false);
   ledger.close();
 }));

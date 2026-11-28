@@ -14,7 +14,11 @@ import { join } from "node:path";
 import { Interface, JsonRpcProvider, computeAddress, encryptKeystoreJsonSync } from "ethers";
 import { evmAddressToBech32 } from "../src/address.js";
 import { BroadcastLedger } from "../src/broadcast-ledger.js";
-import { approveFinalizedTransfer, buildTransferApprovalRequest } from "../src/coordinator.js";
+import { approveFinalizedTransfer, buildTransferApprovalRequest, returnExpiredApprovals } from "../src/coordinator.js";
+import { createApprovalRetirementVerifier } from "../src/approval-retirement.js";
+import { APPROVAL_REISSUE_GRACE_SECONDS } from "../src/approvals.js";
+import { CronosRpcQuorum } from "../src/cronos-rpc.js";
+import { XitcoinRpcQuorum } from "../src/xitcoin-rpc.js";
 import { CometBftHttpClient, decodeXitcoinOutboundBlock, decodeXitcoinOutboundTransaction } from "../src/network.js";
 import { TESTNET_ROUTE_ID } from "../src/preflight.js";
 import { XITCOIN_TESTNET_ROUTE_ID, attestationId } from "../src/protocol.js";
@@ -84,9 +88,16 @@ function isolatedSigners({ vault, proxies }) {
   const policy = createSignerPolicy({ routeIds: [XITCOIN_TESTNET_ROUTE_ID], cronosChainIds: [338], xitcoinChainIds: [CHAIN_ID],
     cronosVaults: [vault], maximumAmount: (10n ** 21n).toString(), maximumDeadlineSeconds: 7_200 });
   const journals = [0, 1, 2].map(() => new SignerApprovalJournal());
+  // Each signer checks an explicit re-issue on the chain itself, through two
+  // origins of its own (the Cronos quorum is never contacted for a mint).
+  const verifyRetirement = createApprovalRetirementVerifier({ cronos: new CronosRpcQuorum({ urls: proxies.map((proxy) => proxy.url),
+    allowLoopbackHttp: true }), cronosVault: vault, cronosConfirmations: 3, xitcoin: new XitcoinRpcQuorum({ allowLoopbackHttp: true,
+    origins: [{ rpcUrl: node.rpcUrl, restUrl: node.restUrl },
+      { rpcUrl: node.rpcUrl.replace("127.0.0.1", "localhost"), restUrl: node.restUrl.replace("127.0.0.1", "localhost") }] }) });
   const services = [0, 1, 2].map((index) => new IsolatedSignerService({ identity: `signer-${index + 1}`, signerAddress: signers[index],
-    policy, verifySource, journal: journals[index], signDigest: async (digest) => keys[index].sign(digest).serialized }));
-  return { services, close: () => { for (const provider of providers) provider.destroy(); for (const journal of journals) journal.close?.(); } };
+    policy, verifySource, journal: journals[index], verifyRetirement, signDigest: async (digest) => keys[index].sign(digest).serialized }));
+  return { services, verifyRetirement,
+    close: () => { for (const provider of providers) provider.destroy(); for (const journal of journals) journal.close?.(); } };
 }
 
 async function scenario(run, { deposits = 1, approved = deposits, deadlineOffset = 3_600, xitcoinPatch = {}, origins = 2, manifestPatch = {} } = {}) {
@@ -177,7 +188,7 @@ async function scenario(run, { deposits = 1, approved = deposits, deadlineOffset
       },
     };
     await run({ anvil, node, bridge, records, requests, store, manifest, paths, runtime, facts, directory, submitter, key,
-      origins: xitcoinOrigins, cronosProxies, approve, idOf });
+      origins: xitcoinOrigins, cronosProxies, approve, idOf, signerSet });
   } finally {
     for (const step of cleanup.reverse()) { try { await step(); } catch { /* best effort */ } }
     rmSync(directory, { recursive: true, force: true });
@@ -396,7 +407,7 @@ test("paused route: nothing is claimed or sent until a quorum-signed resume", op
   await assertSingleMint(facts);
 }));
 
-test("an approval too close to its deadline waits for re-issue without claiming", options, () => scenario(async ({ runtime, facts }) => {
+test("an approval too close to its deadline is handed back, re-issued only after the chain shows it dead, then minted once", options, () => scenario(async ({ runtime, facts, store, records, bridge, signerSet, requests }) => {
   const rt = await runtime();
   const report = await rt.runOnce();
   assert.equal(report.action, "waiting");
@@ -404,6 +415,30 @@ test("an approval too close to its deadline waits for re-issue without claiming"
   assert.equal(facts.row().found, false);
   assert.equal(facts.relay().state, "approved");
   assert.equal(await facts.sequence(), 0);
+  const original = requests[0];
+  assert.deepEqual({ ...store.reissueRequested("cronos", records[0].sourceRef) }, { digest: original.digest, destinationRef: null });
+
+  // Coordinator: the local grace has passed, but not the chain's block time.
+  const now = original.deadlineUnix + APPROVAL_REISSUE_GRACE_SECONDS + 1;
+  const build = (transfer, deadlineUnix) => buildTransferApprovalRequest({ transfer: { ...transfer, state: "finalized" },
+    routeId: XITCOIN_TESTNET_ROUTE_ID, cronosRouteId: TESTNET_ROUTE_ID, cronosChainId: 338, cronosVault: bridge.vault,
+    xitcoinChainId: CHAIN_ID, deadlineUnix });
+  const coordinator = () => returnExpiredApprovals({ store, build, nowUnix: now, windowSeconds: 1_800, verifyRetired: signerSet.verifyRetirement });
+  assert.deepEqual(await coordinator(), { returned: 0, waiting: ["deadline_not_passed"] });
+  for (let i = 0; i < 600 && Date.parse((await node.rpc("status")).sync_info.latest_block_time) / 1000 <= original.deadlineUnix + 1; i++) await sleep(100);
+  assert.deepEqual(await coordinator(), { returned: 1, waiting: [] });
+  assert.equal(facts.relay().state, "finalized");
+  // Signers sign the explicit re-issue only after their own check on the chain.
+  const request = store.approvalRequest("cronos", records[0].sourceRef);
+  const clients = signerSet.services.map((service) => ({ identity: service.identity, approve: (value) => service.approve(value, { nowUnix: now }) }));
+  await approveFinalizedTransfer({ store, sourceChain: "cronos", sourceRef: records[0].sourceRef, request, clients,
+    authorizedSigners: [...signers], threshold: 2, nowUnix: now });
+  assert.equal(facts.relay().state, "approved");
+  requests[0] = request;
+  await completes(rt, facts);
+  await assertSingleMint(facts);
+  assert.equal(facts.row().approvalDigest, request.digest);
+  assert.equal((await facts.attestation()).record.deadline_unix, String(request.deadlineUnix));
 }, { deadlineOffset: 20 }));
 
 test("signed bytes first sent after the deadline end expired and the next transfer proceeds", options, () => scenario(async ({ runtime, facts, manifest, paths, records, approve, requests }) => {
