@@ -4,7 +4,7 @@ import { BroadcastIntentJournal } from "./broadcast-intent.js";
 import { SignedIntentJournal } from "./signed-intent.js";
 import { prepareCronosRelease, inspectCronosSignedTransaction } from "./cronos-destination.js";
 import { buildTransferApprovalRequest } from "./coordinator.js";
-import { cronosRouteId } from "./protocol.js";
+import { TESTNET_ROUTE_ID } from "./preflight.js";
 import { destinationSnapshot, exactFields } from "./destination-validation.js";
 import { validateSubmitterManifest } from "./submitter-manifest.js";
 
@@ -30,7 +30,7 @@ export function reserveStoredCronosIntent(input) {
     if (transfer.state !== "approved" || transfer.destination_ref !== null) throw new Error();
     const request = destinationSnapshot(store.approvalRequest("xitcoin", sourceRef));
     const rebuilt = buildTransferApprovalRequest({ transfer: { ...transfer, state: "finalized" },
-      routeId: config.routeId, cronosRouteId: cronosRouteId(config.routeId), cronosChainId: config.cronosChainId,
+      routeId: config.routeId, cronosRouteId: TESTNET_ROUTE_ID, cronosChainId: config.cronosChainId,
       cronosVault: supplied.identity.vault, signerSetVersion: request.payload.signerSetVersion,
       deadlineUnix: request.deadlineUnix });
     if (!isDeepStrictEqual(request, rebuilt)) throw new Error();
