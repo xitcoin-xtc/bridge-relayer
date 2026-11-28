@@ -1112,7 +1112,8 @@ canary.
 
 - Coordinator re-issue of expired approvals for transfers already `approved`
   but not submitted (both submitters defer them and wait).
-- Reconciler chain readers (vault locked balance and chain outstanding amount).
+- A scheduler and service unit for the reconciler (its chain readers exist;
+  see [OPERATIONS.md](OPERATIONS.md#reconciliation)).
 - An offline review procedure for halted or failed ledger rows, and a reviewed
   completion tool for `release_unverified`, `expired` and `reverted` rows.
 - Light-client verification of the attestation record (`abci_query` with
