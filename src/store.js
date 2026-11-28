@@ -110,6 +110,11 @@ export class RelayStore {
     // For a re-issued approval request, the explicit declaration
     // ({ previousDigest, previousDeadlineUnix }) sent to signers with it.
     if (!columns.has("approval_reissue")) this.database.exec("ALTER TABLE transfers ADD COLUMN approval_reissue TEXT");
+    // Set by the coordinator when its re-issue proof shows that the replay key
+    // of a given-up approval is already used on the destination (for example
+    // with leaked signatures before the deadline): never re-issued, the
+    // destination submitter completes it from the release evidence instead.
+    if (!columns.has("processed_elsewhere")) this.database.exec("ALTER TABLE transfers ADD COLUMN processed_elsewhere TEXT");
     // Every approval request that was replaced by a re-issue, with its
     // approvals and the destination transaction bound to it. Append-only.
     this.database.exec(`
@@ -299,6 +304,25 @@ export class RelayStore {
     return encoded ? reissueMarker(JSON.parse(encoded)) : null;
   }
 
+  // Coordinator side: the given-up approval `digest` can never be re-issued
+  // because the destination shows its replay key used. Conditional on the
+  // submitter's request for exactly that approval; idempotent.
+  markProcessedElsewhere(sourceChain, sourceRef, { digest }) {
+    const marker = reissueMarker({ digest });
+    const result = this.database.prepare(`
+      UPDATE transfers SET processed_elsewhere = ?
+      WHERE source_chain = ? AND source_ref = ? AND processed_elsewhere IS NULL AND state IN ('approved', 'submitted')
+        AND json_extract(reissue_requested, '$.digest') = ? AND json_extract(approval_request, '$.digest') = ?
+    `).run(JSON.stringify({ digest: marker.digest }), sourceChain, sourceRef.toLowerCase(), marker.digest, marker.digest);
+    if (result.changes === 1) return true;
+    return this.processedElsewhere(sourceChain, sourceRef) === marker.digest;
+  }
+
+  processedElsewhere(sourceChain, sourceRef) {
+    const encoded = this.get(sourceChain, sourceRef)?.processed_elsewhere;
+    return encoded ? reissueMarker(JSON.parse(encoded)).digest : null;
+  }
+
   // Approved or submitted transfers whose submitter requested a re-issue.
   reissueRequests({ limit = 100 } = {}) {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) throw new Error("invalid re-issue request limit");
@@ -320,7 +344,7 @@ export class RelayStore {
     try {
       const current = this.get(sourceChain, ref);
       const marker = current?.reissue_requested ? reissueMarker(JSON.parse(current.reissue_requested)) : null;
-      if (!current || !marker || current.approval_request !== previousEncoded || marker.digest !== previous.digest
+      if (!current || !marker || current.processed_elsewhere !== null || current.approval_request !== previousEncoded || marker.digest !== previous.digest
           || !((current.state === "approved" && current.destination_ref === null && marker.destinationRef === null)
             || (current.state === "submitted" && current.destination_ref === marker.destinationRef))) {
         throw new Error("transfer is not awaiting this re-issue");

@@ -85,6 +85,14 @@ export function modelAdapter(destination, chain, { maxBroadcastAttempts = 3, con
       if (chain.short.has(id)) return { action: "wait", code: "insufficient_vault_liquidity", defer: true };
       return { action: "sign", context: { ok: true } };
     },
+    // Only the release-by-another-transaction evidence; never decides to sign.
+    async releasedElsewhere({ transferId: id }) {
+      if (chain.rpcFailure) throw new Error("rpc_disagreement");
+      chain.elsewhereChecks = (chain.elsewhereChecks ?? 0) + 1;
+      if (chain.unverified.has(id)) return { action: "release_unverified", code: "release_not_found" };
+      if (!chain.processed.has(id)) return { action: "wait", code: "release_elsewhere_not_found", defer: true };
+      return elsewhere(id, null);
+    },
     async sign({ request, transferId: id, expectedNonce, context }) {
       if (!context?.ok) throw new Error("missing context");
       if (expectedNonce !== null && expectedNonce !== chain.nonce) return { action: "halt", code: "account_nonce_not_owned" };

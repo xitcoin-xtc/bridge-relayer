@@ -424,9 +424,17 @@ test("an approval too close to its deadline is handed back, re-issued only after
     routeId: XITCOIN_TESTNET_ROUTE_ID, cronosRouteId: TESTNET_ROUTE_ID, cronosChainId: 338, cronosVault: bridge.vault,
     xitcoinChainId: CHAIN_ID, deadlineUnix });
   const coordinator = () => returnExpiredApprovals({ store, build, nowUnix: now, windowSeconds: 1_800, verifyRetired: signerSet.verifyRetirement });
-  assert.deepEqual(await coordinator(), { returned: 0, waiting: ["deadline_not_passed"] });
-  for (let i = 0; i < 600 && Date.parse((await node.rpc("status")).sync_info.latest_block_time) / 1000 <= original.deadlineUnix + 1; i++) await sleep(100);
-  assert.deepEqual(await coordinator(), { returned: 1, waiting: [] });
+  assert.deepEqual(await coordinator(), { returned: 0, processedElsewhere: 0, waiting: ["deadline_not_passed"] });
+  // Until a block that every origin has committed is past the deadline, the
+  // proof keeps waiting; then the transfer is returned.
+  let result;
+  for (let i = 0; i < 600; i++) {
+    result = await coordinator();
+    if (result.returned) break;
+    assert.deepEqual(result, { returned: 0, processedElsewhere: 0, waiting: ["deadline_not_passed"] });
+    await sleep(100);
+  }
+  assert.deepEqual(result, { returned: 1, processedElsewhere: 0, waiting: [] });
   assert.equal(facts.relay().state, "finalized");
   // Signers sign the explicit re-issue only after their own check on the chain.
   const request = store.approvalRequest("cronos", records[0].sourceRef);
@@ -441,6 +449,34 @@ test("an approval too close to its deadline is handed back, re-issued only after
   assert.equal((await facts.attestation()).record.deadline_unix, String(request.deadlineUnix));
   // Inside the 30-second deadline margin from the start, with as much time as
   // possible before the chain's block time passes the deadline.
+}, { deadlineOffset: 28 }));
+
+test("a given-up approval used by leaked signatures before its deadline completes as released elsewhere, never re-issued or signed", options, () => scenario(async ({ runtime, facts, store, records, bridge, signerSet, requests }) => {
+  const rt = await runtime();
+  assert.deepEqual((await rt.runOnce()).waiting, ["approval_expired_awaiting_reissue"]);
+  const original = requests[0];
+  // Someone holding the stored approvals submits the attestation before the deadline.
+  const foreign = await foreignSubmission(THIRD_PARTY_KEY, original, store.approvals("cronos", records[0].sourceRef));
+  assert.equal(foreign.result.tx_result.code, 0);
+  // The coordinator's destination proof finds the deposit processed: no re-issue.
+  const now = original.deadlineUnix + APPROVAL_REISSUE_GRACE_SECONDS + 1;
+  const build = (transfer, deadlineUnix) => buildTransferApprovalRequest({ transfer: { ...transfer, state: "finalized" },
+    routeId: XITCOIN_TESTNET_ROUTE_ID, cronosRouteId: TESTNET_ROUTE_ID, cronosChainId: 338, cronosVault: bridge.vault,
+    xitcoinChainId: CHAIN_ID, deadlineUnix });
+  const coordinator = () => returnExpiredApprovals({ store, build, nowUnix: now, windowSeconds: 1_800, verifyRetired: signerSet.verifyRetirement });
+  // The proof reads one block below the tip: wait for the processing block to be under it.
+  await node.blocks(2);
+  assert.deepEqual(await coordinator(), { returned: 0, processedElsewhere: 1, waiting: ["transfer_processed"] });
+  // The submitter completes it from the verified processing record of that transaction.
+  await completes(rt, facts);
+  const relay = facts.relay();
+  assert.deepEqual([relay.state, relay.destination_ref, relay.release_ref], ["completed", null, foreign.hash]);
+  const row = facts.row();
+  assert.deepEqual([row.state, row.releaseHash, row.signedHex], ["released_elsewhere", foreign.hash, null]);
+  assert.equal(await facts.sequence(), 0); // the submitter never signed or sent anything
+  assert.equal(await facts.balance(), AMOUNT);
+  assert.equal((await rt.runOnce()).action, "idle");
+  assert.deepEqual(await coordinator(), { returned: 0, processedElsewhere: 0, waiting: [] });
 }, { deadlineOffset: 28 }));
 
 test("signed bytes first sent after the deadline end expired and the next transfer proceeds", options, () => scenario(async ({ runtime, facts, manifest, paths, records, approve, requests }) => {

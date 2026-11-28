@@ -169,11 +169,16 @@ async function retirement(verifyRetired, request, previousDeadlineUnix) {
 // `finalized` with a re-issued request for the same source event, and is
 // approved again through the normal path. A rejected transfer (for example an
 // invalid recipient) never asks for this: it stays rejected.
+// When the proof finds the replay key already used (`transfer_processed`, for
+// example leaked signatures used before the deadline), the transfer is never
+// re-issued: it is flagged for its destination submitter, which completes it
+// from the verified release by that other transaction (released elsewhere).
 export async function returnExpiredApprovals({ store, build, nowUnix, windowSeconds, graceSeconds = APPROVAL_REISSUE_GRACE_SECONDS,
   verifyRetired, limit = 100 }) {
-  let returned = 0;
+  let returned = 0, processed = 0;
   const waiting = [];
   for (const transfer of store.reissueRequests({ limit })) {
+    if (transfer.processed_elsewhere !== null) { waiting.push("awaiting_release_elsewhere"); continue; }
     const previous = store.approvalRequest(transfer.source_chain, transfer.source_ref);
     if (!previous || previous.deadlineUnix + graceSeconds >= nowUnix) { waiting.push("approval_reissue_grace"); continue; }
     const next = build(transfer, nowUnix + windowSeconds);
@@ -181,11 +186,14 @@ export async function returnExpiredApprovals({ store, build, nowUnix, windowSeco
       throw new Error("re-issued approval request does not match the persisted source event");
     }
     const retired = await retirement(verifyRetired, next, previous.deadlineUnix);
+    if (retired.wait === "transfer_processed") {
+      if (store.markProcessedElsewhere(transfer.source_chain, transfer.source_ref, { digest: previous.digest })) processed += 1;
+    }
     if (retired.wait) { waiting.push(retired.wait); continue; }
     store.returnForReissue(transfer.source_chain, transfer.source_ref, previous, next, { nowUnix });
     returned += 1;
   }
-  return Object.freeze({ returned, waiting: Object.freeze(waiting) });
+  return Object.freeze({ returned, processedElsewhere: processed, waiting: Object.freeze(waiting) });
 }
 
 export async function scanFinalizedBatch({ watcher, store, sourceChain, startHeight = 1, maxBatch = 100 }) {
@@ -275,6 +283,7 @@ export async function runApprovalOnlyCycle({
     approved: results.length,
     awaitingReissue: waiting,
     returnedForReissue: returns.returned,
+    processedElsewhere: returns.processedElsewhere,
     reissueWaiting: Object.freeze(reissueWaiting),
     submissions: 0,
   });

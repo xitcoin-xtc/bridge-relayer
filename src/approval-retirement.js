@@ -22,7 +22,8 @@ import { XitcoinRpcQuorum } from "./xitcoin-rpc.js";
 // replay key being unused at H shows it was not used before.
 //
 // Cronos: H = tip - confirmations (tip = the lowest head across origins).
-// Xitcoin: H = the lowest committed height across origins (commits are final).
+// Xitcoin: H = one block below the lowest height any origin reports (CometBFT
+// stores a block before the application commits it; commits are final).
 export class RetirementUnproven extends Error {
   constructor(code) { super("previous approval is not provably retired on the destination"); this.code = code; }
 }
@@ -58,30 +59,34 @@ export function createApprovalRetirementVerifier({ cronos, cronosVault, cronosCh
     const height = (await cronos.tip()) - cronosConfirmations;
     if (height < 1) throw fail("destination_unavailable");
     const block = await cronos.block(height);
-    if (block.timestamp <= previousDeadline) throw fail("deadline_not_passed");
     const processed = await cronos.call({ to: vault, data: VAULT.encodeFunctionData("processedBurns", [normalizeBytes32(payload.sourceBurnId)]) }, height);
     if (!/^0x0{63}[01]$/.test(processed)) throw fail("destination_unavailable");
-    if (processed.endsWith("1")) throw fail("transfer_processed");
     if ((await cronos.block(height)).hash !== block.hash) throw fail("destination_disagreement");
+    // A used replay key at a final height is definitive, whatever the time.
+    if (processed.endsWith("1")) throw fail("transfer_processed");
+    if (block.timestamp <= previousDeadline) throw fail("deadline_not_passed");
     return Object.freeze({ retired: true, destination: "cronos", height, blockHash: block.hash, blockTime: block.timestamp });
   }
 
   async function xitcoinRetired(payload, previousDeadline) {
     if (payload.destinationChainId !== XITCOIN_TESTNET_CHAIN_ID) throw fail("destination_mismatch");
-    const height = Math.min(...(await xitcoin.chainId()).map((status) => status.height));
+    const height = Math.min(...(await xitcoin.chainId()).map((status) => status.height)) - 1;
     if (!Number.isSafeInteger(height) || height < 1) throw fail("destination_unavailable");
     const block = await xitcoin.block(height);
-    if (block.time <= previousDeadline) throw fail("deadline_not_passed");
     const id = attestationId({ ...payload, direction: DIRECTION_INBOUND });
     const answers = await xitcoin.attestations(id, height);
     if (answers.some((answer) => JSON.stringify(answer) !== JSON.stringify(answers[0]))) throw fail("destination_disagreement");
+    // A used replay key at a committed height is definitive, whatever the time.
     if (answers[0].status !== "absent") throw fail("transfer_processed");
+    if (block.time <= previousDeadline) throw fail("deadline_not_passed");
     return Object.freeze({ retired: true, destination: "xitcoin", height, blockHash: block.hash, blockTime: block.time });
   }
 
   // Resolves with the evidence when retired; rejects with RetirementUnproven
-  // (code: deadline_not_passed, transfer_processed, destination_mismatch,
+  // (code: transfer_processed, deadline_not_passed, destination_mismatch,
   // destination_disagreement, destination_unavailable) otherwise.
+  // `transfer_processed` (every origin shows the replay key used at the final
+  // height) is permanent: that approval or an earlier one was used.
   return async function verifyRetired({ request, previousDeadlineUnix }) {
     try {
       const canonical = buildApprovalRequest(request);

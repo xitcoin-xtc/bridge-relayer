@@ -166,9 +166,10 @@ test("Xitcoin: an attestation is retired only once a committed block is past its
   const now = await blockTime();
   const request = attestationRequest(now + 3_600);
   await unproven(verify({ request, previousDeadlineUnix: now + 3_600 }), "deadline_not_passed");
-  const retired = await verify({ request, previousDeadlineUnix: now - 1 });
+  // The proof height is one block below the lowest reported height.
+  const retired = await verify({ request, previousDeadlineUnix: now - 5 });
   assert.deepEqual([retired.retired, retired.destination], [true, "xitcoin"]);
-  assert.ok(retired.blockTime > now - 1 && retired.height > 1);
+  assert.ok(retired.blockTime > now - 5 && retired.height > 1);
   // Every attestation read was pinned to the height of the proof.
   assert.ok(origins.every((origin) => origin.calls.some((call) => typeof call === "string" && call.startsWith("/xitcoin/bridge/v1/attestations/"))));
 });
@@ -188,21 +189,21 @@ test("Xitcoin: a processed attestation, disagreeing or unavailable origins and a
     return { status: answer.status, text: rewriteJson(answer.text, transform) };
   };
   origins[1].hook = rewrite((body) => ({ ...body, status: "ATTESTATION_STATE_PROCESSED_WITHOUT_RECORD", processed: true }));
-  await unproven(verify({ request, previousDeadlineUnix: now - 1 }), "destination_disagreement");
+  await unproven(verify({ request, previousDeadlineUnix: now - 5 }), "destination_disagreement");
   origins[1].hook = async ({ kind, path, forward }) => {
     if (kind === "rest" && path.startsWith("/xitcoin/bridge/v1/attestations/")) throw new Error("dropped");
     return forward();
   };
-  await unproven(verify({ request, previousDeadlineUnix: now - 1 }), "destination_unavailable");
+  await unproven(verify({ request, previousDeadlineUnix: now - 5 }), "destination_unavailable");
   origins[1].hook = async ({ kind, method, forward }) => {
     const answer = await forward();
     if (kind !== "rpc" || method !== "block") return answer;
     return { status: answer.status, text: rewriteJson(answer.text, (body) => ({ ...body,
       result: { ...body.result, block_id: { ...body.result.block_id, hash: "CD".repeat(32) } } })) };
   };
-  await unproven(verify({ request, previousDeadlineUnix: now - 1 }), "destination_disagreement");
+  await unproven(verify({ request, previousDeadlineUnix: now - 5 }), "destination_disagreement");
   origins[1].hook = null;
-  await unproven(verify({ request: attestationRequest(now + 3_600, { destinationChainId: "xitcoin" }), previousDeadlineUnix: now - 1 }),
+  await unproven(verify({ request: attestationRequest(now + 3_600, { destinationChainId: "xitcoin" }), previousDeadlineUnix: now - 5 }),
     "destination_mismatch");
-  assert.equal((await verify({ request, previousDeadlineUnix: now - 1 })).retired, true);
+  assert.equal((await verify({ request, previousDeadlineUnix: now - 5 })).retired, true);
 });

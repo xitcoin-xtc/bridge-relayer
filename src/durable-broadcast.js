@@ -22,7 +22,10 @@ import { RelayStore } from "./store.js";
 // (`requestReissue`) and never claims the transfer under it again. The
 // coordinator re-approves it only after the destination shows the approval
 // dead; an `expired` ledger row then continues as a new attempt
-// (`reopenExpired`). A `rejected` transfer is never re-issued.
+// (`reopenExpired`). When the destination instead shows that approval used
+// by another transaction, the transfer completes as `released_elsewhere`
+// from the adapter's verified evidence. A `rejected` transfer is never
+// re-issued.
 export class SubmissionHalt extends Error {
   constructor(code) { super("destination submission halted; offline review required"); this.code = code; }
 }
@@ -356,7 +359,25 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
         // A stale scheduling hint must not delay the re-issued approval.
         const stored = storedRequest(store, sourceChain, candidate.source_ref);
         if (awaitingReissue(relay, stored.request.digest)) {
-          if (scheduled.deferredUntilMs !== null) ledger.clearDeferral(lease, { transferId: transferIdOf(stored), sourceRef: candidate.source_ref });
+          const transferId = transferIdOf(stored);
+          if (scheduled.deferredUntilMs !== null) ledger.clearDeferral(lease, { transferId, sourceRef: candidate.source_ref });
+          // The coordinator's proof found this approval's replay key already
+          // used (for example leaked signatures before the deadline): it is
+          // never re-issued; complete it from the release by that other
+          // transaction. Nothing is ever signed for it.
+          if (store.processedElsewhere(sourceChain, candidate.source_ref) === stored.request.digest
+              && typeof adapter.releasedElsewhere === "function" && scheduled.state !== "expired") {
+            if (assessed >= maximumCandidates) break scan;
+            assessed += 1;
+            const found = decision(await adapter.releasedElsewhere({ ...stored, transferId, nowUnix }),
+              ["released_elsewhere", "release_unverified", "wait", "halt"]);
+            if (found.action === "halt") await halt(transferId, stored, found.code);
+            if (found.action === "released_elsewhere") {
+              return releasedElsewhere(stored, transferId, scheduled.state === null ? null : ledger.inspect(transferId), found);
+            }
+            if (found.action === "release_unverified") { await releaseUnverified(stored, transferId, { code: found.code }); continue; }
+            waiting.push(code(found.code));
+          }
           continue;
         }
       }

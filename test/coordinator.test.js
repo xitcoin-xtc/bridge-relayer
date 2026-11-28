@@ -304,3 +304,30 @@ test("the store re-issues only an expired request and drops approvals for the ex
   assert.throws(() => store.reissueApprovalRequest("cronos", ref, old, next, { nowUnix: 2_000 }), /conflicting/);
   store.close();
 });
+
+test("a given-up approval whose replay key the destination shows used is routed to its submitter, never re-issued", async () => {
+  const { approvedTransfer } = await import("./fixtures/durable-adapter.js");
+  const { returnExpiredApprovals } = await import("../src/coordinator.js");
+  const { TESTNET_ROUTE_ID } = await import("../src/preflight.js");
+  const store = new RelayStore();
+  const { sourceChain, sourceRef, request } = approvedTransfer(store, "cronos", 1, { deadlineUnix: 1_900_000_030 });
+  const build = (transfer, deadlineUnix) => buildTransferApprovalRequest({ transfer: { ...transfer, state: "finalized" },
+    routeId: XITCOIN_TESTNET_ROUTE_ID, cronosRouteId: TESTNET_ROUTE_ID, cronosChainId: 338, cronosVault: "0x1c94273C0b199b139D82da3786C9eCbE189D5919",
+    xitcoinChainId: "xitcoin-testnet-v2-1", signerSetVersion: 1, deadlineUnix });
+  const checks = [];
+  const verifyRetired = async (input) => { checks.push(input); throw new RetirementUnproven("transfer_processed"); };
+  const cycle = () => returnExpiredApprovals({ store, build, nowUnix: 1_900_000_500, windowSeconds: 600, verifyRetired });
+  // Without the submitter's request nothing happens.
+  assert.deepEqual(await cycle(), { returned: 0, processedElsewhere: 0, waiting: [] });
+  assert.equal(store.requestReissue(sourceChain, sourceRef, { digest: request.digest }), true);
+  assert.deepEqual(await cycle(), { returned: 0, processedElsewhere: 1, waiting: ["transfer_processed"] });
+  assert.equal(store.processedElsewhere(sourceChain, sourceRef), request.digest);
+  assert.equal(store.get(sourceChain, sourceRef).state, "approved");
+  assert.equal(store.approvalRequest(sourceChain, sourceRef).digest, request.digest);
+  // Flagged once: never checked or re-issued again; the submitter completes it.
+  assert.deepEqual(await cycle(), { returned: 0, processedElsewhere: 0, waiting: ["awaiting_release_elsewhere"] });
+  assert.equal(checks.length, 1);
+  assert.throws(() => store.returnForReissue(sourceChain, sourceRef, request, build(store.get(sourceChain, sourceRef), 1_900_001_000),
+    { nowUnix: 1_900_000_500 }), /not awaiting/);
+  store.close();
+});

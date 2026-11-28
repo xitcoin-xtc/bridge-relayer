@@ -324,6 +324,20 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
       && observed.r === BigInt(tx.signature.r).toString() && observed.s === BigInt(tx.signature.s).toString();
   }
 
+  // Released by another transaction (anyone may call the vault with valid
+  // approvals): completes with that transaction's verified evidence; a
+  // mismatching release halts; processed at a finalized height without a
+  // matching release in the searched windows is a persistent, non-blocking
+  // alert, never a completion.
+  async function processedElsewhere(request, transferId) {
+    const evidence = await releaseElsewhere(request);
+    if (evidence?.mismatch) return halt("processed_with_mismatching_release");
+    if (evidence && !evidence.unreachable) return evidence.final ? released(evidence) : defer("release_elsewhere_not_final");
+    const finalized = Math.max(0, await rpc.tip() - cronos.confirmations);
+    if (boolean(await rpc.call(view("processedBurns", [transferId]), finalized))) return unverifiedRelease(evidence);
+    return defer("release_elsewhere_not_final");
+  }
+
   function releasedMatches(receipt, request) {
     const p = request.payload;
     const expected = VAULT.encodeEventLog(VAULT.getEvent("Released"), [p.sourceBurnId, p.recipient, p.amount, p.signerSetVersion]);
@@ -362,17 +376,7 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
       if (amount > BigInt(cronos.maxAmount) || amount > identity.maxReleaseAmount) return defer("amount_above_release_limit");
       const state = await live(transferId);
       if (state.paused) return wait("route_paused");
-      if (state.processedAll) {
-        // Released by another transaction (anyone may call the vault with valid approvals).
-        const evidence = await releaseElsewhere(request);
-        if (evidence?.mismatch) return halt("processed_with_mismatching_release");
-        if (evidence && !evidence.unreachable) return evidence.final ? released(evidence) : defer("release_elsewhere_not_final");
-        // Processed at a finalized height yet no matching release in the
-        // searched window: a persistent, non-blocking alert, never a completion.
-        const finalized = Math.max(0, await rpc.tip() - cronos.confirmations);
-        if (boolean(await rpc.call(view("processedBurns", [transferId]), finalized))) return unverifiedRelease(evidence);
-        return defer("release_elsewhere_not_final");
-      }
+      if (state.processedAll) return processedElsewhere(request, transferId);
       if (state.processedAny) return defer("replay_state_unsettled");
       if (request.deadlineUnix < Math.max(nowUnix, state.chainTime) + margin) return defer("approval_expired_awaiting_reissue");
       if (state.liquidity < amount) return defer("insufficient_vault_liquidity");
@@ -386,6 +390,18 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
       if (!await simulate({ from: submitter, to: vault, data })) return defer("release_simulation_reverted");
       if (min(await rpc.balances(submitter)) < gasLimit * gasPrice) return wait("submitter_balance_insufficient");
       return { action: "sign", context: Object.freeze({ gasPrice: gasPrice.toString(), blockHash: identity.blockHash }) };
+    },
+
+    // For a transfer whose approval this submitter gave up and whose burn the
+    // destination already shows processed (the coordinator's re-issue proof
+    // found it): only the release-by-another-transaction evidence, whatever
+    // the approval's deadline. Never decides to sign.
+    async releasedElsewhere({ transfer, request, approvals, transferId }) {
+      await rpc.chainId();
+      if (!storedRequestMatches(transfer, request, approvals) || transferId !== transfer.source_ref) return halt("stored_request_mismatch");
+      const processed = await viewEach("processedBurns", [transferId], boolean);
+      if (!processed.every(Boolean)) return defer(processed.some(Boolean) ? "replay_state_unsettled" : "release_elsewhere_not_found");
+      return processedElsewhere(request, transferId);
     },
 
     async sign({ request, approvals, nowUnix, context, expectedNonce }) {

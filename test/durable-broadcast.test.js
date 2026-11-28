@@ -656,3 +656,47 @@ function buildRequest(store, sourceChain, sourceRef, deadlineUnix) {
     cronosRouteId: TESTNET_ROUTE_ID, cronosChainId: 338, cronosVault: "0x1c94273C0b199b139D82da3786C9eCbE189D5919",
     xitcoinChainId: "xitcoin-testnet-v2-1", signerSetVersion: 1, deadlineUnix });
 }
+
+for (const destination of ["cronos", "xitcoin"]) {
+  test(`${destination}: a given-up approval used elsewhere before its deadline completes as released elsewhere and is never signed`, () => harness(destination, async ({ chain, cycle, setup, processHandle }) => {
+    const late = approvedTransfer(setup.store, destination, 1, { deadlineUnix: 1_900_000_030 });
+    const transferId = modelAdapter(destination, chain).transferId(late.request);
+    const handed = await cycle();
+    assert.deepEqual(handed.waiting, ["approval_expired_awaiting_reissue"]);
+    assert.equal(setup.store.reissueRequested(late.sourceChain, late.sourceRef).digest, late.request.digest);
+    // Leaked signatures: another account releases with the given-up approval.
+    const foreign = chain.foreignRelease(transferId);
+    chain.confirm(3);
+    // Until the coordinator's proof flags it, the engine never looks at it.
+    assert.equal((await cycle({ nowMs: NOW + 1_000 })).action, "idle");
+    assert.equal(chain.elsewhereChecks ?? 0, 0);
+    // The coordinator's proof finds the replay key used: never re-issued.
+    assert.equal(setup.store.markProcessedElsewhere(late.sourceChain, late.sourceRef, { digest: `0x${"ee".repeat(32)}` }), false);
+    assert.equal(setup.store.markProcessedElsewhere(late.sourceChain, late.sourceRef, { digest: late.request.digest }), true);
+    assert.throws(() => reapproveTransfer(setup.store, late.sourceChain, late.sourceRef, { deadlineUnix: 1_900_007_200, nowUnix: 1_900_003_800 }),
+      /not awaiting/);
+    const completed = await cycle({ nowMs: NOW + 2_000 });
+    assert.deepEqual([completed.action, completed.releaseHash], ["released_elsewhere", foreign]);
+    const relay = setup.store.get(late.sourceChain, late.sourceRef);
+    assert.deepEqual([relay.state, relay.destination_ref, relay.release_ref], ["completed", null, foreign]);
+    const row = processHandle().ledger.inspect(transferId);
+    assert.deepEqual([row.state, row.releaseHash, row.signedHex, row.nonce], ["released_elsewhere", foreign, null, null]);
+    assert.equal(chain.deliveries.length, 0); // nothing was ever signed or sent
+    assert.equal((await cycle({ nowMs: NOW + 3_000 })).action, "idle");
+  }));
+}
+
+test("a flagged transfer not yet visible as released waits, and a processed transfer without a matching release is an alert, never a completion", () => harness("cronos", async ({ chain, cycle, setup, processHandle }) => {
+  const late = approvedTransfer(setup.store, "cronos", 1, { deadlineUnix: 1_900_000_030 });
+  const transferId = late.request.payload.sourceBurnId;
+  await cycle();
+  setup.store.markProcessedElsewhere(late.sourceChain, late.sourceRef, { digest: late.request.digest });
+  const waiting = await cycle({ nowMs: NOW + 1_000 });
+  assert.deepEqual([waiting.action, waiting.waiting], ["waiting", ["release_elsewhere_not_found"]]);
+  chain.unverified.add(transferId);
+  await cycle({ nowMs: NOW + 2_000 });
+  assert.equal(processHandle().ledger.inspect(transferId).state, "release_unverified");
+  assert.equal(setup.store.get(late.sourceChain, late.sourceRef).state, "approved");
+  assert.equal((await cycle({ nowMs: NOW + 3_000 })).attention.releaseUnverified, 1);
+  assert.equal(chain.deliveries.length, 0);
+}));
