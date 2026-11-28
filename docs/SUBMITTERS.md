@@ -169,7 +169,21 @@ submitter account. It reuses the private-path checks of the offline journals
 service-owned parent, `O_NOFOLLOW` traversal, inode rechecks), immediate
 transactions, `synchronous=FULL` and WAL. Exclusive creation initializes it;
 reopening requires the identical table DDL, constraints, triggers, version and
-binding. There is no migration, repair, delete, reset, expiry or retry API.
+binding. There is no repair, delete, reset, expiry or retry API. The only
+migration is forward-only from schema version 1 to version 2 (below).
+
+Schema version 2 lifts one rule of version 1: the `CHECK` constraint that
+capped `broadcast_attempts` at 32, which made a row that ran out of attempts
+terminal although resending the identical stored bytes is always safe. Every
+other column, constraint and trigger is unchanged. A version 1 ledger is
+migrated on open, only when its schema is exactly the version 1 DDL and its
+binding is this deployment's, in the opening immediate transaction: the
+transfers table is rebuilt with the version 2 DDL, every row is copied
+unchanged and its triggers are recreated, and the result must equal the exact
+version 2 schema before anything commits. Any other schema or version is
+refused unchanged. Tests migrate a version 1 ledger with rows in every state,
+compare every row before and after, and check that every trigger still
+applies.
 
 The binding is the destination deployment identity: destination, chain ID,
 route, target (Cronos vault address or the Xitcoin bridge module), target
@@ -191,8 +205,9 @@ The ledger enforces, in one fenced immediate transaction per change:
   strictly sequential; a transaction hash, digest or nonce can never be reused
   by another transfer, and bytes can never be replaced;
 - a write-ahead `broadcast` marker committed before every send of those
-  identical bytes, bounded to at most 32 attempts (destination policy may be
-  lower);
+  identical bytes. A destination may cap its sends (at most 32; the Cronos
+  submitter's `maxBroadcastAttempts`), or pace resends itself and record every
+  send without a cap (the Xitcoin submitter);
 - forward-only states `claimed -> signed -> broadcast -> finalized | failed`,
   plus `halted` from any unfinished state. `finalized`, `failed` and `halted`
   are permanent, and any `failed` or `halted` row blocks every new claim until
@@ -731,7 +746,8 @@ password.
     "maxGasPrice": "100000000000",
     "maxFee": "60000000000000000",
     "minDeadlineMarginSeconds": 120,
-    "maxBroadcastAttempts": 5
+    "maxResendIntervalSeconds": 3600,
+    "stalledAlertSeconds": 21600
   },
   "cronos": {
     "rpcUrls": ["http://127.0.0.1:18545", "http://127.0.0.1:18546", "http://127.0.0.1:18547"],
@@ -756,7 +772,8 @@ CometBFT RPC origin and an independent REST origin; `confirmations` 1–1000
 1000–10000000; `maxGas` 100000–5000000; `gasAdjustmentPercent` 110–300;
 `gasHeadroom` 10000–1000000; `feeMultiplierPercent` 150–1000; `maxGasPrice` (axtc
 per gas) at most 10^15; `maxFee` (axtc) at most 10^24;
-`minDeadlineMarginSeconds` 30–3600; `maxBroadcastAttempts` 1–32;
+`minDeadlineMarginSeconds` 30–3600; `maxResendIntervalSeconds` 60–86400;
+`stalledAlertSeconds` 300–2592000;
 `cronos.confirmations` 2–10000. `check` validates the manifest and release
 offline and reports `mode: "testnet"`, `ready: false`, `submissions: 0`.
 
@@ -953,7 +970,7 @@ on every origin decides the branch first.
 | sequence unused, our signed content (our bytes or a re-encoding) in any origin's mempool, or a listing not complete | wait |
 | sequence unused, nothing in flight, route usable, our fee covers the base fee and minimum gas price a strict majority reports, attempts left | resend the identical bytes (also after the deadline or a release elsewhere, to consume the sequence) |
 | sequence unused, nothing in flight, fee below what would be admitted now | wait (`fee_below_required`) |
-| sequence unused, nothing in flight, attempts exhausted | wait (`broadcast_attempts_exhausted`); never a halt |
+| sequence unused, nothing in flight, previous send less than the backoff ago (one minute doubling up to `maxResendIntervalSeconds`) | wait (`resend_backoff`); there is no attempt cap |
 | sequence consumed in a block that holds no transaction with our signed content | halt `nonce_consumed_without_inclusion` |
 | sequence consumed by our signed content, its result not served by a strict majority, block recent | wait (indexing lag) |
 | the same, block deeper than 100 blocks | settled from consensus state: a record naming it and our approval completes it, a record naming another transaction is a release elsewhere, otherwise `release_unverified` (`inclusion_history_unserved`); never a halt |
@@ -967,7 +984,8 @@ on every origin decides the branch first.
 | failed with our `acc_seq`, a lasting condition at both heights (below) | `reverted` with the cause (non-blocking) |
 | failed with our `acc_seq`, history before it no longer served | `release_unverified` (`failure_history_unserved`) |
 | any other failure, including out of gas | `failed`; stop; never retried |
-| consumed before the last `historyBlocks` blocks, no record naming our own transaction | halt `nonce_consumed_without_inclusion` |
+| consumed before the last `historyBlocks` blocks, a record naming our approval and a transaction in its block that carries our signed content | `finalized` (our bytes) or `released_elsewhere` (a re-encoding processed during downtime) |
+| consumed before the last `historyBlocks` blocks, no such record | halt `nonce_consumed_without_inclusion` |
 
 Liveness of an unused sequence. A transaction evicted from mempools, rejected
 at admission or rejected by the ante handler at execution (for example a fee
@@ -975,8 +993,13 @@ below a base fee that rose up to 12.5% per full block, which an outsider can
 cause by filling blocks) leaves our sequence unused, and the signed bytes stay
 valid for anyone to submit. That is never a persisted halt: the identical
 bytes are resent only when nothing carrying our signed content is in any
-mempool and their fee would be admitted now, so attempts are spent on sends
-that can be admitted; once the attempts are spent the row waits. CometBFT
+mempool and their fee would be admitted now, with a backoff after the
+previous send that doubles from one minute up to `maxResendIntervalSeconds`.
+There is no terminal attempt cap: every send is still recorded before it is
+made (the write-ahead marker), and a lasting fee rise or eviction only waits,
+never halts and never produces new signed bytes. An unfinished row signed
+longer ago than `stalledAlertSeconds` is counted as `stalled` in the
+`attention` of every cycle report, from persisted state, until it concludes. CometBFT
 removes rejected and evicted transactions from its mempool cache by default
 (`keep-invalid-txs-in-cache = false`, required on every origin), so identical
 bytes can be readmitted. `feeMultiplierPercent` must be at least 150 so that
@@ -1049,7 +1072,8 @@ regressed sequences, failure classification at both heights, history no longer
 served, mismatching records from one origin, strict-majority sends with three
 origins, stored-byte tampering, re-encodings with any 65th byte or 64-byte
 signatures (also next to our own ante-rejected bytes in one block), resends
-gated on the fee and on nothing in flight with exhausted attempts waiting, and
+gated on the fee, on nothing in flight and on the backoff, with no attempt
+cap past 32, re-encoded copies processed before the searched window, and
 old transaction results from a minority of origins that can never force a
 halt while a strict majority of three can. `test/xitcoin-transaction.test.js` and
 `test/xitcoin-rpc.test.js` cover the encoding (chain vectors, strict decoding)
