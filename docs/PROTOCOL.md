@@ -121,15 +121,58 @@ recorded only after a finalized destination receipt.
 
 ## Expired approvals
 
-An approval request carries a deadline. The coordinator never reuses a
-persisted request after its deadline and never replaces one before it. Once the
-deadline plus `APPROVAL_REISSUE_GRACE_SECONDS` (120 s) has passed, it re-issues
-the request for the same source event with a new deadline: same replay key,
-same destination, amount, nonce and route; only the deadline (and, for
-releases, the vault signer-set version) may change. Approvals collected for the
-expired digest are discarded. The grace period covers destination block time
-lagging the relayer clock. Re-issue is safe because the destination replay key
-does not depend on the deadline.
+An approval request carries a deadline. Both destinations accept an approval
+only while the executing block's time is at or before it (the vault's
+`release` reverts when `block.timestamp > deadline`; the bridge module's
+`Attestation.ValidateAt` fails when `ctx.BlockTime() > deadline_unix`), and
+block time never decreases. The coordinator never reuses a persisted request
+after its deadline and never replaces one before it. A re-issue is a new
+request for the same source event with a new, strictly later deadline: same
+replay key, same destination, amount, nonce and route; only the deadline (and,
+for releases, the vault signer-set version) may change. Re-issue never creates
+a second usable approval:
+
+1. The previous approval must be provably dead on its destination
+   (`src/approval-retirement.js`): at one final height H that every origin
+   serves, with the identical block and answers from every origin, block H's
+   time is strictly later than the previous deadline, and the replay key is
+   unused at H (Cronos: `processedBurns(sourceBurnId)` is false at
+   `tip - confirmations`; Xitcoin: the attestation query at the lowest
+   committed height returns `ATTESTATION_STATE_ABSENT`). No later block can
+   accept the previous approval, and it was not used before H. A processed
+   replay key is never a reason to re-issue.
+2. The coordinator checks this itself, after the local
+   `APPROVAL_REISSUE_GRACE_SECONDS` (120 s) filter, before it asks signers.
+3. Every signer checks it again itself before signing (below), and signs only
+   a request that carries the explicit re-issue declaration
+   `reissue: { previousDigest, previousDeadlineUnix }` next to the canonical
+   request (never inside the signed payload).
+
+Two usable 2-of-3 approvals for one source event would need a signer common to
+both quorums, and that signer signs the second only after the first is dead on
+the destination, so at most one usable approval per source event exists at any
+time, whatever the coordinator does.
+
+The coordinator re-issues in two situations:
+
+- a `finalized` transfer whose persisted request expired before a quorum was
+  collected: the request is replaced (the expired request and any approvals
+  for it are archived in RelayStore `approval_history`);
+- an `approved` or `submitted` transfer whose destination submitter gave its
+  approval up (RelayStore `reissue_requested`, written only by the submitter):
+  the approval reached its deadline before the submitter sent anything, or the
+  submitter's identical bytes were mined after the deadline and reverted
+  (`expired`). The submitter names the digest it will never send and the only
+  transaction it holds for it, and never claims the transfer under that
+  approval again. After the destination proof, the transfer returns to
+  `finalized` with the re-issued request (the old request, approvals and
+  destination transaction are archived) and is approved again through the
+  normal path. The submitter then sends it, as a new attempt for an `expired`
+  row (see [SUBMITTERS.md](SUBMITTERS.md#durable-broadcast-ledger)).
+
+A transfer the submitter rejected (for example an invalid recipient) never asks
+for a re-issue and stays rejected; its refund path is manual
+([OPERATIONS.md](OPERATIONS.md#deposits-that-cannot-mint-and-refunds)).
 
 ## Signer approval journal
 
@@ -143,8 +186,17 @@ coordinator:
 - a request for the same source event with any different content
   (destination, amount, nonce, route, chain, vault, recipient) is refused,
   permanently;
-- a re-issue that changes only the deadline (or release signer-set version) is
-  signed only after the previously signed deadline plus the grace period;
+- a request that changes only the deadline (or release signer-set version) is
+  refused unless it is an explicit re-issue: it carries the re-issue
+  declaration, its deadline is strictly later than both the declared and the
+  signed deadline, the signed deadline plus the grace period has passed on the
+  signer's clock, and the signer's own destination check (the bounded quorum
+  transports over its configured Cronos RPC and Xitcoin RPC and REST origins)
+  shows that no approval with a deadline up to the later of the two can still
+  be used. A signer that never signed for the source event still checks the
+  declared deadline. Each re-issue is appended, with that evidence
+  (destination, height, block time), to the journal's append-only
+  `approval_reissues` table in the same transaction as the new signature;
 - a source event closed by an operator (`npm run signer:journal -- close ...`,
   used for refunds) is never signed again.
 

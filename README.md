@@ -34,8 +34,13 @@ explicitly enabled process (below). The isolated
 signer service enforces a pinned route, source and destination chain, vault,
 amount and deadline, requires an independent canonical-finality verifier, keeps
 a durable journal that refuses a second, different request for the same source
-event, and delegates signing to an injected key provider. Expired approval
-requests are re-issued with a new deadline for the same source event. A
+event, and delegates signing to an injected key provider. An expired
+approval is re-issued with a new deadline for the same source event only after
+the destination shows it dead (its deadline passed at a final height and the
+transfer unprocessed, agreed by every origin); the coordinator and every
+signer check this independently, and signers sign only an explicit, journaled
+re-issue. An approved transfer is re-issued only after its destination
+submitter gives the expired approval up. A
 read-only reconciler compares vault and chain accounting and raises alerts
 (dry-run by default; it never pauses anything by itself). The optional secure keystore adapter reads bounded,
 owner-private encrypted keystores and systemd credentials, verifies the expected

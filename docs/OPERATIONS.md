@@ -97,6 +97,15 @@ Operators must never delete a pending database merely to clear an error.
   approval or another signer's response is never sufficient evidence.
 - Treat source disagreement, a mismatched digest, a wrong signing account or an
   expired request as a hard rejection and emit no signature.
+- Configure every signer's `xitcoin.restUrls`: the REST API of the same
+  operator as each entry of `xitcoin.rpcUrls`, in the same order (two to four
+  origins). With them and `cronos.rpcUrls`, the signer verifies on the
+  destination itself that the approval an explicit re-issue replaces can never
+  be used (see [PROTOCOL.md](PROTOCOL.md#expired-approvals)); without proof it
+  refuses. A different digest for an already signed source event is refused
+  unless it is such an explicit re-issue. Each signed re-issue is recorded in
+  the journal's `approval_reissues` table with the destination height and
+  block time of the proof; the table can be read with `sqlite3 -readonly`.
 
 ## Deposits that cannot mint and refunds
 
@@ -107,8 +116,10 @@ module account. The Cronos vault has no user refund function. The future vault
 rejects deposits above its own deposit limits (configure them no higher than
 the chain limits), but a deposit that is already locked follows this procedure:
 
-1. Daily limit: no action. The approval expires and is re-issued with a new
-   deadline (same replay key) on a later day.
+1. Daily limit: no action. The Xitcoin submitter defers the deposit; once its
+   approval is too close to its deadline the submitter gives it up, and the
+   coordinator re-issues it with a new deadline (same replay key) after the
+   chain shows the old approval dead, until it mints on a later day.
 2. Outstanding limit or per-transfer limit: the signer quorum may raise the
    chain limits with a 2-of-3 `update_route_config`, after which the deposit
    mints normally. This is a limit decision and needs the owner's approval.
@@ -125,6 +136,8 @@ the chain limits), but a deposit that is already locked follows this procedure:
    finalized Xitcoin burn), so the refund is a manual, reviewed signing step
    outside the service. Mark the coordinator row `failed` with the refund
    reference. Accounting stays balanced because the deposit was never minted.
+   A submitter `rejected` row (an invalid recipient) is handled the same way:
+   it is never re-issued and nothing automates the refund.
 
 Outbound burns to the zero or `0x…dEaD` address are rejected by the chain
 before burning, because the vault refuses to release to them.
@@ -186,7 +199,21 @@ activation.
   submitted -> completed` transitions of its direction (outbound transfers for
   the Cronos submitter, inbound transfers for the Xitcoin submitter).
 - Require at least two independent HTTPS RPC origins for each chain and reject
-  credentials embedded in URLs.
+  credentials embedded in URLs. The coordinator also needs `xitcoin.restUrls`
+  (one REST API per `xitcoin.rpcUrls` entry, same operator and order) for the
+  destination proof before any approval re-issue.
+- Approval re-issue: each coordinator cycle reports `awaitingReissue` (finalized
+  transfers whose expired request is not re-issued yet), `returnedForReissue`
+  (approved or submitted transfers given up by their submitter and returned to
+  `finalized` with a re-issued request) and `reissueWaiting`, one code per
+  waiting transfer: `approval_reissue_grace` (local grace),
+  `deadline_not_passed` (the destination's final block time has not passed the
+  old deadline yet), `destination_unavailable`, `destination_disagreement`,
+  `destination_mismatch` and `retirement_verifier_missing`. A lasting
+  `transfer_processed` means the destination already shows the old approval
+  used although no completion was recorded: never re-issue by hand; verify the
+  destination record as in [Reviewing non-blocking rows](#reviewing-non-blocking-rows)
+  and treat an unexplained use as a possible approval leak.
 - A critical watcher, approval or submission worker failure halts the runtime;
   operators must investigate instead of skipping the failed stage.
 - `/livez` reports process liveness. `/readyz` becomes successful only after
@@ -267,20 +294,29 @@ transaction is recorded as `released_elsewhere` with that transaction.
   recorded as `released_elsewhere` and is not an error; RelayStore
   `release_ref` names the releasing transaction.
 - Every cycle report carries `attention` counts (`rejected`, `expired`,
-  `releaseUnverified`, `reverted`). These rows never block other transfers but
-  each needs the review below.
+  `releaseUnverified`, `reverted`). These rows never block other transfers and,
+  except `expired` rows (re-issued automatically), each needs the review
+  below.
 - Logs contain only stable codes, transfer IDs and transaction hashes.
 
 ### Reviewing non-blocking rows
 
-`expired`, `reverted`, `release_unverified` and `rejected` ledger rows are
-permanent. The submitter never sends anything else for those transfers, and
-the broadcast ledger must never be edited, reset or replaced to retry one: its
-row is the permanent record of the nonce and bytes used for that transfer.
+`reverted`, `release_unverified` and `rejected` ledger rows are permanent. The
+submitter never sends anything else for those transfers, and the broadcast
+ledger must never be edited, reset or replaced to retry one: its row is the
+permanent record of the nonce and bytes used for that transfer.
+
+An `expired` row resolves itself: the submitter gives its approval up, the
+coordinator re-issues it after the destination shows it dead, and the row
+continues as a new attempt with the re-issued approval and the next nonce. Its
+expired bytes, nonce, hash and inclusion stay archived in the ledger's
+append-only `superseded_attempts` table and in RelayStore `approval_history`.
+Review an `expired` count that does not return to zero within a few cycles
+(check `reissueWaiting` in the coordinator log).
 
 | State | Meaning |
 | --- | --- |
-| `expired` | our identical bytes were mined after the approval deadline and reverted; nonce consumed |
+| `expired` | our identical bytes were mined after the approval deadline and reverted; nonce consumed; continues as a new attempt once the approval is re-issued |
 | `reverted` | our bytes were mined before the deadline and reverted for the cause in `reason_code`: `vault_paused` (guardian pause), `signer_set_rotated`, `release_limit_exceeded`, `daily_release_limit_exhausted` or `insufficient_vault_liquidity`; nonce consumed |
 | `release_unverified` | the outcome could not be verified; the reason is the code of its `release_unverified` event: `release_not_found` (burn processed, no matching `Released` event in the searched windows), `release_history_unserved` (that search reached history an origin no longer serves), `receipt_history_unserved` (our mined transaction's receipt, transaction or block is no longer served by some origins), `revert_history_unserved` (our transaction reverted and the state needed to classify it is no longer served) |
 | `rejected` | the transfer can never be sent (`invalid_recipient`); nothing was signed |
@@ -327,13 +363,14 @@ Resolve, by owner decision and without touching the broadcast ledger:
   `submitted` (the reconciler reports it) until a reviewed completion
   recording the release transaction exists; no such tool exists yet.
 - Not paid (`processedBurns` false at a finalized height and no `Released`
-  event): once the cause is cleared (resume, liquidity, limits, signer set),
-  either a re-approval handled as a new transfer record, never reusing this
-  transfer ID, or the refund path on the source chain. Before either, confirm
-  that every approval ever issued for the burn is past its deadline (the vault
-  then refuses it) and that no signer will approve the old burn ID again, so
-  the burn can never be released twice. Neither path is automated in this
-  release; both need owner approval.
+  event), for a `reverted` or `release_unverified` row: once the cause is
+  cleared (resume, liquidity, limits, signer set), either a re-approval or the
+  refund path on the source chain. Before either, confirm that every approval
+  ever issued for the burn is past its deadline (the vault then refuses it)
+  and that no signer will approve the old burn ID again, so the burn can never
+  be released twice. Neither path is automated for these rows in this
+  release; both need owner approval. (`expired` rows are re-issued
+  automatically, as above.)
 
 ## Xitcoin testnet submitter
 
@@ -366,10 +403,11 @@ Resolve, by owner decision and without touching the broadcast ledger:
   while it holds the queue: investigate the fee market and the origins'
   mempools; the bytes remain valid, nothing new is ever signed for the
   transfer, and the ledger must not be edited.
-- The broadcast ledger is schema version 2. A version 1 ledger (created by an
-  earlier release) is migrated forward automatically on the first open, only
-  when its schema and binding are exact; back it up before upgrading, like any
-  ledger, and never restore a version 1 copy over a migrated one.
+- The broadcast ledger is schema version 3. A version 1 or 2 ledger (created
+  by an earlier release) is migrated forward automatically on the first open,
+  one version at a time, only when its schema and binding are exact; back it up
+  before upgrading, like any ledger, and never restore an older copy over a
+  migrated one.
 - Anyone who has seen our bytes can re-wrap the same signed content with
   another signature encoding (the chain's eth_secp256k1 verifier ignores the
   65th byte and accepts 64-byte signatures). Such a copy that lands first is
@@ -385,7 +423,8 @@ Resolve, by owner decision and without touching the broadcast ledger:
   that transaction. A processing record whose approved fields differ halts
   (`processed_with_mismatching_record`): pause the route and start incident
   response.
-- `expired`, `reverted` and `release_unverified` rows are reviewed as in
+- `reverted` and `release_unverified` rows (and `expired` rows whose re-issue
+  does not happen) are reviewed as in
   [Reviewing non-blocking rows](#reviewing-non-blocking-rows) (as the
   `xitcoin-bridge-submitter-xitcoin` user),
   with the Xitcoin reads: the attestation query (status and record), CometBFT
