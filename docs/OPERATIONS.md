@@ -171,7 +171,9 @@ activation.
 ## Runtime composition
 
 - Keep the coordinator, three signers and two destination submitters under six
-  distinct operating-system identities.
+  distinct operating-system identities. The Cronos submitter additionally needs
+  reviewed write access to the coordinator RelayStore for the `approved ->
+  submitted -> completed` transitions of outbound transfers.
 - Require at least two independent HTTPS RPC origins for each chain and reject
   credentials embedded in URLs.
 - A critical watcher, approval or submission worker failure halts the runtime;
@@ -200,15 +202,35 @@ Never manually retry an approved or submitted transfer. The submission helper
 can resume a persisted transaction reference or a canonically processed record.
 The [durable broadcast ledger](SUBMITTERS.md#durable-broadcast-ledger) persists
 exact signed bytes before any send and recovers ambiguous broadcasts by
-observation or by resending only those identical bytes; it is not yet connected
-to a startup path. Never delete, copy between hosts or restore an old copy of a
-broadcast ledger: like a signer journal, it is what prevents a second
-transaction. Back it up like a key. A `failed` or `halted` ledger row blocks the
-submitter until an offline review. `rejected` rows (a transfer that can never be
-sent) and deferred transfers do not block other transfers; review them from the
+observation or by resending only those identical bytes. The Cronos testnet
+submitter uses it; the Xitcoin startup path still fails closed. Never delete,
+copy between hosts or restore an old copy of a broadcast ledger: like a signer
+journal, it is what prevents a second transaction. Back it up like a key. A
+`failed` or `halted` ledger row stops the submitter until an offline review; no
+procedure or API for resolving such a row exists yet, and a row must never be
+edited to permit a retry. `rejected` rows (a transfer that can never be sent)
+and deferred transfers do not block other transfers; review them from the
 ledger, they remain `approved` in RelayStore. A transfer released by another
-transaction is recorded as `released_elsewhere` with that transaction. Both public submitter startup paths fail
-closed; [SUBMITTERS.md](SUBMITTERS.md) lists the exact adapter gaps.
+transaction is recorded as `released_elsewhere` with that transaction.
+[SUBMITTERS.md](SUBMITTERS.md) lists the remaining gaps.
+
+## Cronos testnet submitter
+
+- Run it only from a root-owned `testnet` manifest pinned to chain ID `338`,
+  the deployed vault, its runtime code hash, the signer set and version, and a
+  dedicated submitter account used by no other program.
+- Keep the submitter key in an encrypted keystore owned by the submitter
+  identity; pass its password only as the encrypted systemd credential
+  `keystore-password`.
+- Give it at least two independent RPC providers per chain (reviewed loopback
+  tunnels with the provided template). It stops on any disagreement.
+- It stops on halts, RPC disagreement, transport failures and finalized failed
+  executions and does not restart itself. Investigate before restarting; never
+  lower confirmations, remove a pinned value or reset state to resume.
+- A paused vault, an approval too close to its deadline, a gas price above the
+  cap, insufficient liquidity or submitter balance makes it wait without
+  claiming anything.
+- Logs contain only stable codes, transfer IDs and transaction hashes.
 
 ## Testnet preflight
 

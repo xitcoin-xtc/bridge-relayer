@@ -30,5 +30,10 @@ decision identifier, directions, bounded amounts, source and destination
 transaction hashes, final status and report digest. Never publish keys,
 mnemonics, tokens, private endpoints, raw RPC responses or signatures.
 
+Current component readiness: the Cronos testnet submitter can perform the
+Xitcoin Testnet to Cronos Testnet leg. The Cronos Testnet to Xitcoin Testnet leg
+still requires the Xitcoin destination adapter and a canonical
+attestation-status query, so the two-direction canary cannot run yet.
+
 A passing canary is evidence for final security review. It is not by itself an
 authorization for unrestricted or mainnet operation.

@@ -28,8 +28,9 @@ advances checkpoints only after a second canonical event and block verification.
 Xitcoin message decoding remains an explicit canonical dependency rather than a
 heuristic event parser. The approval coordinator requests bounded HTTPS
 responses from isolated signers, recovers each signer locally, persists an
-immutable deterministic 2-of-3 quorum and remains restart-safe. Network
-submission remains deliberately excluded. The isolated
+immutable deterministic 2-of-3 quorum and remains restart-safe. The coordinator
+itself never submits transactions; destination submission is a separate,
+explicitly enabled process (below). The isolated
 signer service enforces a pinned route, source and destination chain, vault,
 amount and deadline, requires an independent canonical-finality verifier, keeps
 a durable journal that refuses a second, different request for the same source
@@ -72,12 +73,17 @@ npm run vectors
 See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) and
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
-The public destination submitter phase provides strict root-owned manifests,
-immutable release binding and offline checks for `xitcoin` and `cronos`. Both
-startup paths fail closed pending production adapters. See
-[phase-one scope and exact gaps](docs/SUBMITTERS.md). A destination-generic
-[durable broadcast ledger](docs/SUBMITTERS.md#durable-broadcast-ledger) commits
-an exclusive claim and the exact signed transaction before any send and recovers
-without ever creating a second transaction; it is not yet connected to startup.
-The existing submission helper and staging adapters exercise status-first
-recovery and idempotent completion; they do not provide a production broadcaster.
+The public destination submitters use strict root-owned manifests, immutable
+release binding and offline checks for `xitcoin` and `cronos`. `disabled` is the
+default for both. An explicit `testnet` manifest enables the
+[Cronos testnet submitter](docs/SUBMITTERS.md#cronos-testnet-submitter) for
+Cronos EVM Testnet chain ID `338` only (mainnet `25` is rejected): pinned vault
+code, route, signer set, account and fee caps; bounded independent RPC reads;
+Xitcoin source finality; and receipt, `Released` event and transaction-input
+verification with finality depth. It is built on a destination-generic
+[durable broadcast ledger](docs/SUBMITTERS.md#durable-broadcast-ledger) that
+commits an exclusive claim and the exact signed transaction before any send and
+recovers without ever creating a second transaction. The Xitcoin startup path
+still fails closed until the chain exposes a canonical attestation-status
+query. Nothing here deploys or starts a service; see
+[remaining work](docs/SUBMITTERS.md#remaining-before-the-bridge-can-run-end-to-end).

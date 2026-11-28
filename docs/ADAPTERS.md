@@ -1,7 +1,11 @@
 # Destination adapter work in progress
 
-Both public submitter startup paths remain disabled. No wallet, RPC transport,
-credential loader or broadcaster is connected by this work.
+Update: the Cronos destination now has a transaction-capable testnet adapter,
+enabled only by an explicit root-owned `testnet` manifest; see
+[Cronos testnet submitter](SUBMITTERS.md#cronos-testnet-submitter). The Xitcoin
+startup path remains disabled. The sections below record the offline
+prerequisites in the order they were built; their `mayBroadcast: false`
+statements describe those offline APIs, which remain unchanged.
 
 ## Verified source evidence
 
@@ -80,11 +84,16 @@ state tampering or rollback. Do not delete pending state to change releases.
   envelope, sign mode, sequence/account lookup, fee/gas bounds and response
   semantics; obtain transaction/payload/block/finality evidence beyond the
   replay flag. No wire format is inferred from a message name.
-- Cronos: verify deployed testnet vault code identity, independent receipts,
-  transaction input, replay state, route/pause state and authorized signer quorum;
-  implement account nonce ownership and bounded fees.
-- Both: a bounded transport enforcing timeouts while streaming responses and
-  canonical finality verification. Durable signed-byte custody, the exclusive
+- Cronos: implemented for testnet chain ID `338` by the
+  [Cronos testnet submitter](SUBMITTERS.md#cronos-testnet-submitter): pinned vault
+  code identity, independent receipts, transaction input, `Released` event,
+  replay state, route/pause state, authorized signer quorum, source finality,
+  account nonce ownership and bounded fees. Remaining: deployment, RelayStore
+  sharing review, confirmation of legacy-transaction and fee behaviour on
+  Cronos testnet in the canary, and mainnet (rejected in this release).
+- Both: canonical finality verification for Xitcoin. The bounded transport
+  (`src/bounded-transport.js`) enforces an overall deadline and streaming byte
+  limits before JSON parsing for Cronos JSON-RPC and CometBFT reads. Durable signed-byte custody, the exclusive
   claim, write-ahead broadcast markers, approval-to-transfer binding,
   pending-send recovery and crash-safe RelayStore integration are now provided
   by the destination-generic [durable broadcast ledger](SUBMITTERS.md#durable-broadcast-ledger);
@@ -255,3 +264,11 @@ relayer dependency. It does not replace a chain-generated signing vector.
 The shared streamed reader also caps read operations: endless immediately resolved
 empty chunks cannot starve the timer without exhausting a byte budget. This
 fail-closed cap applies to signer responses as well as destination fixtures.
+
+## Cronos vault route identity fix
+
+The offline release plan and custody inspection compared the vault route with
+`keccak256("cronos-testnet-xitcoin-testnet")`. The deployed testnet vault,
+preflight, signer and coordinator configuration pin `TESTNET_ROUTE_ID`
+(`0x21121c16...`), as PROTOCOL.md requires. Both checks now use the deployed
+route; a regression test rejects the label hash.
