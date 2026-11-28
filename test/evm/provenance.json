@@ -10,6 +10,9 @@
       "note": "current contracts main: exact release accounting and deposit limits, not deployed on testnet" },
     { "path": "token/MockERC20.sol", "commit": "96ee420b210b0cfe174a6d3c89dab327c274667e",
       "source": "contracts/test/MockERC20.sol", "blob": "32e7402c7b930eb8cdc1ecda31e5425396166635",
-      "note": "test-only mintable asset" }
+      "note": "test-only mintable asset" },
+    { "path": "adversarial-token/AdversarialERC20.sol", "commit": "96ee420b210b0cfe174a6d3c89dab327c274667e",
+      "source": "contracts/test/AdversarialERC20.sol", "blob": "71b82e3191929fbec4fa6fa6ac6f98a64ca282d6",
+      "note": "test-only asset whose transfer can be switched to refuse, for an unexplained release revert" }
   ]
 }

@@ -67,7 +67,8 @@ export function normalizeLog(value) {
   if (!Array.isArray(log.topics) || log.topics.length > 4 || typeof log.removed !== "boolean") throw invalid();
   return Object.freeze({ address: address(log.address), topics: Object.freeze(log.topics.map(hash32)),
     data: data(log.data, 65_536), removed: log.removed, logIndex: safeQuantity(log.logIndex),
-    transactionHash: hash32(log.transactionHash), blockHash: hash32(log.blockHash), blockNumber: safeQuantity(log.blockNumber) });
+    transactionIndex: safeQuantity(log.transactionIndex), transactionHash: hash32(log.transactionHash),
+    blockHash: hash32(log.blockHash), blockNumber: safeQuantity(log.blockNumber) });
 }
 
 export function normalizeReceipt(value) {
@@ -75,7 +76,8 @@ export function normalizeReceipt(value) {
   const receipt = object(value);
   if (!Array.isArray(receipt.logs) || receipt.logs.length > 64 || !["0x0", "0x1"].includes(receipt.status)) throw invalid();
   return Object.freeze({ transactionHash: hash32(receipt.transactionHash), blockHash: hash32(receipt.blockHash),
-    blockNumber: safeQuantity(receipt.blockNumber), status: receipt.status, from: address(receipt.from),
+    blockNumber: safeQuantity(receipt.blockNumber), transactionIndex: safeQuantity(receipt.transactionIndex),
+    status: receipt.status, from: address(receipt.from),
     to: optional(receipt.to, address), contractAddress: optional(receipt.contractAddress, address),
     gasUsed: quantity(receipt.gasUsed).toString(), logs: Object.freeze(receipt.logs.map(normalizeLog)) });
 }
@@ -148,6 +150,23 @@ export class CronosRpcQuorum {
       }
       try { return { ok: true, value: normalize(result.value) }; } catch { return { ok: false, execution: false }; }
     });
+  }
+
+  // One answer per origin without throwing: { ok: true, value } or
+  // { ok: false, explicit, error } where `explicit` marks a provider-side
+  // refusal (a JSON-RPC error, for example pruned history) as opposed to a
+  // transport failure or an invalid response, and `error` is what `each`
+  // would have thrown for that origin.
+  async settled(method, params, normalize) {
+    const settled = await Promise.allSettled(this.#clients.map((client) => client.call(method, params)));
+    return Object.freeze(settled.map((result) => {
+      if (result.status !== "fulfilled") {
+        const error = result.reason instanceof TransportError ? result.reason : new TransportError("unavailable");
+        return Object.freeze({ ok: false, explicit: error.code === "rpc_error", error });
+      }
+      try { return Object.freeze({ ok: true, value: normalize(result.value) }); }
+      catch (error) { return Object.freeze({ ok: false, explicit: false, error: error instanceof RpcInvalid ? error : invalid() }); }
+    }));
   }
 
   // The value a strict majority returns identically, and whether every origin
@@ -242,6 +261,17 @@ export class CronosRpcQuorum {
   nonces(account, tag) { return this.each("eth_getTransactionCount", [account, tag], safeQuantity); }
 
   receipts(transactionHash) { return this.each("eth_getTransactionReceipt", [transactionHash], normalizeReceipt); }
+
+  receiptsSettled(transactionHash) { return this.settled("eth_getTransactionReceipt", [transactionHash], normalizeReceipt); }
+
+  transactionsSettled(transactionHash) { return this.settled("eth_getTransactionByHash", [transactionHash], normalizeTransaction); }
+
+  logsSettled(filter) {
+    return this.settled("eth_getLogs", [filter], (value) => {
+      if (!Array.isArray(value) || value.length > 16) throw invalid();
+      return Object.freeze(value.map(normalizeLog));
+    });
+  }
 
   // Bounded log query (one vault event topic pair); every origin must agree.
   logs(filter) {

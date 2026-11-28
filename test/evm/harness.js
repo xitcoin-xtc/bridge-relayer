@@ -42,7 +42,7 @@ export function compile(forge, folder) {
       "--remappings", `@openzeppelin/=${join(root, "node_modules", "@openzeppelin")}/`], { encoding: "utf8", timeout: 240_000 });
     if (result.status !== 0) throw new Error(`forge build failed: ${result.stderr}`);
     const artifacts = {};
-    for (const name of ["CronosBridgeVault", "MockERC20"]) {
+    for (const name of ["CronosBridgeVault", "MockERC20", "AdversarialERC20"]) {
       const path = join(work, "out", `${name}.sol`, `${name}.json`);
       if (existsSync(path)) {
         const artifact = JSON.parse(readFileSync(path, "utf8"));
@@ -157,7 +157,8 @@ export async function deployBridge(chain, artifacts, { routeId, signers, version
   const provider = new JsonRpcProvider(chain.url, undefined, { staticNetwork: true, cacheTimeout: -1 });
   for (const key of Object.values(localKeys)) await chain.rpc("anvil_setBalance", [localAddress(key), "0x56bc75e2d63100000"]);
   const deployer = new Wallet(localKeys.deployer.privateKey, provider);
-  const token = await new ContractFactory(artifacts.token.abi, artifacts.token.bytecode, deployer).deploy("Test XTC", "tXTC");
+  const named = artifacts.token.abi.find((item) => item.type === "constructor")?.inputs.length === 2;
+  const token = await new ContractFactory(artifacts.token.abi, artifacts.token.bytecode, deployer).deploy(...(named ? ["Test XTC", "tXTC"] : []));
   await token.waitForDeployment();
   const args = [await token.getAddress(), routeId, signers, localAddress(localKeys.guardian), maxRelease, dailyLimit];
   if (version === "main") args.push(maxRelease, dailyLimit, liquidity * 2n);

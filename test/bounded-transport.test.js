@@ -140,14 +140,16 @@ test("Cronos RPC quorum requires every origin, agreement and testnet chain ident
 
 test("receipt, transaction and block normalizers accept only exact bounded shapes", () => {
   const h = (byte) => `0x${byte.repeat(64)}`;
-  const log = { address: `0x${"1".repeat(40)}`, topics: [h("a")], data: "0x", removed: false, logIndex: "0x0", transactionHash: h("b"), blockHash: h("c"), blockNumber: "0x5" };
-  const receipt = { transactionHash: h("b"), blockHash: h("c"), blockNumber: "0x5", status: "0x1", from: `0x${"2".repeat(40)}`,
+  const log = { address: `0x${"1".repeat(40)}`, topics: [h("a")], data: "0x", removed: false, logIndex: "0x0", transactionIndex: "0x0",
+    transactionHash: h("b"), blockHash: h("c"), blockNumber: "0x5" };
+  const receipt = { transactionHash: h("b"), blockHash: h("c"), blockNumber: "0x5", transactionIndex: "0x0", status: "0x1", from: `0x${"2".repeat(40)}`,
     to: `0x${"1".repeat(40)}`, contractAddress: null, gasUsed: "0x5208", logs: [log] };
   assert.equal(normalizeReceipt(receipt).logs.length, 1);
   assert.equal(normalizeReceipt(null), null);
   for (const patch of [{ status: "0x2" }, { status: 1 }, { blockHash: "0x00" }, { logs: Array.from({ length: 65 }, () => log) },
     { logs: [{ ...log, topics: [h("a"), h("a"), h("a"), h("a"), h("a")] }] }, { logs: [{ ...log, removed: "false" }] },
-    { blockNumber: "0x01" }, { blockNumber: `0x${"f".repeat(15)}` }, { from: "0x12" }]) {
+    { blockNumber: "0x01" }, { blockNumber: `0x${"f".repeat(15)}` }, { from: "0x12" }, { transactionIndex: undefined },
+    { logs: [{ ...log, transactionIndex: null }] }]) {
     assert.throws(() => normalizeReceipt({ ...receipt, ...patch }), (error) => error.code === "rpc_invalid_response");
   }
   assert.throws(() => normalizeReceipt(Object.assign(Object.create({ polluted: 1 }), receipt)));
