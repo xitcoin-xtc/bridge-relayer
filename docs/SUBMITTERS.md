@@ -505,8 +505,7 @@ only our own transaction, or none), and the queue moves on.
   more than one) halts (`processed_with_mismatching_release`), even when it is
   returned by a single origin while others fail or no longer serve that
   range: only a compromised signer quorum (or a lying origin, settled in the
-  offline review) produces one, and a halt is preferred to an alert. This is
-  the only blocking state a single origin's answer can persist. Evidence not
+  offline review) produces one, and a halt is preferred to an alert. Evidence not
   yet final defers the transfer. If the burn is processed at a finalized
   height and no matching release is found (`release_not_found`), or the
   history to search is no longer served (`release_history_unserved`), the
@@ -517,7 +516,16 @@ only our own transaction, or none), and the queue moves on.
   (null or a JSON-RPC error, after downtime longer than an origin's
   retention), with our nonce consumed on every origin, is recorded
   `release_unverified` (`receipt_history_unserved`); so is a revert whose
-  classifying state is no longer served (`revert_history_unserved`). Recent
+  classifying state is no longer served (`revert_history_unserved`). A
+  receipt that only some origins return is not proof on its own: every origin
+  must either refuse the claimed block (null or a JSON-RPC error) or serve that
+  block, with the receipt's block hash, containing our transaction (a pruned
+  transaction index). If any origin serves the claimed block without our
+  transaction, and after a second read no origin that lacked the receipt sees
+  our transaction, the receipt is contradicted: with our nonce used on every
+  origin the row halts `nonce_consumed_without_receipt`, exactly as when no
+  origin returns a receipt, so one origin fabricating an old receipt cannot
+  turn that key-compromise tripwire into an alert. Recent
   history missing on an origin is indexing lag and transport failures stay
   temporary. Origins must retain at least the maximum expected downtime plus
   `releaseLookbackBlocks` (see [OPERATIONS.md](OPERATIONS.md#cronos-testnet-submitter)).
@@ -527,7 +535,8 @@ Recovery decisions (all from canonical observations, never from send errors):
 | Observation | Action |
 | --- | --- |
 | receipt absent on some origins, mined within the last `releaseLookbackBlocks` | wait (indexing lag) |
-| our receipt, transaction or block older than that and no longer served by some origins (null or JSON-RPC error), nonce consumed on every origin | `release_unverified` (`receipt_history_unserved`); queue continues |
+| our receipt, transaction or block older than that and no longer served by some origins (null or JSON-RPC error), every origin refusing the claimed block or serving it with our transaction, nonce consumed on every origin | `release_unverified` (`receipt_history_unserved`); queue continues |
+| our receipt returned by some origins only, older than that, while an origin serves the claimed block without our transaction, nonce consumed on every origin | halt `nonce_consumed_without_receipt` |
 | receipts or included transactions differ between origins, or content disagrees | temporary stop (`rpc_disagreement`), retried |
 | transaction pending on any origin | wait |
 | unknown everywhere, nonce unused, not processed, not paused, attempts left | resend the identical persisted bytes (also after the deadline: they then revert and consume the nonce) |
@@ -555,10 +564,12 @@ review. The classification only decides blocking versus non-blocking; it never
 completes a transfer or sends anything.
 
 Every persisted halt is based on evidence that every origin returns
-identically, with the single exception of a mismatching `Released` event
-above; otherwise a single origin (stalling, rate limiting or lying) can only
-cause a temporary stop or a non-blocking alert, and no approval deadline can
-turn a provider fault into a queue-wide halt.
+identically, with two exceptions where a halt is preferred to an alert: a
+mismatching `Released` event and an old receipt for our transaction that an
+origin's copy of the claimed block contradicts (both above). Otherwise a
+single origin (stalling, rate limiting or lying) can only cause a temporary
+stop or a non-blocking alert, and no approval deadline can turn a provider
+fault into a queue-wide halt.
 
 ### Tests
 
@@ -591,7 +602,10 @@ pause mined just before our transaction in its block (`reverted`,
 `vault_paused`); a governance limit change mined after our transaction in its
 block (not taken as the cause: `failed`); our own receipt or the state
 classifying our revert no longer served by one origin after downtime beyond
-the lookback (`release_unverified`); a release to another recipient signed by
+the lookback, with that origin's old blocks still served or pruned too
+(`release_unverified`); one origin fabricating an old receipt for a send that
+never landed while our nonce was used elsewhere and the other origin serves
+the claimed block without it (halt `nonce_consumed_without_receipt`); a release to another recipient signed by
 two compromised signer keys, visible on one origin while the other no longer
 serves that range (halt); a RelayStore locked by another process (temporary stop, then
 progress); SIGKILL in a child process at every boundary (claimed, signed,
