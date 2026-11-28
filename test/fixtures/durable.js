@@ -1,7 +1,7 @@
 import { RelayStore } from "../../src/store.js";
 import { buildTransferApprovalRequest } from "../../src/coordinator.js";
 import { prepareCronosRelease, inspectCronosSignedTransaction } from "../../src/cronos-destination.js";
-import { cronosRouteId } from "../../src/protocol.js";
+import { TESTNET_ROUTE_ID } from "../../src/preflight.js";
 import { outbound, signedBytes } from "./cronos.js";
 import { sign } from "./destination.js";
 export const manifest = { version: 1, mode: "disabled", destination: "cronos", releaseCommit: "a".repeat(40),
@@ -17,7 +17,7 @@ export function storedCandidate(path = ":memory:", patch = {}) {
       payload: { requestId: ref, destination: base.request.payload.recipient, amount: patch.amount ?? "10" } });
     const transfer = store.transition("xitcoin", ref, "finalized");
     const request = buildTransferApprovalRequest({ transfer, routeId: manifest.routeId,
-      cronosRouteId: cronosRouteId(manifest.routeId), cronosChainId: 338, cronosVault: evidence.identity.vault,
+      cronosRouteId: TESTNET_ROUTE_ID, cronosChainId: 338, cronosVault: evidence.identity.vault,
       signerSetVersion: 1, deadlineUnix: 2_000_000_000 });
     store.persistApprovalRequest("xitcoin", ref, request);
     for (const approval of sign(request)) store.recordApproval("xitcoin", ref, approval);
