@@ -1,0 +1,4 @@
+# Exact gitleaks fingerprints only (commit:path:rule:line); never a path or rule wildcard.
+# test/fixtures/xitcoin-envelope-vector.json "authInfoHex": protobuf AuthInfo of the synthetic
+# public test vector (type URL plus the compressed public key of private key 3); no secret.
+42a1ce3a4e9465069a3982de99fced36924dcf2f:test/fixtures/xitcoin-envelope-vector.json:generic-api-key:71
