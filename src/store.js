@@ -6,9 +6,24 @@ export const STATES = Object.freeze([
 
 const progress = new Map(STATES.map((state, index) => [state, index]));
 
+// The coordinator and the Cronos submitter both write this database. Lock
+// contention waits for a bounded interval, then fails with SQLITE_BUSY, which
+// callers must treat as a temporary condition (see isRelayStoreBusy).
+export const RELAY_STORE_BUSY_TIMEOUT_MS = 5_000;
+
+export function isRelayStoreBusy(error) {
+  try {
+    if (!error || typeof error !== "object") return false;
+    const descriptor = Object.getOwnPropertyDescriptor(error, "errcode");
+    const errcode = descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : undefined;
+    return Number.isSafeInteger(errcode) && [5, 6].includes(errcode & 0xff); // SQLITE_BUSY, SQLITE_LOCKED
+  } catch { return false; }
+}
+
 export class RelayStore {
-  constructor(path = ":memory:") {
-    this.database = new DatabaseSync(path);
+  constructor(path = ":memory:", { busyTimeoutMs = RELAY_STORE_BUSY_TIMEOUT_MS } = {}) {
+    if (!Number.isSafeInteger(busyTimeoutMs) || busyTimeoutMs < 0 || busyTimeoutMs > 60_000) throw new Error("invalid RelayStore busy timeout");
+    this.database = new DatabaseSync(path, { timeout: busyTimeoutMs });
     this.database.exec(`
       PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS transfers (
