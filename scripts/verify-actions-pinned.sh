@@ -50,4 +50,18 @@ done < <(
     sed -E 's/^([^:]+):[[:space:]-]*(image|container):[[:space:]]*/\1:/' || true
 )
 
+# Images referenced through environment variables (for example a pinned image
+# run with `docker run` in a step) must carry a digest too.
+while IFS= read -r entry; do
+  file="${entry%%:*}"
+  value="$(normalize "${entry#*:}")"
+  if [[ ! "$value" =~ @sha256:[0-9a-f]{64}$ ]]; then
+    printf 'Container image variable without an @sha256 digest: %s: %s\n' "$file" "$value" >&2
+    status=1
+  fi
+done < <(
+  grep -RHE '^[[:space:]]*[A-Z0-9_]*IMAGE:[[:space:]]*[^[:space:]#]' "$repo_root/.github/workflows" |
+    sed -E 's/^([^:]+):[[:space:]]*[A-Z0-9_]*IMAGE:[[:space:]]*/\1:/' || true
+)
+
 exit "$status"
