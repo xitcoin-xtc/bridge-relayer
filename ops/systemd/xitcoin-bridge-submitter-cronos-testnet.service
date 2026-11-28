@@ -1,0 +1,55 @@
+# Review-only template. Do not install or enable it until the deployment,
+# RelayStore sharing, RPC egress, keystore and canary steps in
+# docs/SUBMITTERS.md have passed review.
+[Unit]
+Description=Xitcoin bridge Cronos testnet destination submitter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xitcoin-bridge-submitter-cronos
+Group=xitcoin-bridge-submitter-cronos
+UMask=0077
+LimitCORE=0
+WorkingDirectory=/opt/xitcoin-bridge-relayer/current
+ExecStart=/opt/xitcoin-bridge-node/24.19.0/bin/node --jitless /opt/xitcoin-bridge-relayer/current/src/submitter-cli.js start cronos /etc/xitcoin-bridge/submitter-cronos.json
+# The submitter key password is a root-owned encrypted credential, never an
+# environment variable, argument or file in the release tree.
+LoadCredentialEncrypted=keystore-password:/etc/credstore.encrypted/xitcoin-bridge-submitter-cronos-keystore-password
+# A halt or unavailable dependency stops the service; an operator investigates.
+Restart=no
+# Durable broadcast ledger: private to the service identity.
+StateDirectory=xitcoin-bridge/submitter-cronos
+StateDirectoryMode=0700
+# RPC egress only through reviewed loopback tunnels to independent providers.
+IPAddressDeny=any
+IPAddressAllow=localhost
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+# The RelayStore is written by the coordinator; sharing it requires a reviewed
+# group/permission arrangement (see docs/SUBMITTERS.md). Nothing else is writable.
+ReadWritePaths=/var/lib/xitcoin-bridge/submitter-cronos /var/lib/xitcoin-bridge/coordinator
+
+[Install]
+WantedBy=multi-user.target

@@ -5,7 +5,11 @@ installed or enabled by this repository.
 
 Signer instances use the reviewed public CLI with a root-owned manifest at
 `/etc/xitcoin-bridge/signer-%i.json` and two distinct encrypted systemd
-credentials. The submitter template uses the public CLI and remains blocked in phase one.
+credentials. The generic submitter template uses the public CLI, denies all
+networking and remains blocked for both destinations. The separate
+`xitcoin-bridge-submitter-cronos-testnet.service` template documents the
+Cronos testnet submitter: an encrypted keystore credential, a private state
+directory for the broadcast ledger, loopback-only RPC egress and no restart.
 See [submitter requirements](../../docs/SUBMITTERS.md).
 Never add keys, mnemonics, tokens or private production endpoints to templates
 or manifests.

@@ -82,3 +82,21 @@ export function createCanonicalSourceVerifier({ cronosWatcher, xitcoinWatcher, c
     return Object.freeze({ canonical: true, finalized: true, digest: canonical.digest });
   };
 }
+
+// Destination submitters for Cronos re-verify only the Xitcoin burn of an
+// outbound request; any other direction is rejected rather than routed.
+export function createOutboundSourceVerifier({ xitcoinWatcher }) {
+  if (!xitcoinWatcher || typeof xitcoinWatcher.events !== "function" || typeof xitcoinWatcher.verifyCanonicalEvent !== "function") {
+    throw new Error("Xitcoin source watcher is required");
+  }
+  return async function verifyOutboundSource(request) {
+    const canonical = buildApprovalRequest(request);
+    if (canonical.direction !== DIRECTION_OUTBOUND) throw new Error("outbound approval request is required");
+    const expected = evidence(canonical.payload, canonical.direction);
+    const records = await xitcoinWatcher.events(expected.blockHeight, expected.blockHeight);
+    const matches = records.filter((record) => matchingOutbound(record, canonical.payload, expected));
+    if (matches.length !== 1) throw new Error("canonical source event does not match approval request");
+    await xitcoinWatcher.verifyCanonicalEvent(matches[0]);
+    return Object.freeze({ canonical: true, finalized: true, digest: canonical.digest });
+  };
+}

@@ -205,3 +205,102 @@ test("release traversal rejects every higher unsafe ancestor after a trusted src
     }
   }
 });
+
+// Cronos testnet submission mode.
+const testnetSigners = ["0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf", "0x2B5AD5c4795c026514f8317c7a215E218DcCD6cF",
+  "0x6813Eb9362372EEF6200f3b1dbC3f819671cBA69"];
+const testnet = (patch = {}, cronosPatch = {}, xitcoinPatch = {}) => ({ version: 1, mode: "testnet", destination: "cronos",
+  releaseCommit: "a".repeat(40), routeId: "cronos-testnet-xitcoin-testnet", cronosChainId: 338, xitcoinChainId: "xitcoin-testnet-v2-1",
+  relayStorePath: "/var/lib/xitcoin-bridge/coordinator/relay.sqlite", ledgerPath: "/var/lib/xitcoin-bridge/submitter-cronos/ledger.sqlite",
+  keystorePath: "/var/lib/xitcoin-bridge/submitter-cronos-keystore/keystore.json", cycleIntervalMs: 5000,
+  cronos: { rpcUrls: ["https://cronos-a.example/rpc", "https://cronos-b.example/rpc"], allowLoopbackHttp: false,
+    vault: "0x1c94273C0b199b139D82da3786C9eCbE189D5919", vaultCodeHash: `0x${"ab".repeat(32)}`,
+    cronosRouteId: "0x21121c16b53a726056a6683f00c7eb4da5501ce8a2abc8a4677e06f1e94b5cd9", signerSetVersion: "1",
+    authorizedSigners: [...testnetSigners], submitter: "0xe1AB8145F7E55DC933d51a18c793F901A3A0b276", confirmations: 12,
+    maxAmount: "100000000000000000000", gasLimit: "400000", maxGasPrice: "5000000000000", maxFee: "2000000000000000000",
+    minDeadlineMarginSeconds: 120, maxBroadcastAttempts: 5, ...cronosPatch },
+  xitcoin: { rpcUrls: ["https://xitcoin-a.example", "https://xitcoin-b.example"], allowLoopbackHttp: false, safetyLag: 2, ...xitcoinPatch },
+  ...patch });
+
+test("Cronos testnet mode requires every pinned value and rejects mainnet, Xitcoin and coercion", async () => {
+  const { validateCronosTestnetManifest, parseSubmitterManifest } = await import("../src/submitter-manifest.js");
+  const accepted = validateCronosTestnetManifest(testnet());
+  assert.ok(Object.isFrozen(accepted) && Object.isFrozen(accepted.cronos) && Object.isFrozen(accepted.cronos.authorizedSigners));
+  assert.deepEqual(parseSubmitterManifest(testnet()), accepted);
+  assert.deepEqual(parseSubmitterManifest(manifest("cronos")), validateSubmitterManifest(manifest("cronos")));
+  assert.equal(validateCronosTestnetManifest(testnet({}, { rpcUrls: ["http://127.0.0.1:8545", "http://127.0.0.1:8546"], allowLoopbackHttp: true })).cronos.allowLoopbackHttp, true);
+  const top = [{ destination: "xitcoin" }, { mode: "live" }, { mode: "disabled" }, { cronosChainId: 25 }, { cronosChainId: "338" },
+    { version: 2 }, { routeId: "other" }, { xitcoinChainId: "xitcoin" }, { releaseCommit: "main" }, { cycleIntervalMs: 999 },
+    { cycleIntervalMs: 60_001 }, { relayStorePath: "relative.sqlite" }, { ledgerPath: "/var/lib/a/../b" },
+    { keystorePath: "/var/lib/xitcoin-bridge/coordinator/relay.sqlite" }, { extra: true }, { password: "x" }];
+  const cronos = [{ chainId: 25 }, { rpcUrls: ["https://a.example"] }, { rpcUrls: ["https://a.example/x", "https://a.example/y"] },
+    { rpcUrls: ["http://cronos-a.example", "https://cronos-b.example"] }, { rpcUrls: ["https://k:s@a.example", "https://b.example"] },
+    { rpcUrls: ["https://a.example/?key=1", "https://b.example"] }, { rpcUrls: ["http://127.0.0.1:1", "http://127.0.0.1:2"] },
+    { allowLoopbackHttp: "true" }, { vault: "0x1c94273c0b199b139d82da3786c9ecbe189d5919" }, { vault: "0x000000000000000000000000000000000000dEaD" },
+    { vaultCodeHash: `0x${"0".repeat(64)}` }, { vaultCodeHash: "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470" },
+    { vaultCodeHash: `0x${"AB".repeat(32)}` }, { cronosRouteId: "0xb9ae829d654d824b9046d969c96822a479b9eac3488642b4092928d65e07df5b" },
+    { signerSetVersion: 1 }, { signerSetVersion: "0" }, { signerSetVersion: "18446744073709551616" },
+    { authorizedSigners: testnetSigners.slice(0, 2) }, { authorizedSigners: [testnetSigners[0], testnetSigners[0], testnetSigners[1]] },
+    { submitter: testnetSigners[0] }, { submitter: "0x1c94273C0b199b139D82da3786C9eCbE189D5919" }, { confirmations: 1 },
+    { confirmations: 10_001 }, { maxAmount: "0" }, { maxAmount: 1 }, { gasLimit: "20999" }, { gasLimit: "10000001" },
+    { maxGasPrice: "0" }, { maxGasPrice: "10000000000001" }, { maxFee: "1" }, { minDeadlineMarginSeconds: 29 },
+    { minDeadlineMarginSeconds: 3_601 }, { maxBroadcastAttempts: 0 }, { maxBroadcastAttempts: 33 }, { extra: 1 }, { privateKey: "0x1" }];
+  const xitcoin = [{ rpcUrls: ["https://x.example"] }, { safetyLag: -1 }, { safetyLag: 1_001 }, { allowLoopbackHttp: 1 }, { extra: 1 }];
+  for (const patch of top) assert.throws(() => validateCronosTestnetManifest(testnet(patch)), undefined, JSON.stringify(patch));
+  for (const patch of cronos) assert.throws(() => validateCronosTestnetManifest(testnet({}, patch)), undefined, JSON.stringify(patch));
+  for (const patch of xitcoin) assert.throws(() => validateCronosTestnetManifest(testnet({}, {}, patch)), undefined, JSON.stringify(patch));
+  for (const field of Object.keys(testnet())) {
+    const value = testnet(); delete value[field];
+    assert.throws(() => validateCronosTestnetManifest(value));
+  }
+  let touched = false;
+  const getter = testnet();
+  Object.defineProperty(getter.cronos, "vault", { enumerable: true, get() { touched = true; return testnetSigners[0]; } });
+  assert.throws(() => validateCronosTestnetManifest(getter));
+  assert.equal(touched, false);
+  // Disabled phase-one validation keeps rejecting every testnet-only field.
+  assert.throws(() => validateSubmitterManifest(testnet()));
+});
+
+test("testnet inspection is offline and unready; only Cronos testnet builds a runtime", async () => {
+  const options = { destination: "cronos", manifestPath: "/etc/xitcoin-bridge/submitter-cronos.json", modulePath, credentialsDirectory: "/run/credentials/x" };
+  const verifyRelease = (config, path) => verifySubmitterRelease(config, path, { resolve: async (x) => x, stat: trustedStat });
+  const report = await inspectSubmitter(options, { loadManifest: async () => testnet(), verifyRelease });
+  assert.deepEqual(report, { version: 1, destination: "cronos", releaseCommit: "a".repeat(40), mode: "testnet", ready: false,
+    submissions: 0, blocker: "cronos_live_checks_run_only_at_start" });
+  let built;
+  const runtime = await buildSubmitterRuntime(options, { loadManifest: async () => testnet(), verifyRelease,
+    buildCronos: async (config, dependencies) => { built = { config, dependencies }; return { run: async () => {} }; } });
+  assert.equal(typeof runtime.run, "function");
+  assert.equal(built.config.mode, "testnet"); assert.equal(built.dependencies.credentialsDirectory, "/run/credentials/x");
+  await assert.rejects(buildSubmitterRuntime(options, { loadManifest: async () => manifest("cronos"), verifyRelease,
+    buildCronos: () => assert.fail("disabled manifest must not build") }), { code: "SUBMITTER_UNAVAILABLE" });
+  await assert.rejects(buildSubmitterRuntime({ ...options, destination: "xitcoin" }, { loadManifest: async () => testnet(), verifyRelease,
+    buildCronos: () => assert.fail("destination mismatch must not build") }), /does not match/);
+  await assert.rejects(buildSubmitterRuntime(options, { loadManifest: async () => testnet({ releaseCommit: "b".repeat(40) }), verifyRelease,
+    buildCronos: () => assert.fail("release mismatch must not build") }), /does not match its pinned manifest/);
+  const { calls, dependencies } = reader(JSON.stringify(testnet()));
+  assert.equal((await loadSubmitterManifest("/etc/bridge/submitter.json", dependencies)).mode, "testnet");
+  assert.equal(calls.closed, 1);
+});
+
+test("CLI start runs until SIGTERM, closes state and reports only stable error codes", async () => {
+  const { EventEmitter } = await import("node:events");
+  const signals = new EventEmitter();
+  let closed = 0, errors = "";
+  const runtime = { run: ({ signal }) => new Promise((resolve) => { signal.addEventListener("abort", resolve); setImmediate(() => signals.emit("SIGTERM")); }),
+    close: () => { closed++; } };
+  const common = { stdout: { write() {} }, stderr: { write: (x) => { errors += x; } }, signals, credentialsDirectory: "/run/credentials/x" };
+  assert.equal(await runSubmitterCli(["start", "cronos", "/etc/config"], { ...common, build: async (options) => {
+    assert.equal(options.credentialsDirectory, "/run/credentials/x"); return runtime; } }), 0);
+  assert.equal(closed, 1); assert.equal(signals.listenerCount("SIGTERM"), 0);
+  const failing = { run: async () => { const error = new Error("secret endpoint https://k@rpc"); error.code = "vault_code_mismatch"; throw error; }, close: () => { closed++; } };
+  assert.equal(await runSubmitterCli(["start", "cronos", "/etc/config"], { ...common, build: async () => failing }), 1);
+  assert.match(errors, /submitter stopped: vault_code_mismatch;/);
+  assert.doesNotMatch(errors, /secret|https/);
+  assert.equal(closed, 2);
+  errors = "";
+  const unsafe = new Error("x"); unsafe.code = "Contains Spaces https://x";
+  assert.equal(await runSubmitterCli(["start", "cronos", "/etc/config"], { ...common, build: async () => { throw unsafe; } }), 1);
+  assert.doesNotMatch(errors, /Contains|https/);
+});
