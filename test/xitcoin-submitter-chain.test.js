@@ -151,7 +151,7 @@ async function scenario(run, { deposits = 1, approved = deposits, deadlineOffset
         chainSchemaCommit: XITCOIN_CHAIN_SCHEMA_COMMIT, signerSetVersion: "1", authorizedSigners: [...signers], submitter,
         confirmations: 2, historyBlocks: 1_000, maxAmount: (10n ** 21n).toString(), maxGas: "600000", gasAdjustmentPercent: 130,
         gasHeadroom: 30_000, feeMultiplierPercent: 200, maxGasPrice: "100000000000", maxFee: "60000000000000000",
-        minDeadlineMarginSeconds: 30, maxBroadcastAttempts: 5, ...xitcoinPatch },
+        minDeadlineMarginSeconds: 30, maxResendIntervalSeconds: 600, stalledAlertSeconds: 3_600, ...xitcoinPatch },
       cronos: { rpcUrls: cronosProxies.map((proxy) => proxy.url), allowLoopbackHttp: true, vault: bridge.vault,
         cronosRouteId: TESTNET_ROUTE_ID, confirmations: 3 }, ...manifestPatch });
     const runtimes = [];

@@ -299,7 +299,8 @@ const xitcoinTestnet = (patch = {}, xitcoinPatch = {}, cronosPatch = {}) => ({ v
   chainSchemaCommit: XITCOIN_CHAIN_SCHEMA_COMMIT, signerSetVersion: "1", authorizedSigners: [...testnetSigners],
   submitter: "xtc1pvxgdtncv9ttghcdrp89uzhyhacu5l6r42ahd9", confirmations: 2, historyBlocks: 100_000,
   maxAmount: "100000000000000000000", maxGas: "600000", gasAdjustmentPercent: 130, gasHeadroom: 40_000, feeMultiplierPercent: 200,
-  maxGasPrice: "100000000000", maxFee: "60000000000000000", minDeadlineMarginSeconds: 120, maxBroadcastAttempts: 5, ...xitcoinPatch },
+  maxGasPrice: "100000000000", maxFee: "60000000000000000", minDeadlineMarginSeconds: 120, maxResendIntervalSeconds: 3_600,
+  stalledAlertSeconds: 21_600, ...xitcoinPatch },
   cronos: { rpcUrls: ["https://cronos-a.example/rpc", "https://cronos-b.example/rpc"], allowLoopbackHttp: false,
     vault: "0x1c94273C0b199b139D82da3786C9eCbE189D5919", cronosRouteId: "0x21121c16b53a726056a6683f00c7eb4da5501ce8a2abc8a4677e06f1e94b5cd9",
     confirmations: 12, ...cronosPatch },
@@ -338,7 +339,9 @@ test("Xitcoin testnet mode requires every pinned value and rejects mainnet, the 
     { confirmations: 0 }, { confirmations: 1_001 }, { historyBlocks: 999 }, { maxAmount: "0" }, { maxGas: "99999" }, { maxGas: "5000001" },
     { maxGas: 600000 }, { gasAdjustmentPercent: 109 }, { gasAdjustmentPercent: 301 }, { gasHeadroom: 9_999 }, { feeMultiplierPercent: 99 }, { feeMultiplierPercent: 100 }, { feeMultiplierPercent: 149 },
     { feeMultiplierPercent: 1_001 }, { maxGasPrice: "0" }, { maxGasPrice: "1000000000000001" }, { maxFee: "0" },
-    { minDeadlineMarginSeconds: 29 }, { maxBroadcastAttempts: 33 }, { extra: 1 }, { privateKey: "0x1" }, { allowLoopbackHttp: "false" }];
+    { minDeadlineMarginSeconds: 29 }, { maxBroadcastAttempts: 5 }, { maxResendIntervalSeconds: 59 }, { maxResendIntervalSeconds: 86_401 },
+    { maxResendIntervalSeconds: "600" }, { stalledAlertSeconds: 299 }, { stalledAlertSeconds: 2_592_001 }, { extra: 1 }, { privateKey: "0x1" },
+    { allowLoopbackHttp: "false" }];
   const cronos = [{ rpcUrls: ["https://a.example"] }, { vault: "0x1c94273c0b199b139d82da3786c9ecbe189d5919" },
     { cronosRouteId: "0xb9ae829d654d824b9046d969c96822a479b9eac3488642b4092928d65e07df5b" }, { confirmations: 1 }, { extra: 1 }];
   for (const patch of top) assert.throws(() => validateXitcoinTestnetManifest(xitcoinTestnet(patch)), undefined, JSON.stringify(patch));

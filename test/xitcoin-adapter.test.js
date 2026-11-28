@@ -27,7 +27,7 @@ function manifest(model, patch = {}) {
     xitcoin: { origins: model.urls, allowLoopbackHttp: false, chainSchemaCommit: XITCOIN_CHAIN_SCHEMA_COMMIT, signerSetVersion: "1",
       authorizedSigners: [...signers], submitter: SUBMITTER, confirmations: 2, historyBlocks: 1_000, maxAmount: (10n ** 21n).toString(),
       maxGas: "600000", gasAdjustmentPercent: 130, gasHeadroom: 30_000, feeMultiplierPercent: 200, maxGasPrice: "100000000000",
-      maxFee: "60000000000000000", minDeadlineMarginSeconds: 60, maxBroadcastAttempts: 3, ...patch },
+      maxFee: "60000000000000000", minDeadlineMarginSeconds: 60, maxResendIntervalSeconds: 3_600, stalledAlertSeconds: 86_400, ...patch },
     cronos: { rpcUrls: ["https://cronos-a.example", "https://cronos-b.example"], allowLoopbackHttp: false, vault: VAULT,
       cronosRouteId: TESTNET_ROUTE_ID, confirmations: 12 } });
 }
@@ -59,7 +59,8 @@ async function signed(context) {
   const result = await context.adapter.sign({ ...context.stored, context: assessed.context, expectedNonce: null });
   assert.equal(result.action, "signed");
   return { assessed, result, row: { transferId: context.transferId, sourceRef: context.transfer.source_ref, state: "broadcast",
-    nonce: result.nonce, signedHex: result.signedHex, transactionHash: result.transactionHash, broadcastAttempts: 1 } };
+    nonce: result.nonce, signedHex: result.signedHex, transactionHash: result.transactionHash, broadcastAttempts: 1,
+    updatedAt: nowUnix() - 7_200 } };
 }
 const observe = (context, row) => context.adapter.observe({ ...context.stored, row });
 
@@ -150,9 +151,12 @@ test("a failure in the ante handler leaves the sequence unused: identical bytes 
   context.model.state.mempool = [row.signedHex];
   assert.deepEqual(await observe(context, row), { action: "pending" });
   context.model.state.mempool = [];
-  // With every attempt spent and nothing in flight the row waits; the sequence
-  // is unused and the bytes stay valid, so no halt is ever persisted.
-  assert.deepEqual(await observe(context, { ...row, broadcastAttempts: 3 }), { action: "wait", code: "broadcast_attempts_exhausted" });
+  // There is no terminal cap: past 32 attempts the identical bytes are still
+  // resent, after a backoff (here the 3600 s maximum) since the previous send.
+  assert.deepEqual(await observe(context, { ...row, broadcastAttempts: 40 }), { action: "rebroadcast" });
+  assert.deepEqual(await observe(context, { ...row, broadcastAttempts: 40, updatedAt: nowUnix() - 3_000 }), { action: "wait", code: "resend_backoff" });
+  assert.deepEqual(await observe(context, { ...row, broadcastAttempts: 1, updatedAt: nowUnix() - 30 }), { action: "wait", code: "resend_backoff" });
+  assert.deepEqual(await observe(context, { ...row, broadcastAttempts: 1, updatedAt: nowUnix() - 61 }), { action: "rebroadcast" });
   context.model.state.account.sequence = 1; // something else used our sequence
   assert.deepEqual(await observe(context, row), { action: "halt", code: "nonce_consumed_without_inclusion" });
 });
@@ -406,7 +410,11 @@ test("resends wait for an admissible fee and nothing in flight; exhausted attemp
     { action: "wait", code: "fee_below_required" });
   context.model.state.baseFee = `${price}.000000000000000000`;
   assert.deepEqual(await observe(context, row), { action: "rebroadcast" });
-  assert.deepEqual(await observe(context, { ...row, broadcastAttempts: 3 }), { action: "wait", code: "broadcast_attempts_exhausted" });
+  // A lasting fee rise only waits: never a halt and never new signed bytes;
+  // the stalled-row alert (ledger attention) reports it once it lasts.
+  assert.deepEqual(await observe(context, { ...row, broadcastAttempts: 33 }), { action: "rebroadcast" });
+  assert.equal(context.adapter.maxBroadcastAttempts, null);
+  assert.equal(context.adapter.stalledAlertSeconds, 86_400);
 });
 
 test("one origin's transaction result for old history can never force a halt; a strict majority can", async () => {
@@ -448,4 +456,41 @@ test("one origin's transaction result for old history can never force a halt; a 
   assert.deepEqual(outcome.result, { action: "halt", code: "record_names_failed_transaction" });
   outcome = await lying({ origins: 3, liars: [0, 1], code: 0, record: foreign });
   assert.deepEqual(outcome.result, { action: "halt", code: "record_mismatch_after_success" });
+});
+
+test("a re-encoded copy of our transaction that processed the attestation before the searched window completes, never halts", async () => {
+  // Our sequence was used longer ago than historyBlocks (long downtime): the
+  // consuming block can no longer be searched, but the record names a
+  // transaction in its block that carries our signed content.
+  const outcome = async (bytesOf, record) => {
+    const context = setup();
+    const { row } = await signed(context);
+    const tx = bytesOf(row);
+    const hash = context.model.commit(tx, { height: 100, accSeq: [`${SUBMITTER}/0`] });
+    context.model.state.txs.delete(hash); // the transaction index no longer serves it
+    context.model.faults[0] = context.model.faults[1] = ({ kind, method, params, body }) => (kind === "rpc" && method === "block"
+      && params.height === "100" ? { ...body, result: { ...body.result, block: { ...body.result.block,
+        data: { txs: [Buffer.from(tx.slice(2), "hex").toString("base64")] } } } } : undefined);
+    context.model.state.account.sequence = 1; // consumed at every searchable height
+    context.model.state.height = 100 + 5_000;
+    context.model.state.attestations.set(context.transferId, { status: "processed",
+      record: record(context, hash) });
+    return { result: await observe(context, row), hash, context, row };
+  };
+  const exact = (context, hash) => recordFor(context.request, context.approvals, { txHash: hash, height: 100 });
+  let found = await outcome((row) => reencode(row.signedHex, 27), exact);
+  assert.deepEqual(found.result, { action: "released_elsewhere", releaseHash: found.hash, blockNumber: 100,
+    blockHash: found.context.model.blockHash(100) });
+  found = await outcome((row) => reencode(row.signedHex, "rs"), exact);
+  assert.equal(found.result.action, "released_elsewhere");
+  // Our own bytes: finalized, as before.
+  found = await outcome((row) => row.signedHex, exact);
+  assert.deepEqual(found.result, { action: "finalized", blockNumber: 100, blockHash: found.context.model.blockHash(100) });
+  // Another signed content (a forged S) still trips the tripwire.
+  found = await outcome((row) => {
+    const other = Buffer.from(reencode(row.signedHex, 27).slice(2), "hex");
+    other[other.length - 2] ^= 1;
+    return `0x${other.toString("hex")}`;
+  }, exact);
+  assert.deepEqual(found.result, { action: "halt", code: "nonce_consumed_without_inclusion" });
 });

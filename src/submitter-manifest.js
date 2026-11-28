@@ -18,7 +18,7 @@ const XITCOIN_FIELDS = ["rpcUrls", "allowLoopbackHttp", "safetyLag"];
 const XITCOIN_TESTNET_FIELDS = [...FIELDS, "relayStorePath", "ledgerPath", "keystorePath", "cycleIntervalMs", "xitcoin", "cronos"];
 const XITCOIN_DESTINATION_FIELDS = ["origins", "allowLoopbackHttp", "chainSchemaCommit", "signerSetVersion", "authorizedSigners",
   "submitter", "confirmations", "historyBlocks", "maxAmount", "maxGas", "gasAdjustmentPercent", "gasHeadroom",
-  "feeMultiplierPercent", "maxGasPrice", "maxFee", "minDeadlineMarginSeconds", "maxBroadcastAttempts"];
+  "feeMultiplierPercent", "maxGasPrice", "maxFee", "minDeadlineMarginSeconds", "maxResendIntervalSeconds", "stalledAlertSeconds"];
 const CRONOS_SOURCE_FIELDS = ["rpcUrls", "allowLoopbackHttp", "vault", "cronosRouteId", "confirmations"];
 const EMPTY_CODE_HASH = "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470";
 const MAX_BYTES = 16_384;
@@ -200,7 +200,12 @@ export function validateXitcoinTestnetManifest(input) {
       feeMultiplierPercent: integer(xitcoin.feeMultiplierPercent, 150, 1_000),
       maxGasPrice, maxFee,
       minDeadlineMarginSeconds: integer(xitcoin.minDeadlineMarginSeconds, 30, 3_600),
-      maxBroadcastAttempts: integer(xitcoin.maxBroadcastAttempts, 1, 32),
+      // The identical stored bytes are resent with a backoff that doubles from
+      // one minute up to this interval; there is no terminal attempt cap.
+      maxResendIntervalSeconds: integer(xitcoin.maxResendIntervalSeconds, 60, 86_400),
+      // An unfinished row signed longer ago than this is reported in every
+      // cycle (attention `stalled`) until it concludes; never a halt.
+      stalledAlertSeconds: integer(xitcoin.stalledAlertSeconds, 300, 2_592_000),
     }),
     cronos: Object.freeze({ rpcUrls: urls(cronos.rpcUrls, cronos.allowLoopbackHttp), allowLoopbackHttp: cronos.allowLoopbackHttp,
       vault: checksummed(cronos.vault), cronosRouteId: cronos.cronosRouteId, confirmations: integer(cronos.confirmations, 2, 10_000) }),
