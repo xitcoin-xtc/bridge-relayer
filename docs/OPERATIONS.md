@@ -216,9 +216,10 @@ copy between hosts or restore an old copy of a broadcast ledger: like a signer
 journal, it is what prevents a second transaction. Back it up like a key. A
 `failed` or `halted` ledger row stops the submitter until an offline review; no
 procedure or API for resolving such a row exists yet, and a row must never be
-edited to permit a retry. `rejected` rows (a transfer that can never be sent)
-and deferred transfers do not block other transfers; review them from the
-ledger, they remain `approved` in RelayStore. A transfer released by another
+edited to permit a retry. `rejected`, `expired`, `reverted` and
+`release_unverified` rows and deferred transfers do not block other transfers;
+review them as described in
+[Reviewing non-blocking rows](#reviewing-non-blocking-rows). A transfer released by another
 transaction is recorded as `released_elsewhere` with that transaction.
 [SUBMITTERS.md](SUBMITTERS.md) lists the remaining gaps.
 
@@ -232,8 +233,16 @@ transaction is recorded as `released_elsewhere` with that transaction.
   `keystore-password`.
 - Prefer three or more independent Cronos RPC providers: with three, one
   faulty provider can no longer hold a signed transaction until its approval
-  expires. Every provider must serve at least `releaseLookbackBlocks` of recent
-  block and log history.
+  expires.
+- History retention: every origin must retain at least the maximum expected
+  submitter downtime plus `releaseLookbackBlocks` blocks of block, receipt,
+  transaction, log and state history (state for `eth_call` at past heights).
+  An archive node is recommended; the canary plan uses our own Cronos node as
+  one of its three origins. When the submitter was down for longer than an
+  origin's retention, history about its own last transaction that some
+  origins no longer serve ends in a non-blocking `release_unverified` alert
+  (below) instead of a stop; if every origin has lost the transaction itself,
+  the row halts `nonce_consumed_without_receipt` for review.
 - Give it at least two independent RPC providers per chain (reviewed loopback
   tunnels with the provided template). It never acts on a disagreement: a
   disagreement, transport failure or a RelayStore locked by the coordinator is
@@ -251,14 +260,73 @@ transaction is recorded as `released_elsewhere` with that transaction.
   recorded as `released_elsewhere` and is not an error; RelayStore
   `release_ref` names the releasing transaction.
 - Every cycle report carries `attention` counts (`rejected`, `expired`,
-  `releaseUnverified`, `reverted`). These never block other transfers but need review:
-  `expired` burns need a new approval and transaction (procedure not defined
-  yet); `release_unverified` means the vault reports the burn processed but no
-  matching `Released` event was found, which the reconciler will also show as
-  a discrepancy. A transfer to an
-  invalid recipient is `rejected` and needs an operator decision (refund
-  procedure); it does not block other transfers.
+  `releaseUnverified`, `reverted`). These rows never block other transfers but
+  each needs the review below.
 - Logs contain only stable codes, transfer IDs and transaction hashes.
+
+### Reviewing non-blocking rows
+
+`expired`, `reverted`, `release_unverified` and `rejected` ledger rows are
+permanent. The submitter never sends anything else for those transfers, and
+the broadcast ledger must never be edited, reset or replaced to retry one: its
+row is the permanent record of the nonce and bytes used for that transfer.
+
+| State | Meaning |
+| --- | --- |
+| `expired` | our identical bytes were mined after the approval deadline and reverted; nonce consumed |
+| `reverted` | our bytes were mined before the deadline and reverted for the cause in `reason_code`: `vault_paused` (guardian pause), `signer_set_rotated`, `release_limit_exceeded`, `daily_release_limit_exhausted` or `insufficient_vault_liquidity`; nonce consumed |
+| `release_unverified` | the outcome could not be verified; the reason is the code of its `release_unverified` event: `release_not_found` (burn processed, no matching `Released` event in the searched windows), `release_history_unserved` (that search reached history an origin no longer serves), `receipt_history_unserved` (our mined transaction's receipt, transaction or block is no longer served by some origins), `revert_history_unserved` (our transaction reverted and the state needed to classify it is no longer served) |
+| `rejected` | the transfer can never be sent (`invalid_recipient`); nothing was signed |
+
+Detect: any non-zero `attention` count in the cycle log. List the rows with a
+read-only query run as the submitter service user with a private umask (a
+WAL or SHM file owned by another user, or readable by others, makes the
+ledger fail closed), never with a writable connection:
+
+```sh
+sudo -u xitcoin-bridge-submitter-cronos sh -c 'umask 077; exec sqlite3 -readonly "$1"' sh \
+  /var/lib/xitcoin-bridge/submitter-cronos/<ledger file named by the manifest ledgerPath> <<'SQL'
+SELECT transfer_id, source_ref, state, nonce, transaction_hash, block_number, block_hash, reason_code
+  FROM transfers WHERE state IN ('expired', 'reverted', 'release_unverified', 'rejected');
+SELECT transfer_id, state, code, at FROM transfer_events WHERE state = 'release_unverified';
+SQL
+```
+
+Verify on chain, with read-only calls to an independent archive node (the
+source burn ID is the `transfer_id`; the approved recipient, amount, signer
+version and deadline are in the stored approval request):
+
+1. `processedBurns(sourceBurnId)` on the vault at a finalized height.
+2. The vault's `Released` logs with that burn ID as the first indexed topic,
+   from the block of the first approval to the finalized height. One event
+   whose recipient, amount and signer version match the approval means the
+   recipient was paid. An event with any other field is a signer-quorum
+   compromise: pause the vault and start incident response.
+3. For our transaction, if the row has one (`transaction_hash`, `block_number`, `block_hash`):
+   the receipt status, that the block hash is canonical, and the block
+   timestamp against the approval deadline (`expired` rows: after it).
+4. For `reverted` and `revert_history_unserved`: vault state at
+   `block_number - 1` and at `block_number` (`paused`, `signerSetVersion`,
+   `maxReleaseAmount`, `releaseDay`, `releasedToday`, `dailyReleaseLimit`,
+   `availableLiquidity`), and the revert reason from a transaction trace on
+   the archive node.
+5. For `rejected`: the recipient in the approved payload (zero, `0x…dEaD` or
+   the vault itself).
+
+Resolve, by owner decision and without touching the broadcast ledger:
+
+- Recipient paid (a matching `Released` event, ours or another transaction's,
+  at a finalized height): no new transaction. The RelayStore transfer stays
+  `submitted` (the reconciler reports it) until a reviewed completion
+  recording the release transaction exists; no such tool exists yet.
+- Not paid (`processedBurns` false at a finalized height and no `Released`
+  event): once the cause is cleared (resume, liquidity, limits, signer set),
+  either a re-approval handled as a new transfer record, never reusing this
+  transfer ID, or the refund path on the source chain. Before either, confirm
+  that every approval ever issued for the burn is past its deadline (the vault
+  then refuses it) and that no signer will approve the old burn ID again, so
+  the burn can never be released twice. Neither path is automated in this
+  release; both need owner approval.
 
 ## Testnet preflight
 

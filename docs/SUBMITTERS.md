@@ -206,17 +206,19 @@ The ledger enforces, in one fenced immediate transaction per change:
   every cycle report (`attention`) until an operator reviews them: `expired`
   (our identical bytes were mined and reverted after the approval deadline,
   consuming their nonce; the burn still awaits a new approval and RelayStore
-  keeps it `submitted`, in flight) and `release_unverified` (the destination
-  reports the transfer processed but no matching release was found; never a
-  completion, RelayStore unchanged). `rejected` rows are counted too, and so
-  are `reverted` rows: our bytes were mined before the deadline and reverted
-  for a lasting condition of this transfer (daily release limit exhausted,
-  insufficient liquidity, amount above the release limit, signer-set
-  rotation), as shown by vault state at the inclusion block on every origin.
-  Their nonce is consumed and retrying would need a second transaction for
-  the transfer, which the ledger forbids, so the transfer is parked without
-  blocking the queue. Out of gas, a revert under a guardian pause or any
-  unexplained revert stays `failed` (blocking).
+  keeps it `submitted`, in flight) and `release_unverified` (the outcome
+  could not be verified: the destination reports the transfer processed but
+  no matching release was found, or history about our mined transaction is no
+  longer served; never a completion, RelayStore unchanged; the reason code is
+  kept in the transfer's event history). `rejected` rows are counted too, and
+  so are `reverted` rows: our bytes were mined before the deadline and
+  reverted under a guardian pause or for a lasting condition of this transfer
+  (daily release limit exhausted, insufficient liquidity, amount above the
+  release limit, signer-set rotation), as shown by vault state on every
+  origin. Their nonce is consumed and retrying would need a second
+  transaction for the transfer, which the ledger forbids, so the transfer is
+  parked without blocking the queue. Out of gas or any unexplained revert
+  stays `failed` (blocking).
 
 SQLite triggers repeat these rules (no delete, no regression, no replacement,
 immutable source reference, sequential nonce, monotonic lease epoch) as defense in depth against
@@ -434,9 +436,13 @@ plan and signed-byte inspector re-check every field before the ledger commits
 the bytes, hash and nonce. Then RelayStore records `submitted` with that hash,
 the broadcast marker is committed, and the identical bytes are sent to every
 origin. Before the first send the deadline is checked first: once the local
-clock says the margin is lost, the stored bytes are sent at once, without any
-origin read or simulation, so their reserved nonce is consumed whatever the
-origins do (sending our own committed bytes is never unsafe). Otherwise the
+clock says the margin is lost, the stored bytes are sent without simulation or
+nonce checks, so their reserved nonce is consumed whatever the origins do
+(sending our own committed bytes is never unsafe). Only the pause flag is read
+first, from a strict majority: a known guardian pause still holds the row
+(`route_paused`; after the resume the bytes are sent and, past the deadline,
+end `expired`), and only when that read fails are the bytes sent without it.
+Otherwise the
 nonce, pause, replay flag, latest block time and a simulation of the exact
 signed transaction are read from a strict majority of origins: with three or
 more origins one faulty origin no longer holds the row until its approval
@@ -495,21 +501,33 @@ only our own transaction, or none), and the queue moves on.
   strictly sequential nonces.
 - Our transaction reverted because the burn was already processed: recorded as
   released elsewhere instead of `failed`.
-- A `Released` event for the burn that does not match the approved fields halts
-  (`processed_with_mismatching_release`). Evidence not yet final defers the
-  transfer. If the burn is processed at a finalized height and no matching
-  release is found, or the history to search is no longer served, the ledger
-  records `release_unverified`: a persistent, non-blocking alert reported in
-  every cycle, never a completion. Observing our own receipt still needs its
-  block from every origin; a receipt older than the history an origin serves
-  stops temporarily until it is served (remaining exposure after downtime
-  longer than `releaseLookbackBlocks`).
+- A `Released` event for the burn that does not match the approved fields (or
+  more than one) halts (`processed_with_mismatching_release`), even when it is
+  returned by a single origin while others fail or no longer serve that
+  range: only a compromised signer quorum (or a lying origin, settled in the
+  offline review) produces one, and a halt is preferred to an alert. This is
+  the only blocking state a single origin's answer can persist. Evidence not
+  yet final defers the transfer. If the burn is processed at a finalized
+  height and no matching release is found (`release_not_found`), or the
+  history to search is no longer served (`release_history_unserved`), the
+  ledger records `release_unverified`: a persistent, non-blocking alert
+  reported in every cycle, never a completion.
+- Our own mined transaction older than the last `releaseLookbackBlocks`
+  blocks whose receipt, transaction or block some origins no longer serve
+  (null or a JSON-RPC error, after downtime longer than an origin's
+  retention), with our nonce consumed on every origin, is recorded
+  `release_unverified` (`receipt_history_unserved`); so is a revert whose
+  classifying state is no longer served (`revert_history_unserved`). Recent
+  history missing on an origin is indexing lag and transport failures stay
+  temporary. Origins must retain at least the maximum expected downtime plus
+  `releaseLookbackBlocks` (see [OPERATIONS.md](OPERATIONS.md#cronos-testnet-submitter)).
 
 Recovery decisions (all from canonical observations, never from send errors):
 
 | Observation | Action |
 | --- | --- |
-| receipt absent on some origins | wait (indexing lag) |
+| receipt absent on some origins, mined within the last `releaseLookbackBlocks` | wait (indexing lag) |
+| our receipt, transaction or block older than that and no longer served by some origins (null or JSON-RPC error), nonce consumed on every origin | `release_unverified` (`receipt_history_unserved`); queue continues |
 | receipts or included transactions differ between origins, or content disagrees | temporary stop (`rpc_disagreement`), retried |
 | transaction pending on any origin | wait |
 | unknown everywhere, nonce unused, not processed, not paused, attempts left | resend the identical persisted bytes (also after the deadline: they then revert and consume the nonce) |
@@ -521,13 +539,26 @@ Recovery decisions (all from canonical observations, never from send errors):
 | finalized revert because another transaction released the burn | `released_elsewhere`; RelayStore `completed` with `release_ref`; queue continues |
 | finalized revert, burn processed, no matching release found | `release_unverified` alert; queue continues |
 | finalized revert in a block later than the approval deadline | `expired`; queue continues |
-| finalized revert before the deadline explained by daily limit, liquidity, release limit or signer rotation at the inclusion block (every origin) | `reverted`; queue continues |
-| any other finalized failed execution (status `0`, including out of gas or a pause) | ledger `failed`; stop; never retried |
+| finalized revert before the deadline under a guardian pause, or explained by daily limit, liquidity, release limit or signer rotation (every origin) | `reverted`; queue continues |
+| finalized revert before the deadline whose classifying state is older than `releaseLookbackBlocks` and no longer served | `release_unverified` (`revert_history_unserved`); queue continues |
+| any other finalized failed execution (status `0`, including out of gas) | ledger `failed`; stop; never retried |
+
+Revert classification. Standard RPC cannot read state at a position inside a
+block. The pause is reconstructed exactly: the vault changes it only with
+`Paused` and `Unpaused` events, which are replayed from the state at the end
+of the previous block up to our transaction index (and must end in the state
+read at the end of the inclusion block). Signer set, limits and liquidity
+count only when the condition holds both at the end of the previous block and
+at the end of the inclusion block, so a change made by another transaction in
+the same block is never taken as the cause; such a revert stays `failed` for
+review. The classification only decides blocking versus non-blocking; it never
+completes a transfer or sends anything.
 
 Every persisted halt is based on evidence that every origin returns
-identically; a single origin (stalling, rate limiting or lying) can only cause
-a temporary stop, and no approval deadline can turn a provider fault into a
-queue-wide halt.
+identically, with the single exception of a mismatching `Released` event
+above; otherwise a single origin (stalling, rate limiting or lying) can only
+cause a temporary stop or a non-blocking alert, and no approval deadline can
+turn a provider fault into a queue-wide halt.
 
 ### Tests
 
@@ -541,7 +572,7 @@ on the Xitcoin origins and keeping its own approval journal (scenarios that test
 the submitter's own source checks bypass them deliberately). Vendored sources are
 checked against their git blob hashes in `test/evm/provenance.json`: the vault
 recorded for the deployed testnet vault (`d3ae705`) and current contracts main
-(`96ee420`). Scenarios: approve, release and complete on both vault versions;
+(`96ee420`), plus test-only tokens from `96ee420`. Scenarios: approve, release and complete on both vault versions;
 concurrent workers, two submitter processes contesting the lease, a later
 worker and an independent ledger (no second release; the independent ledger
 records `released_elsewhere`); a front-run copying our pending calldata; a
@@ -553,13 +584,22 @@ flag until the approval expires (the stored bytes are sent once and recorded
 `expired`; the queue continues); a claimed row whose approval expires during
 downtime (released without a nonce); release evidence found from the deadline
 and our receipt after a front-run and downtime beyond the lookback; a release
-outside every window (`release_unverified` alert); a RelayStore locked by another process (temporary stop, then
+outside every window (`release_unverified` alert); a known guardian pause
+holding a signed row after the local deadline margin is lost (then `expired`
+after the resume); bytes sent while the pause flag could not be read, and a
+pause mined just before our transaction in its block (`reverted`,
+`vault_paused`); a governance limit change mined after our transaction in its
+block (not taken as the cause: `failed`); our own receipt or the state
+classifying our revert no longer served by one origin after downtime beyond
+the lookback (`release_unverified`); a release to another recipient signed by
+two compromised signer keys, visible on one origin while the other no longer
+serves that range (halt); a RelayStore locked by another process (temporary stop, then
 progress); SIGKILL in a child process at every boundary (claimed, signed,
 RelayStore submitted, broadcast marker, sent, ledger finalized, RelayStore
 completed) followed by recovery with exactly one transaction; a reorganization
 that removes the release (identical bytes resent) and one that replaces it with
 a foreign use of the nonce (halt); a paused route until a quorum-signed resume;
-a finalized failed execution; RPC disagreement on chain ID, code and blocks;
+an unexplained finalized failed execution (the asset refusing the transfer); RPC disagreement on chain ID, code and blocks;
 ambiguous and lost send responses; forged receipt events and transaction input
 from every origin; foreign nonce use before signing and after signing; expired
 approvals; code hash, signer set and chain ID `25` mismatches; source events

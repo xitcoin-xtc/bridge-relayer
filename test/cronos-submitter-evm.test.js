@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Interface, JsonRpcProvider, ZeroHash, encryptKeystoreJsonSync, keccak256 } from "ethers";
+import { AbiCoder, Interface, JsonRpcProvider, TypedDataEncoder, ZeroAddress, ZeroHash, encryptKeystoreJsonSync, keccak256 } from "ethers";
 import { BroadcastLedger } from "../src/broadcast-ledger.js";
 import { approveFinalizedTransfer, buildTransferApprovalRequest } from "../src/coordinator.js";
 import { CometBftHttpClient, decodeXitcoinOutboundBlock, decodeXitcoinOutboundTransaction } from "../src/network.js";
@@ -28,16 +28,18 @@ import provenance from "./evm/provenance.json" with { type: "json" };
 
 const evm = evmAvailability();
 const options = { skip: evm.skip, timeout: 240_000 };
-const VAULT = new Interface(["function processedBurns(bytes32) view returns (bool)", "function pause()",
-  "function resume(uint256 nonce,uint256 deadline,bytes[] signatures)", "function balanceOf(address) view returns (uint256)"]);
+const VAULT = new Interface(["function processedBurns(bytes32) view returns (bool)", "function pause()", "function paused() view returns (bool)",
+  "function resume(uint256 nonce,uint256 deadline,bytes[] signatures)", "function balanceOf(address) view returns (uint256)",
+  "function updateLimits(uint256 newMaxReleaseAmount,uint256 newDailyReleaseLimit,uint256 nonce,uint256 deadline,bytes[] signatures)"]);
+const TOKEN = new Interface(["function configure(uint8 mode,address target,bytes data)"]);
 const RELEASE = new Interface(["function release(bytes32,address,uint256,uint64,uint256,bytes[])"]);
 const AMOUNT = 10n ** 18n;
 const recipient = signers[0];
 const SUBMITTER = localAddress(localKeys.submitter);
 
-function artifacts(version) {
+function artifacts(version, token = "mock") {
   return { vault: compile(evm.forge, version === "main" ? "vault-main" : "vault-testnet").CronosBridgeVault,
-    token: compile(evm.forge, "token").MockERC20 };
+    token: token === "adversarial" ? compile(evm.forge, "adversarial-token").AdversarialERC20 : compile(evm.forge, "token").MockERC20 };
 }
 
 // Coordinator-side persistence of a finalized Xitcoin burn and its approval
@@ -79,7 +81,7 @@ function isolatedSigners({ vault, proxies, comets }) {
 
 async function scenario(run, { version = "testnet", chainId = 338, burns = 1, approved = burns, deadlineOffset = 3_600,
   patch = {}, cronosPatch = {}, cometBurns = (items) => [items, items], approvals = "signers", recipientFor = () => recipient,
-  origins = 2, bridgeOptions = {}, history = 0 } = {}) {
+  origins = 2, bridgeOptions = {}, history = 0, token = "mock" } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "cronos-submitter-"));
   const cleanup = [];
   try {
@@ -89,7 +91,7 @@ async function scenario(run, { version = "testnet", chainId = 338, burns = 1, ap
     for (let index = 0; index < origins; index++) proxies.push(await startProxy(chain.url));
     if (history) await chain.rpc("anvil_mine", [`0x${history.toString(16)}`]); // older history than the lookback window
     cleanup.push(...proxies.map((proxy) => proxy.stop));
-    const bridge = await deployBridge(chain, artifacts(version), { routeId: TESTNET_ROUTE_ID, signers, version, ...bridgeOptions });
+    const bridge = await deployBridge(chain, artifacts(version, token), { routeId: TESTNET_ROUTE_ID, signers, version, ...bridgeOptions });
     await chain.rpc("anvil_mine", ["0xa"]); // vault identity is read at a finalized height
     const allBurns = Array.from({ length: burns }, (_, index) => xitcoinBurn({ index: index + 1,
       recipient: recipientFor(index + 1, bridge), amount: AMOUNT.toString() }));
@@ -304,13 +306,23 @@ test("paused route: nothing is claimed or sent until a quorum-signed resume", op
   await assertSingleRelease(facts, burns[0]);
 }));
 
-test("finalized failed execution is recorded, halts and is never retried", options, () => scenario(async ({ chain, bridge, runtime, facts }) => {
+// Sends a raw transaction and waits until automine includes it.
+async function included(chain, raw) {
+  const hash = await chain.rpc("eth_sendRawTransaction", [raw]);
+  for (let i = 0; i < 100 && !(await chain.rpc("eth_getTransactionReceipt", [hash])); i++) await new Promise((resolve) => setTimeout(resolve, 20));
+  return hash;
+}
+const receiptsOf = (chain, hashes) => Promise.all(hashes.map((hash) => chain.rpc("eth_getTransactionReceipt", [hash])));
+// From the next transaction on, the asset refuses every transfer (returns false).
+const refuseTransfers = async (chain, bridge, options = {}) => chain.rpc("eth_sendRawTransaction", [await signedCall(chain, localKeys.deployer,
+  { to: bridge.token, data: TOKEN.encodeFunctionData("configure", [4, ZeroAddress, "0x"]), ...options })]);
+
+test("an unexplained execution failure (the asset refuses the transfer) is recorded, halts and is never retried", options, () => scenario(async ({ chain, bridge, runtime, facts }) => {
   await chain.rpc("evm_setAutomine", [false]);
   const rt = await runtime();
   const sent = await rt.runOnce();
   assert.equal(sent.action, "submitted");
-  await chain.rpc("eth_sendRawTransaction", [await signedCall(chain, localKeys.guardian, { to: bridge.vault,
-    data: VAULT.encodeFunctionData("pause"), gasPrice: 50_000_000_000n })]);
+  await refuseTransfers(chain, bridge, { gasPrice: 50_000_000_000n });
   await chain.rpc("evm_mine", []);
   assert.equal((await chain.rpc("eth_getTransactionReceipt", [sent.transactionHash])).status, "0x0");
   assert.equal((await rt.runOnce()).action, "pending");
@@ -321,6 +333,31 @@ test("finalized failed execution is recorded, halts and is never retried", optio
   try { assert.equal(ledger.blocking()[0].state, "failed"); } finally { ledger.close(); }
   assert.equal(facts.relay().state, "submitted");
   assert.equal(await facts.nonce(), 1);
+}, { token: "adversarial" }));
+
+test("a guardian pause mined just before our transaction in its block makes the revert non-blocking, never failed", options, () => scenario(async ({ chain, bridge, runtime, facts }) => {
+  await chain.rpc("evm_setAutomine", [false]);
+  const rt = await runtime();
+  const sent = await rt.runOnce();
+  assert.equal(sent.action, "submitted");
+  const pause = await chain.rpc("eth_sendRawTransaction", [await signedCall(chain, localKeys.guardian, { to: bridge.vault,
+    data: VAULT.encodeFunctionData("pause"), gasPrice: 50_000_000_000n })]);
+  await chain.rpc("evm_mine", []);
+  const [ours, paused] = await receiptsOf(chain, [sent.transactionHash, pause]);
+  assert.equal(ours.status, "0x0"); assert.equal(ours.blockHash, paused.blockHash);
+  assert.ok(Number(paused.transactionIndex) < Number(ours.transactionIndex));
+  assert.equal((await rt.runOnce()).action, "pending");
+  await facts.mine(3);
+  const reverted = await rt.runOnce();
+  assert.equal(reverted.action, "reverted"); assert.equal(reverted.code, "vault_paused");
+  const ledger = facts.ledger();
+  try {
+    assert.equal(ledger.inspect(reverted.transferId).reasonCode, "vault_paused"); assert.equal(ledger.blocking().length, 0);
+  } finally { ledger.close(); }
+  assert.equal(facts.relay().state, "submitted");
+  assert.equal(await facts.nonce(), 1);
+  const next = await rt.runOnce(); // never ledger_requires_review
+  assert.equal(next.attention.reverted, 1);
 }));
 
 test("RPC disagreement on chain, code or vault state stops before any claim", options, () => scenario(async ({ proxies, runtime, facts, burns }) => {
@@ -837,3 +874,178 @@ test("an early send that reverts before the deadline for a lasting reason is tra
   assert.equal(next.action, "released_elsewhere");
   assert.equal(next.attention.reverted, 1);
 }, { burns: 2, approved: 1, deadlineOffset: 1_200, bridgeOptions: { maxRelease: AMOUNT, dailyLimit: (AMOUNT * 3n) / 2n } }));
+
+const PAUSED_SELECTOR = VAULT.getFunction("paused").selector;
+const resumeVault = async (chain, bridge, deadline) => included(chain, await signedCall(chain, localKeys.deployer, { to: bridge.vault,
+  data: VAULT.encodeFunctionData("resume", [0, deadline, controlSignatures({ vault: bridge.vault, action: "RESUME", payloadHash: ZeroHash,
+    nonce: 0, deadline, keys: [keys[0], keys[1]] })]) }));
+
+test("a known guardian pause still holds a signed row once the local deadline margin is lost; after the resume it ends expired, never failed", options, () => scenario(async ({ chain, bridge, runtime, facts, burns, approve }) => {
+  await assert.rejects((await runtime(stopAtSigned)).runOnce(), /stop/);
+  await included(chain, await signedCall(chain, localKeys.guardian, { to: bridge.vault, data: VAULT.encodeFunctionData("pause") }));
+  // Locally the deadline margin is lost, on chain the deadline has not passed.
+  const rt = await runtime({ offsetMs: (1_200 - 30) * 1_000 });
+  const held = await rt.runOnce();
+  assert.equal(held.action, "waiting"); assert.equal(held.code, "route_paused");
+  assert.equal(await facts.nonce(), 0); // nothing is sent into the pause
+  // The pause outlasts the approval; a quorum-signed resume follows.
+  await warp(chain, 1_300);
+  await resumeVault(chain, bridge, Math.floor(Date.now() / 1000) + 1_300 + 600);
+  const later = await runtime({ offsetMs: 1_300_000 + 10 * 60_000 });
+  assert.equal((await later.runOnce()).action, "submitted"); // the identical bytes, now past the deadline
+  await facts.mine(3);
+  assert.equal((await later.runOnce()).action, "expired");
+  const ledger = facts.ledger();
+  try {
+    assert.equal(ledger.inspect(burns[0].requestId).state, "expired"); assert.equal(ledger.blocking().length, 0);
+  } finally { ledger.close(); }
+  await approve(burns[1], Math.floor(Date.now() / 1000) + 1_300 + 600 + 1_800);
+  await completes(later, facts, burns[1]);
+  await assertSingleRelease(facts, burns[1]);
+  assert.equal(await facts.nonce(), 2);
+}, { burns: 2, approved: 1, deadlineOffset: 1_200 }));
+
+test("bytes sent without a readable pause flag that revert under the pause are non-blocking (vault_paused), never failed", options, () => scenario(async ({ chain, bridge, proxies, runtime, facts, burns }) => {
+  await assert.rejects((await runtime(stopAtSigned)).runOnce(), /stop/);
+  await included(chain, await signedCall(chain, localKeys.guardian, { to: bridge.vault, data: VAULT.encodeFunctionData("pause") }));
+  for (const proxy of proxies) {
+    proxy.hook = async ({ message, forward }) => (message.method === "eth_call" && message.params[0]?.data?.startsWith(PAUSED_SELECTOR)
+      ? JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code: -32005, message: "limit exceeded" } }) : forward());
+  }
+  const rt = await runtime({ offsetMs: (1_200 - 30) * 1_000 });
+  const sent = await rt.runOnce();
+  assert.equal(sent.action, "submitted"); // the pause read failed on every origin: our bytes are sent
+  for (const proxy of proxies) proxy.hook = null;
+  await facts.mine(3);
+  assert.equal((await chain.rpc("eth_getTransactionReceipt", [sent.transactionHash])).status, "0x0");
+  const reverted = await rt.runOnce();
+  assert.equal(reverted.action, "reverted"); assert.equal(reverted.code, "vault_paused");
+  const ledger = facts.ledger();
+  try {
+    assert.equal(ledger.inspect(burns[0].requestId).state, "reverted"); assert.equal(ledger.blocking().length, 0);
+  } finally { ledger.close(); }
+}, { deadlineOffset: 1_200 }));
+
+test("a vault condition that only appears after our transaction in its block is not taken as the revert cause", options, () => scenario(async ({ chain, bridge, runtime, facts }) => {
+  await chain.rpc("evm_setAutomine", [false]);
+  const rt = await runtime();
+  const sent = await rt.runOnce();
+  assert.equal(sent.action, "submitted");
+  const ours = await chain.rpc("eth_getTransactionByHash", [sent.transactionHash]);
+  await refuseTransfers(chain, bridge, { gasPrice: 50_000_000_000n }); // before ours: the real, unexplained cause
+  // After ours in the same block: governance lowers the release limit below the amount.
+  const limits = [AMOUNT / 2n, 5n * 10n ** 20n], deadline = Math.floor(Date.now() / 1000) + 600;
+  const signatures = controlSignatures({ vault: bridge.vault, action: "UPDATE_LIMITS", nonce: 0, deadline, keys: [keys[0], keys[1]],
+    payloadHash: keccak256(AbiCoder.defaultAbiCoder().encode(["uint256", "uint256"], limits)) });
+  const lowered = await chain.rpc("eth_sendRawTransaction", [await signedCall(chain, localKeys.guardian, { to: bridge.vault,
+    data: VAULT.encodeFunctionData("updateLimits", [...limits, 0, deadline, signatures]), gasPrice: BigInt(ours.gasPrice) - 1n })]);
+  await chain.rpc("evm_mine", []);
+  const [mine, theirs] = await receiptsOf(chain, [sent.transactionHash, lowered]);
+  assert.equal(mine.status, "0x0"); assert.equal(theirs.status, "0x1"); assert.equal(mine.blockHash, theirs.blockHash);
+  assert.ok(Number(mine.transactionIndex) < Number(theirs.transactionIndex));
+  assert.equal((await rt.runOnce()).action, "pending");
+  await facts.mine(3);
+  await assert.rejects(rt.runOnce(), (error) => error instanceof SubmissionHalt && error.code === "destination_execution_failed");
+  const ledger = facts.ledger();
+  try { assert.equal(ledger.blocking()[0].state, "failed"); } finally { ledger.close(); }
+}, { token: "adversarial" }));
+
+// Pruned origin for our own history: receipts and transactions mined before
+// `oldest` are no longer returned (null), and, with `state`, state reads at
+// such heights fail (JSON-RPC error). Recent history is served normally.
+function pruneOwnHistory(proxy, oldest, { receipts = true, state = false } = {}) {
+  const number = (value) => (typeof value === "string" && value.startsWith("0x") ? Number.parseInt(value, 16) : Number.POSITIVE_INFINITY);
+  proxy.hook = async ({ message, forward }) => {
+    if (state && message.method === "eth_call" && number(message.params[1]) < oldest) {
+      return JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: "missing trie node" } });
+    }
+    if (receipts && ["eth_getTransactionReceipt", "eth_getTransactionByHash"].includes(message.method)) {
+      return rewriteResult(await forward(), (result) => (result && number(result.blockNumber) < oldest ? null : result));
+    }
+    return forward();
+  };
+}
+
+test("our own receipt that an origin no longer serves after long downtime is a non-blocking alert, never pending forever", options, () => scenario(async ({ chain, proxies, runtime, facts, burns, approve }) => {
+  const rt = await runtime();
+  const sent = await rt.runOnce();
+  assert.equal(sent.action, "submitted");
+  await facts.settle();
+  const mined = await chain.rpc("eth_getTransactionReceipt", [sent.transactionHash]);
+  assert.equal(mined.status, "0x1");
+  await chain.rpc("anvil_mine", ["0x514"]); // downtime beyond releaseLookbackBlocks
+  pruneOwnHistory(proxies[1], Number.parseInt(await chain.rpc("eth_blockNumber"), 16) - 1_000);
+  const alert = await rt.runOnce();
+  assert.equal(alert.action, "release_unverified"); assert.equal(alert.code, "receipt_history_unserved");
+  const ledger = facts.ledger();
+  try {
+    const row = ledger.inspect(burns[0].requestId);
+    assert.equal(row.state, "release_unverified"); assert.equal(row.blockHash, mined.blockHash);
+    assert.equal(ledger.blocking().length, 0);
+  } finally { ledger.close(); }
+  assert.equal(facts.relay(burns[0]).state, "submitted"); // never completed without every origin's evidence
+  await approve(burns[1]);
+  const reports = [];
+  for (let i = 0; i < 8 && facts.relay(burns[1]).state !== "completed"; i++) { reports.push(await rt.runOnce()); await facts.mine(3); }
+  assert.equal(facts.relay(burns[1]).state, "completed");
+  assert.ok(reports.every((report) => report.attention.releaseUnverified === 1));
+  assert.equal(await facts.nonce(), 2);
+}, { burns: 2, approved: 1 }));
+
+test("a revert whose cause an origin can no longer read after long downtime is a non-blocking alert, never an endless temporary stop", options, () => scenario(async ({ chain, bridge, store, proxies, runtime, facts, burns, approve }) => {
+  await assert.rejects((await runtime(stopAtSigned)).runOnce(), /stop/);
+  await approve(burns[1], Math.floor(Date.now() / 1000) + 7_000);
+  await thirdPartyRelease(chain, bridge, store, burns[1]); // exhausts the daily release limit
+  const rt = await runtime({ offsetMs: (1_200 - 30) * 1_000 });
+  const sent = await rt.runOnce();
+  assert.equal(sent.action, "submitted");
+  await facts.settle();
+  assert.equal((await chain.rpc("eth_getTransactionReceipt", [sent.transactionHash])).status, "0x0");
+  await chain.rpc("anvil_mine", ["0x514"]); // downtime beyond releaseLookbackBlocks
+  pruneOwnHistory(proxies[1], Number.parseInt(await chain.rpc("eth_blockNumber"), 16) - 1_000, { receipts: false, state: true });
+  const alert = await rt.runOnce();
+  assert.equal(alert.action, "release_unverified"); assert.equal(alert.code, "revert_history_unserved");
+  const ledger = facts.ledger();
+  try {
+    assert.equal(ledger.inspect(burns[0].requestId).state, "release_unverified"); assert.equal(ledger.blocking().length, 0);
+  } finally { ledger.close(); }
+  await rt.runOnce(); // the queue moves on: no ledger_requires_review
+  assert.equal(facts.relay(burns[0]).state, "submitted");
+}, { burns: 2, approved: 1, deadlineOffset: 1_200, bridgeOptions: { maxRelease: AMOUNT, dailyLimit: (AMOUNT * 3n) / 2n } }));
+
+// A release of the burn to another recipient, signed by two of the three
+// signer keys (the signer-compromise case).
+async function compromisedRelease(chain, bridge, store, burn, otherRecipient, options = {}) {
+  const p = store.approvalRequest("xitcoin", burn.requestId).payload;
+  const digest = TypedDataEncoder.hash({ name: "Xitcoin Cronos Bridge Vault", version: "1", chainId: 338, verifyingContract: bridge.vault },
+    { Release: [{ name: "sourceBurnId", type: "bytes32" }, { name: "recipient", type: "address" }, { name: "amount", type: "uint256" },
+      { name: "signerSetVersion", type: "uint64" }, { name: "deadline", type: "uint256" }] },
+    { sourceBurnId: p.sourceBurnId, recipient: otherRecipient, amount: p.amount, signerSetVersion: p.signerSetVersion, deadline: p.deadline });
+  const signatures = [keys[0], keys[1]].map((key) => key.sign(digest).serialized);
+  return chain.rpc("eth_sendRawTransaction", [await signedCall(chain, localKeys.guardian, { to: bridge.vault, gasLimit: 400_000n,
+    data: RELEASE.encodeFunctionData("release", [p.sourceBurnId, otherRecipient, p.amount, p.signerSetVersion, p.deadline, signatures]), ...options })]);
+}
+
+test("a release with other fields than the approval halts even when an origin no longer serves that history", options, () => scenario(async ({ chain, bridge, store, proxies, runtime, facts, burns }) => {
+  await chain.rpc("evm_setAutomine", [false]);
+  const rt = await runtime();
+  const sent = await rt.runOnce();
+  assert.equal(sent.action, "submitted");
+  const foreign = await compromisedRelease(chain, bridge, store, burns[0], signers[1], { gasPrice: 50_000_000_000n });
+  await chain.rpc("evm_mine", []);
+  await chain.rpc("evm_setAutomine", [true]);
+  const [ours, theirs] = await receiptsOf(chain, [sent.transactionHash, foreign]);
+  assert.equal(ours.status, "0x0"); assert.equal(theirs.status, "0x1");
+  await warp(chain, 4_000);
+  await chain.rpc("anvil_mine", ["0x514"]); // downtime beyond releaseLookbackBlocks
+  pruneHistory(proxies[1], Number.parseInt(await chain.rpc("eth_blockNumber"), 16) - 1_000, { blocks: false });
+  const later = await runtime({ offsetMs: 4_000_000 + 10 * 60_000 });
+  await assert.rejects(later.runOnce(), (error) => error instanceof SubmissionHalt && error.code === "processed_with_mismatching_release");
+  await assert.rejects(later.runOnce(), (error) => error.code === "ledger_requires_review");
+  const ledger = facts.ledger();
+  try {
+    const [row] = ledger.blocking();
+    assert.equal(row.state, "halted"); assert.equal(row.reasonCode, "processed_with_mismatching_release");
+  } finally { ledger.close(); }
+  assert.equal(facts.relay(burns[0]).state, "submitted");
+}));

@@ -28,6 +28,8 @@ import { XitcoinFinalizedWatcher } from "./watchers.js";
 const VAULT = new Interface([
   "function release(bytes32 sourceBurnId,address recipient,uint256 amount,uint64 signerSetVersion,uint256 deadline,bytes[] signatures)",
   "event Released(bytes32 indexed sourceBurnId,address indexed recipient,uint256 amount,uint64 signerSetVersion)",
+  "event Paused(address account)",
+  "event Unpaused(address account)",
   "function paused() view returns (bool)",
   "function routeId() view returns (bytes32)",
   "function signerSetVersion() view returns (uint64)",
@@ -40,6 +42,8 @@ const VAULT = new Interface([
   "function releasedToday() view returns (uint256)",
 ]);
 const RELEASED_TOPIC = VAULT.getEvent("Released").topicHash;
+const PAUSED_TOPIC = VAULT.getEvent("Paused").topicHash;
+const UNPAUSED_TOPIC = VAULT.getEvent("Unpaused").topicHash;
 const ZERO_WORD = "0".repeat(64);
 const halt = (code) => ({ action: "halt", code });
 // Route-scoped waits stop the cycle; transfer-scoped waits defer only that
@@ -170,9 +174,19 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
   // match; the receipt must succeed and contain it; its block must be
   // canonical. Returns evidence, { mismatch }, { final: false }, null (nothing
   // in the searched windows) or { unreachable } (history no longer served).
+  //
+  // A Released event for this burn whose fields differ from the approval (or
+  // more than one) returned by ANY single origin is a mismatch and halts, even
+  // when other origins fail or do not serve that range: only a compromised
+  // signer quorum (or a lying origin, settled in the offline review) produces
+  // it, and a halt is preferred to a non-blocking alert. This is the one place
+  // where a single origin's answer persists a blocking state.
   async function releaseElsewhere(request, ownHash = null, ownBlock = null) {
     const p = request.payload, burn = String(p.sourceBurnId).toLowerCase();
     const expected = VAULT.encodeEventLog(VAULT.getEvent("Released"), [p.sourceBurnId, p.recipient, p.amount, p.signerSetVersion]);
+    const expectedTopics = stable(expected.topics.map((topic) => topic.toLowerCase())), expectedData = expected.data.toLowerCase();
+    const ofBurn = (logs) => logs.filter((log) => !log.removed && log.address === vault.toLowerCase()
+      && log.topics[0] === RELEASED_TOPIC && log.topics[1] === burn);
     const tip = await rpc.tip();
     const recent = Math.max(0, tip - cronos.releaseLookbackBlocks);
     let unreachable = false;
@@ -183,15 +197,29 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
     for (const anchor of anchors) {
       const lowest = Math.max(0, anchor - cronos.releaseLookbackBlocks);
       for (let to = anchor; to >= lowest; to -= cronos.logRangeBlocks) {
-        const from = Math.max(lowest, to - cronos.logRangeBlocks + 1);
-        const fetched = await historical(from < recent,
-          () => rpc.logs({ address: vault, topics: [RELEASED_TOPIC, burn], fromBlock: hex(from), toBlock: hex(to) }));
-        if (fetched === UNREACHABLE) { unreachable = true; break; }
-        const logs = fetched.filter((log) => !log.removed && log.address === vault.toLowerCase() && log.topics[0] === RELEASED_TOPIC && log.topics[1] === burn);
+        const from = Math.max(lowest, to - cronos.logRangeBlocks + 1), oldRange = from < recent;
+        const answers = await rpc.logsSettled({ address: vault, topics: [RELEASED_TOPIC, burn], fromBlock: hex(from), toBlock: hex(to) });
+        const found = answers.map((answer) => (answer.ok ? ofBurn(answer.value) : null));
+        if (found.some((logs) => logs !== null && (logs.length > 1
+            || logs.some((log) => stable(log.topics) !== expectedTopics || log.data !== expectedData)))) return { mismatch: true };
+        if (found.some((logs) => logs === null)) {
+          // Recent history must be served; an old range an origin explicitly
+          // refuses makes the search unreachable. The origins that do serve
+          // it are still searched further back for a mismatching release.
+          const failure = answers.find((answer) => !answer.ok && !(oldRange && answer.explicit));
+          if (failure) throw failure.error;
+          unreachable = true;
+          if (found.every((logs) => logs === null)) break;
+          continue;
+        }
+        if (found.some((logs) => stable(logs) !== stable(found[0]))) {
+          if (!oldRange) throw new RpcDisagreement();
+          unreachable = true;
+          continue;
+        }
+        const logs = found[0];
         if (!logs.length) continue;
         const log = logs[0];
-        if (logs.length > 1 || stable(log.topics) !== stable(expected.topics.map((topic) => topic.toLowerCase()))
-            || log.data !== expected.data.toLowerCase()) return { mismatch: true };
         if (log.transactionHash === ownHash) return { final: false };
         const old = log.blockNumber < recent;
         const receipts = await historical(old, () => rpc.receipts(log.transactionHash));
@@ -211,29 +239,57 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
   }
   const released = (evidence) => ({ action: "released_elsewhere", releaseHash: evidence.releaseHash,
     blockNumber: evidence.blockNumber, blockHash: evidence.blockHash });
+  // Processed, yet no matching release in the searched windows (or that
+  // history is no longer served): a persistent, non-blocking alert.
+  const unverifiedRelease = (evidence, inclusion = {}) => ({ action: "release_unverified",
+    code: evidence?.unreachable ? "release_history_unserved" : "release_not_found", ...inclusion });
 
   // Latest block timestamps from the origins that answer (a strict majority).
   async function latestTimes() {
     return (await rpc.majorityAnswers("eth_getBlockByNumber", ["latest", false], normalizeBlock)).map((block) => block.timestamp);
   }
 
-  // A vault condition at the inclusion block, identical on every origin, that
-  // explains a revert and belongs to this transfer. It never authorizes a new
-  // transaction: the transfer is only parked without blocking the queue.
-  async function lastingRevertCause(request, receipt, block, tx) {
+  // A vault condition, identical on every origin, that explains a revert of
+  // our transaction and is not a relayer fault: a guardian pause, or a lasting
+  // condition of this transfer. It never authorizes a new transaction: the
+  // transfer is only parked without blocking the queue. Returns the code, null
+  // (unexplained: `failed`, which blocks) or UNREACHABLE when that history is
+  // older than the recent window and no longer served.
+  //
+  // Standard RPC cannot read state at a position inside a block. The pause is
+  // reconstructed exactly: the vault changes it only with Paused and Unpaused
+  // events, replayed from the state at the end of the previous block up to our
+  // transaction index (and checked against the state at the end of the
+  // inclusion block). Limits, signer set and liquidity count only when the
+  // condition holds both at the end of the previous block and at the end of
+  // the inclusion block, so a change made by another transaction in the same
+  // block is never taken as the cause; such a revert stays `failed` for review.
+  async function lastingRevertCause(request, receipt, block, tx, recent) {
     if (BigInt(receipt.gasUsed) >= tx.gasLimit) return null; // out of gas: a gas policy problem for every transfer
-    const at = receipt.blockNumber;
-    // A pause is a route-wide guardian incident, not a condition of this
-    // transfer: a revert under a pause stays `failed` for operator review.
-    const [version, maxRelease, dailyLimit, day, releasedToday, liquidity] = await Promise.all(
-      ["signerSetVersion", "maxReleaseAmount", "dailyReleaseLimit", "releaseDay", "releasedToday", "availableLiquidity"]
-        .map((name) => rpc.call(view(name), at)));
-    const amount = BigInt(request.payload.amount);
-    if (uint(version).toString() !== String(request.payload.signerSetVersion)) return "signer_set_rotated";
-    if (amount > uint(maxRelease)) return "release_limit_exceeded";
-    if (uint(day) === BigInt(block.timestamp) / 86_400n && uint(releasedToday) + amount > uint(dailyLimit)) return "daily_release_limit_exhausted";
-    if (uint(liquidity) < amount) return "insufficient_vault_liquidity";
-    return null;
+    const at = receipt.blockNumber, before = at - 1;
+    const names = ["paused", "signerSetVersion", "maxReleaseAmount", "dailyReleaseLimit", "releaseDay", "releasedToday", "availableLiquidity"];
+    const read = await historical(before < recent, () => Promise.all([
+      ...[before, at].map((height) => Promise.all(names.map((name) => rpc.call(view(name), height)))),
+      rpc.logs({ address: vault, topics: [[PAUSED_TOPIC, UNPAUSED_TOPIC]], fromBlock: hex(at), toBlock: hex(at) })]));
+    if (read === UNREACHABLE) return UNREACHABLE;
+    const [previous, end] = read.slice(0, 2).map(([paused, version, maxRelease, dailyLimit, day, releasedToday, liquidity]) => ({
+      paused: boolean(paused), version: uint(version), maxRelease: uint(maxRelease), dailyLimit: uint(dailyLimit),
+      day: uint(day), releasedToday: uint(releasedToday), liquidity: uint(liquidity) }));
+    const transitions = read[2].filter((log) => !log.removed && log.address === vault.toLowerCase() && log.blockHash === receipt.blockHash
+      && [PAUSED_TOPIC, UNPAUSED_TOPIC].includes(log.topics[0]))
+      .sort((a, b) => a.transactionIndex - b.transactionIndex || a.logIndex - b.logIndex);
+    const replay = (logs) => logs.reduce((paused, log) => log.topics[0] === PAUSED_TOPIC, previous.paused);
+    if (replay(transitions) === end.paused && replay(transitions.filter((log) => log.transactionIndex < receipt.transactionIndex))) {
+      return "vault_paused";
+    }
+    const amount = BigInt(request.payload.amount), today = BigInt(block.timestamp) / 86_400n;
+    const causes = [
+      ["signer_set_rotated", (state) => state.version.toString() !== String(request.payload.signerSetVersion)],
+      ["release_limit_exceeded", (state) => amount > state.maxRelease],
+      ["daily_release_limit_exhausted", (state) => (state.day === today ? state.releasedToday : 0n) + amount > state.dailyLimit],
+      ["insufficient_vault_liquidity", (state) => state.liquidity < amount],
+    ];
+    return causes.find(([, holds]) => holds(previous) && holds(end))?.[0] ?? null;
   }
 
   // False only when every origin reports an execution revert.
@@ -313,7 +369,7 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
         // Processed at a finalized height yet no matching release in the
         // searched window: a persistent, non-blocking alert, never a completion.
         const finalized = Math.max(0, await rpc.tip() - cronos.confirmations);
-        if (boolean(await rpc.call(view("processedBurns", [transferId]), finalized))) return { action: "release_unverified" };
+        if (boolean(await rpc.call(view("processedBurns", [transferId]), finalized))) return unverifiedRelease(evidence);
         return defer("release_elsewhere_not_final");
       }
       if (state.processedAny) return defer("replay_state_unsettled");
@@ -365,10 +421,18 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
 
     async beforeFirstSend({ row, request, nowUnix }) {
       const tx = parseStored(row);
-      // Once the local clock says the approval margin is lost, send the stored
-      // bytes without consulting any origin: sending our own committed bytes is
-      // never unsafe, and no origin fault can keep their reserved nonce unused.
-      if (request.deadlineUnix < nowUnix + margin) return { action: "send" };
+      // Once the local clock says the approval margin is lost, the stored bytes
+      // are sent even if origins fail: sending our own committed bytes is never
+      // unsafe, and no origin fault can keep their reserved nonce unused. A
+      // guardian pause that a strict majority reports is still honoured (after
+      // the resume the bytes are sent and, past the deadline, end `expired`);
+      // only when that read fails are the bytes sent without it.
+      if (request.deadlineUnix < nowUnix + margin) {
+        let paused = false;
+        try { paused = boolean((await rpc.majority("eth_call", [view("paused"), "latest"], returnData)).value); }
+        catch { paused = false; } // reads failed: send blind
+        return paused ? wait("route_paused") : { action: "send" };
+      }
       // Strict-majority reads: with three or more origins one faulty origin
       // cannot hold the row until its approval expires. They only decide to
       // proceed or wait; a persisted halt still needs every origin to agree.
@@ -400,8 +464,12 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
     async observe({ row, request, nowUnix }) {
       await rpc.chainId();
       const tx = parseStored(row);
-      const receipts = await rpc.receipts(row.transactionHash);
-      if (receipts.every((receipt) => receipt === null)) {
+      const answers = await rpc.receiptsSettled(row.transactionHash);
+      const present = answers.filter((answer) => answer.ok && answer.value !== null).map((answer) => answer.value);
+      if (!present.length) {
+        // No origin returns our receipt: every origin must answer.
+        const failure = answers.find((answer) => !answer.ok);
+        if (failure) throw failure.error;
         const seen = await rpc.transactions(row.transactionHash);
         if (seen.some((observed) => observed && !matchesProvider(observed, tx))) throw unavailable("rpc_transaction_mismatch");
         if (seen.some(Boolean)) return { action: "pending" };
@@ -432,27 +500,50 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
         if (row.broadcastAttempts >= cronos.maxBroadcastAttempts) return halt("broadcast_attempts_exhausted");
         return { action: "rebroadcast" };
       }
-      const present = receipts.filter(Boolean);
       if (present.some((receipt) => stable(receipt) !== stable(present[0]))) throw new RpcDisagreement();
-      if (present.length !== receipts.length) return { action: "pending" }; // indexing lag
       const receipt = present[0];
-      if (receipt.transactionHash !== row.transactionHash || receipt.from !== submitter.toLowerCase()
-          || receipt.to !== vault.toLowerCase() || receipt.contractAddress !== null) return halt("receipt_mismatch");
-      const included = await rpc.transactions(row.transactionHash);
-      if (included.some((observed) => observed === null)) return { action: "pending" };
+      const ours = receipt.transactionHash === row.transactionHash && receipt.from === submitter.toLowerCase()
+        && receipt.to === vault.toLowerCase() && receipt.contractAddress === null;
+      const tip = await rpc.tip();
+      const recent = Math.max(0, tip - cronos.releaseLookbackBlocks);
+      const old = receipt.blockNumber < recent;
+      const inclusion = { blockNumber: receipt.blockNumber, blockHash: receipt.blockHash };
+      // Our own history (receipt, included transaction, block) that some
+      // origins no longer serve once it is older than the recent window (a
+      // pruned node, or downtime longer than an origin's retention). Recent
+      // history must be served by every origin (missing is indexing lag) and
+      // transport failures stay temporary. Otherwise, with our nonce consumed
+      // on every origin, the row becomes a persistent non-blocking alert
+      // instead of a temporary stop repeated forever; never a completion.
+      const unserved = async (missing, consistent) => {
+        const failure = missing.find((answer) => !answer.ok && !(old && answer.explicit));
+        if (failure) throw failure.error;
+        if (!old) return { action: "pending" };
+        const nonces = await accountNonces();
+        if (!consistent || !nonces || nonces.latest <= row.nonce) throw new RpcDisagreement();
+        return { action: "release_unverified", code: "receipt_history_unserved", ...inclusion };
+      };
+      const missing = (results) => results.filter((answer) => !answer.ok || answer.value === null);
+      if (present.length !== answers.length) return unserved(missing(answers), ours);
+      if (!ours) return halt("receipt_mismatch");
+      const transactions = await rpc.transactionsSettled(row.transactionHash);
+      const included = transactions.filter((answer) => answer.ok && answer.value !== null).map((answer) => answer.value);
       // Persist a mismatch only when every origin returns the same object.
       if (included.some((observed) => stable(observed) !== stable(included[0]))) throw new RpcDisagreement();
+      if (included.length !== transactions.length) {
+        return unserved(missing(transactions), included.every((observed) => matchesProvider(observed, tx)
+          && observed.blockHash === receipt.blockHash && observed.blockNumber === receipt.blockNumber));
+      }
       if (!matchesProvider(included[0], tx)) return halt("included_transaction_mismatch");
       if (included.some((observed) => observed.blockHash !== receipt.blockHash || observed.blockNumber !== receipt.blockNumber)) {
         return { action: "pending" };
       }
-      const tip = await rpc.tip();
-      const block = await rpc.block(receipt.blockNumber);
+      const block = await historical(old, () => rpc.block(receipt.blockNumber));
+      if (block === UNREACHABLE) return unserved([], true);
       if (block.hash !== receipt.blockHash) return { action: "pending" }; // reorganizing
       if (receipt.status === "0x1" && !releasedMatches(receipt, request)) return halt("release_event_mismatch");
       const finalizedHeight = tip - cronos.confirmations;
       if (receipt.blockNumber > finalizedHeight) return { action: "pending" };
-      const inclusion = { blockNumber: receipt.blockNumber, blockHash: receipt.blockHash };
       if (receipt.status === "0x0") {
         // A revert because another finalized transaction already released this
         // transfer (for example a front-run copying our calldata) is not a failure.
@@ -463,16 +554,17 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
           // recent window, never the whole chain. Evidence that is absent or
           // whose history is no longer served becomes a persistent non-blocking
           // alert instead of a temporary stop repeated forever.
-          if (!evidence || evidence.unreachable) return { action: "release_unverified", ...inclusion };
+          if (!evidence || evidence.unreachable) return unverifiedRelease(evidence, inclusion);
           return evidence.final ? released(evidence) : { action: "pending" };
         }
         // Mined after the approval deadline (agreed block timestamp): the
         // approval expired; our nonce is consumed and the queue moves on.
         if (block.timestamp > request.deadlineUnix) return { action: "expired", ...inclusion };
-        // Mined before the deadline: a lasting condition of this transfer at the
-        // inclusion block (every origin agreeing) is transfer-specific and does
+        // Mined before the deadline: a guardian pause or a lasting condition of
+        // this transfer when our transaction ran (every origin agreeing) does
         // not block the queue. Out of gas or an unexplained revert still does.
-        const cause = await lastingRevertCause(request, receipt, block, tx);
+        const cause = await lastingRevertCause(request, receipt, block, tx, recent);
+        if (cause === UNREACHABLE) return { action: "release_unverified", code: "revert_history_unserved", ...inclusion };
         return cause ? { action: "reverted", code: cause, ...inclusion } : { action: "failed", ...inclusion };
       }
       if (!boolean(await rpc.call(view("processedBurns", [row.transferId]), finalizedHeight))) return halt("replay_flag_missing_after_release");

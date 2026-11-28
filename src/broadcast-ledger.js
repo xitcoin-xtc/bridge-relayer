@@ -24,14 +24,16 @@ import { PrivateJournalPath } from "./journal-path.js";
 //   - a claimed row without bytes may be `unclaimed` (never sent, no nonce) and
 //     claimed again later, so an expired approval never holds the queue;
 //   - `expired` (our identical bytes were mined and reverted after the approval
-//     deadline, consuming their nonce) and `release_unverified` (the destination
-//     reports the transfer processed but no matching release was found) are
+//     deadline, consuming their nonce) and `release_unverified` (the outcome
+//     could not be verified: the destination reports the transfer processed but
+//     no matching release was found, or history about our mined transaction is
+//     no longer served; the reason code is kept in the event history) are
 //     permanent, never block the queue and are reported for operator attention;
 //   - `reverted`: our identical bytes were mined before the deadline and
-//     reverted for a lasting, transfer-specific vault condition (daily limit,
-//     liquidity, release limit, signer rotation). Their nonce is
-//     consumed; permanent, non-blocking and reported for attention. Any other
-//     revert stays `failed`, which blocks.
+//     reverted under a guardian pause or for a lasting, transfer-specific vault
+//     condition (daily limit, liquidity, release limit, signer rotation). Their
+//     nonce is consumed; permanent, non-blocking and reported for attention.
+//     Any other revert stays `failed`, which blocks.
 // Destination adapters validate the bytes; this module treats them as opaque.
 const failure = () => new Error("broadcast ledger unavailable or conflicting");
 const HASH = /^0x[0-9a-f]{64}$/;
@@ -491,14 +493,18 @@ export class BroadcastLedger {
     }, lease);
   }
 
-  // The destination reports the transfer processed but no matching release
-  // could be verified. Never a completion: permanent, non-blocking, reported
-  // for operator attention. With bytes, only after they were mined (reverted).
+  // The outcome of the transfer could not be verified: the destination
+  // reports it processed but no matching release was found, or the history
+  // needed to classify our mined transaction is no longer served. Never a
+  // completion: permanent, non-blocking, reported for operator attention. With
+  // bytes, only after they were mined. The optional reason code is recorded in
+  // the transfer's event history (the row's reason column stays empty).
   releaseUnverified(lease, input) {
-    const { transferId, sourceRef: source, approvalDigest, requestHash, blockNumber, blockHash } =
-      identityOf(input, ["blockNumber", "blockHash"]);
+    const { transferId, sourceRef: source, approvalDigest, requestHash, blockNumber, blockHash, code: reason = null } =
+      identityOf(input, Object.hasOwn(input ?? {}, "code") ? ["blockNumber", "blockHash", "code"] : ["blockNumber", "blockHash"]);
     const included = blockHash !== null;
     if (included ? !hash(blockHash) || !Number.isSafeInteger(blockNumber) || blockNumber < 0 : blockNumber !== null) throw failure();
+    if (reason !== null && (typeof reason !== "string" || !CODE.test(reason))) throw failure();
     return this.#transaction(() => {
       const existing = this.#existing(transferId, source);
       const now = Math.floor(Date.now() / 1000);
@@ -513,7 +519,7 @@ export class BroadcastLedger {
         this.#database.prepare(`UPDATE transfers SET state = 'release_unverified', block_number = ?, block_hash = ?, updated_at = ?
           WHERE transfer_id = ? AND state = 'broadcast'`).run(blockNumber, blockHash, now, transferId);
       } else throw failure();
-      this.#event(transferId, "release_unverified", "release_unverified", lease.epoch);
+      this.#event(transferId, "release_unverified", reason ?? "release_unverified", lease.epoch);
       return this.#snapshot(this.#raw(transferId));
     }, lease);
   }

@@ -244,6 +244,30 @@ for (const destination of ["cronos", "xitcoin"]) {
     ledger.close();
   }));
 
+  test(`${destination}: an unverified outcome keeps its reason in the transfer history, never in a blocking state`, () => fixture((path) => {
+    const ledger = open(path, destination);
+    const lease = ledger.acquireLease(owner(1));
+    ledger.claim(lease, claimOf(hash("1")));
+    ledger.recordSigned(lease, signed(hash("1"), 0));
+    ledger.markBroadcast(lease, hash("1"), { maxAttempts: 1 });
+    for (const code of ["", "Upper", "x".repeat(65), 5, "a b"]) {
+      assert.throws(() => ledger.releaseUnverified(lease, { ...claimOf(hash("1")), blockNumber: 7, blockHash: hash("e"), code }), failure);
+    }
+    assert.throws(() => ledger.releaseUnverified(lease, { ...claimOf(hash("1")), blockNumber: 7, blockHash: hash("e"), code: "x", extra: 1 }), failure);
+    const row = ledger.releaseUnverified(lease, { ...claimOf(hash("1")), blockNumber: 7, blockHash: hash("e"), code: "receipt_history_unserved" });
+    assert.equal(row.state, "release_unverified"); assert.equal(row.reasonCode, null); assert.equal(row.blockNumber, 7);
+    ledger.releaseUnverified(lease, { ...claimOf(hash("2")), blockNumber: null, blockHash: null, code: null });
+    assert.deepEqual({ ...ledger.attention() }, { rejected: 0, expired: 0, releaseUnverified: 2, reverted: 0 });
+    assert.equal(ledger.blocking().length, 0);
+    ledger.close();
+    const raw = new DatabaseSync(path, { readOnly: true });
+    try {
+      const events = raw.prepare("SELECT transfer_id, code FROM transfer_events WHERE state = 'release_unverified' ORDER BY seq").all();
+      assert.deepEqual(events.map((event) => [event.transfer_id, event.code]),
+        [[hash("1"), "receipt_history_unserved"], [hash("2"), "release_unverified"]]);
+    } finally { raw.close(); }
+  }));
+
   test(`${destination}: lease fencing rejects every write from a previous holder`, () => fixture((path) => {
     const first = open(path, destination), second = open(path, destination);
     const now = 1_000_000;

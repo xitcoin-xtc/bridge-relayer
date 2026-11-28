@@ -149,10 +149,11 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
   // The destination reports the transfer processed but no matching release was
   // verified: never a completion. RelayStore is left unchanged (in flight).
   async function releaseUnverified(stored, transferId, observed) {
+    const reason = observed.code === undefined ? null : code(observed.code);
     const row = ledger.releaseUnverified(lease, { ...identity(stored, transferId),
-      blockNumber: observed.blockNumber ?? null, blockHash: observed.blockHash ?? null });
+      blockNumber: observed.blockNumber ?? null, blockHash: observed.blockHash ?? null, code: reason });
     await boundary("ledger-release-unverified");
-    return report("release_unverified", { transferId, transactionHash: row.transactionHash });
+    return report("release_unverified", { transferId, transactionHash: row.transactionHash, ...(reason ? { code: reason } : {}) });
   }
 
   async function reject(stored, transferId, rejectCode) {
@@ -217,7 +218,7 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
     if (assessed.action === "halt") await halt(transferId, stored, assessed.code);
     if (assessed.action === "reject") return reject(stored, transferId, assessed.code);
     if (assessed.action === "released_elsewhere") return releasedElsewhere(stored, transferId, claimedRow, assessed);
-    if (assessed.action === "release_unverified") return releaseUnverified(stored, transferId, {});
+    if (assessed.action === "release_unverified") return releaseUnverified(stored, transferId, { code: assessed.code });
     if (assessed.action === "wait") return report("waiting", { transferId, code: code(assessed.code), defer: assessed.defer === true });
     const claimed = ledger.claim(lease, identity(stored, transferId));
     await boundary("claimed");
