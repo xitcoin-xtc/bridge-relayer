@@ -21,9 +21,28 @@ import {
 
 export const APPROVAL_PROTOCOL_VERSION = 1;
 // An expired approval request is re-issued (new deadline, same source event)
-// only this long after its deadline, so destination block time that lags the
-// relayer clock cannot still accept the previous approval.
+// only this long after its deadline by the local clock. It is a cheap first
+// filter: a re-issue is signed only after the destination itself shows the
+// previous approval dead (src/approval-retirement.js).
 export const APPROVAL_REISSUE_GRACE_SECONDS = 120;
+
+// The explicit re-issue declaration sent to signers next to (never inside)
+// the canonical request: the approval it replaces, as the coordinator knows
+// it. A signer signs a second digest for one source event only with this
+// declaration, a strictly later deadline and its own destination check.
+export function reissueDeclaration(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new Error("re-issue declaration is invalid");
+  }
+  const keys = Object.keys(value);
+  if (keys.length !== 2 || !keys.includes("previousDigest") || !keys.includes("previousDeadlineUnix")) {
+    throw new Error("re-issue declaration is invalid");
+  }
+  const previousDigest = String(value.previousDigest);
+  if (!/^0x[0-9a-f]{64}$/.test(previousDigest)) throw new Error("re-issue declaration is invalid");
+  if (!Number.isSafeInteger(value.previousDeadlineUnix) || value.previousDeadlineUnix < 1) throw new Error("re-issue declaration is invalid");
+  return Object.freeze({ previousDigest, previousDeadlineUnix: value.previousDeadlineUnix });
+}
 
 function positiveInteger(value, label, minimum = 1) {
   const number = Number(value);
@@ -152,6 +171,7 @@ export async function collectApprovalQuorum({
   authorizedSigners,
   threshold = 2,
   nowUnix = Math.floor(Date.now() / 1000),
+  reissue = null,
 }) {
   const allowed = signerSet(authorizedSigners);
   const required = positiveInteger(threshold, "approval threshold");
@@ -167,7 +187,13 @@ export async function collectApprovalQuorum({
   if (expected.deadlineUnix < positiveInteger(nowUnix, "current time", 0)) {
     throw new Error("approval request has expired");
   }
-  const responses = await Promise.allSettled(clients.map((client) => client.approve(expected)));
+  // A re-issued request carries its explicit declaration to every signer.
+  const declaration = reissue === null ? null : reissueDeclaration(reissue);
+  if (declaration && (declaration.previousDigest === expected.digest || declaration.previousDeadlineUnix >= expected.deadlineUnix)) {
+    throw new Error("a re-issued approval request needs a new digest and a strictly later deadline");
+  }
+  const outgoing = declaration ? Object.freeze({ ...expected, reissue: declaration }) : expected;
+  const responses = await Promise.allSettled(clients.map((client) => client.approve(outgoing)));
   // One unavailable, malformed, unauthorized or duplicate response must not
   // sink the round: each response is verified on its own and only distinct
   // valid signers count toward the threshold.

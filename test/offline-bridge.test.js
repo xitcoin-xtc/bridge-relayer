@@ -70,9 +70,13 @@ test('offline process: deposit, finality, quorum, mint, burn, return and persist
     const first = await ok({ op: 'approve', ref: second.ref, deadline: 2000, now: 1000 });
     await worker.close(); worker = await start(join(dir, 'synthetic-state.json'));
     await reject({ op: 'mint', ref: second.ref, deadline: 2000, now: 2100 }, /expired/);
+    const reissue = { previousDigest: first.digest, previousDeadlineUnix: 2000 };
     // Inside the re-issue grace window the signers still refuse a new deadline.
-    await reject({ op: 'mint', ref: second.ref, deadline: 2600, now: 2100 }, /unexpired approval|quorum not reached/);
-    const reissued = await ok({ op: 'mint', ref: second.ref, deadline: 2600, now: 2200 });
+    // (Signer refusals reach the coordinator as unavailable signers.)
+    await reject({ op: 'mint', ref: second.ref, deadline: 2600, now: 2100, reissue }, /quorum not reached/);
+    // After it, the identical new deadline is refused unless it is an explicit re-issue.
+    await reject({ op: 'mint', ref: second.ref, deadline: 2600, now: 2200 }, /quorum not reached/);
+    const reissued = await ok({ op: 'mint', ref: second.ref, deadline: 2600, now: 2200, reissue });
     assert.equal(reissued.key, first.key);
     assert.notEqual(reissued.digest, first.digest);
     await reject({ op: 'mint', ref: second.ref, deadline: 2700, now: 2300 }, /replay/);

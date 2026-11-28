@@ -17,7 +17,7 @@ export class ModelChain {
   constructor() {
     Object.assign(this, { height: 100, nonce: 0, paused: false, mempool: new Map(), receipts: new Map(),
       processed: new Map(), deliveries: [], foreign: 0, failNext: false, sendMode: "deliver", invalid: new Set(),
-      time: 1_900_000_000, unverified: new Set() });
+      time: 1_900_000_000, unverified: new Set(), short: new Set() });
   }
   receive(signedHex) {
     const hash = keccak256(signedHex);
@@ -82,7 +82,16 @@ export function modelAdapter(destination, chain, { maxBroadcastAttempts = 3, con
       if (chain.unverified.has(id)) return { action: "release_unverified" };
       if (chain.processed.has(id)) return elsewhere(id, null);
       if (request.deadlineUnix < nowUnix + marginSeconds) return { action: "wait", code: "approval_expired_awaiting_reissue", defer: true };
+      if (chain.short.has(id)) return { action: "wait", code: "insufficient_vault_liquidity", defer: true };
       return { action: "sign", context: { ok: true } };
+    },
+    // Only the release-by-another-transaction evidence; never decides to sign.
+    async releasedElsewhere({ transferId: id }) {
+      if (chain.rpcFailure) throw new Error("rpc_disagreement");
+      chain.elsewhereChecks = (chain.elsewhereChecks ?? 0) + 1;
+      if (chain.unverified.has(id)) return { action: "release_unverified", code: "release_not_found" };
+      if (!chain.processed.has(id)) return { action: "wait", code: "release_elsewhere_not_found", defer: true };
+      return elsewhere(id, null);
     },
     async sign({ request, transferId: id, expectedNonce, context }) {
       if (!context?.ok) throw new Error("missing context");
@@ -164,6 +173,21 @@ export function approvedTransfer(store, destination, index = 1, { deadlineUnix =
   for (const approval of sign(request)) store.recordApproval(sourceChain, sourceRef, approval);
   store.transition(sourceChain, sourceRef, "approved");
   return { sourceChain, sourceRef, request };
+}
+
+// The coordinator side of an approved-transfer re-issue, after its
+// destination proof: the transfer returns to finalized with a re-issued
+// request for the same source event and is approved again.
+export function reapproveTransfer(store, sourceChain, sourceRef, { deadlineUnix, nowUnix }) {
+  const previous = store.approvalRequest(sourceChain, sourceRef);
+  const transfer = store.get(sourceChain, sourceRef);
+  const next = buildTransferApprovalRequest({ transfer: { ...transfer, state: "finalized" }, routeId: XITCOIN_TESTNET_ROUTE_ID,
+    cronosRouteId: TESTNET_ROUTE_ID, cronosChainId: 338, cronosVault: "0x1c94273C0b199b139D82da3786C9eCbE189D5919",
+    xitcoinChainId: "xitcoin-testnet-v2-1", signerSetVersion: 1, deadlineUnix });
+  store.returnForReissue(sourceChain, sourceRef, previous, next, { nowUnix });
+  for (const approval of sign(next)) store.recordApproval(sourceChain, sourceRef, approval);
+  store.transition(sourceChain, sourceRef, "approved");
+  return next;
 }
 
 export function openStore(path) { return new RelayStore(path); }

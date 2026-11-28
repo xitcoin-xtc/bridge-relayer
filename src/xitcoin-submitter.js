@@ -251,6 +251,22 @@ export function createXitcoinAdapter({ manifest, rpc, signer, verifySource }) {
   const released = (evidence) => ({ action: "released_elsewhere", releaseHash: evidence.releaseHash,
     blockNumber: evidence.blockNumber, blockHash: evidence.blockHash });
 
+  // The deposit already processed by another transaction: completes with that
+  // transaction's verified record; a mismatching record halts; processed
+  // before records were kept is a persistent, non-blocking alert (minted, but
+  // by which transaction cannot be verified). Null while absent.
+  async function processedElsewhere(request, approvals) {
+    const state = await attestationState(request, approvals);
+    if (state.mismatch) return halt("processed_with_mismatching_record");
+    if (state.unsettled) return defer("replay_state_unsettled");
+    if (state.withoutRecord) return { action: "release_unverified", code: "processed_without_record" };
+    if (state.processed) {
+      const evidence = await releasedElsewhere(state.processed);
+      return evidence.final ? released(evidence) : defer("release_elsewhere_not_final");
+    }
+    return null;
+  }
+
   // The lowest height whose committed state shows our sequence consumed (the
   // block that consumed it), searched within the last `historyBlocks` blocks
   // with height-pinned reads every origin agrees on; null when it was consumed
@@ -464,16 +480,8 @@ export function createXitcoinAdapter({ manifest, rpc, signer, verifySource }) {
       if (!route.usable) return wait("route_paused");
       const amount = BigInt(request.payload.amount);
       if (amount > BigInt(x.maxAmount) || amount > route.maxTransferAmount) return defer("amount_above_transfer_limit");
-      const state = await attestationState(request, approvals);
-      if (state.mismatch) return halt("processed_with_mismatching_record");
-      if (state.unsettled) return defer("replay_state_unsettled");
-      // Processed before the processing records existed: minted, but by which
-      // transaction cannot be verified. A persistent, non-blocking alert.
-      if (state.withoutRecord) return { action: "release_unverified", code: "processed_without_record" };
-      if (state.processed) {
-        const evidence = await releasedElsewhere(state.processed);
-        return evidence.final ? released(evidence) : defer("release_elsewhere_not_final");
-      }
+      const elsewhere = await processedElsewhere(request, approvals);
+      if (elsewhere) return elsewhere;
       const chainTime = Math.max(...statuses.map((status) => status.time));
       if (request.deadlineUnix < Math.max(nowUnix, chainTime) + margin) return defer("approval_expired_awaiting_reissue");
       const [usages, outstandings] = await Promise.all([rpc.dailyUsages(), rpc.outstandings()]);
@@ -496,6 +504,17 @@ export function createXitcoinAdapter({ manifest, rpc, signer, verifySource }) {
       if (feeAmount > maxFee) return wait("fee_above_cap");
       if (min(await rpc.balances(submitter)) < feeAmount) return wait("submitter_balance_insufficient");
       return { action: "sign", context: Object.freeze({ gasLimit: gasLimit.toString(), feeAmount: feeAmount.toString() }) };
+    },
+
+    // For a deposit whose approval this submitter gave up and which the chain
+    // already shows processed (the coordinator's re-issue proof found it):
+    // only the processed-by-another-transaction evidence, whatever the
+    // approval's deadline. Never decides to sign.
+    async releasedElsewhere({ transfer, request, approvals, transferId }) {
+      await rpc.chainId();
+      if (!storedRequestMatches(transfer, request, approvals)
+          || transferId !== attestationId({ ...request.payload, direction: request.direction })) return halt("stored_request_mismatch");
+      return (await processedElsewhere(request, approvals)) ?? defer("release_elsewhere_not_found");
     },
 
     async sign({ request, approvals, nowUnix, context, expectedNonce }) {

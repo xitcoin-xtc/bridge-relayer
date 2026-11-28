@@ -17,9 +17,10 @@ import { XitcoinRpcQuorum } from "./xitcoin-rpc.js";
 //     checked against the pinned hash at that height;
 //   - Xitcoin: the bridge module's `outstanding_amount` and the route's daily
 //     usage (`/xitcoin/bridge/v1/outstanding`, `/xitcoin/bridge/v1/daily_usage`)
-//     at the lowest committed height across origins (CometBFT commits are
-//     final), pinned with `x-cosmos-block-height`, with that block agreed by
-//     every origin.
+//     one block below the lowest height any origin reports (CometBFT stores a
+//     block before the application commits it, so the reported height may
+//     not be queryable yet; commits are final), pinned with
+//     `x-cosmos-block-height`, with that block agreed by every origin.
 // A missing, failing or invalid origin answer is `unavailable`; different
 // valid answers are a `disagreement`; a vault code or route that is not the
 // pinned one is an `identity_mismatch`. None of them is evidence of a deficit.
@@ -95,7 +96,7 @@ export function createXitcoinBridgeReader({ rpc, routeId = XITCOIN_TESTNET_ROUTE
   return Object.freeze({
     async chainOutstanding() {
       try {
-        const height = Math.min(...(await rpc.chainId()).map((status) => status.height));
+        const height = Math.min(...(await rpc.chainId()).map((status) => status.height)) - 1;
         if (!Number.isSafeInteger(height) || height < 1) throw new ReconciliationReadError("unavailable", "xitcoin_history_too_short");
         const block = await rpc.block(height);
         const outstanding = agreed(await rpc.outstandings(height), "xitcoin", "outstanding");

@@ -30,6 +30,12 @@ import { XITCOIN_TESTNET_ROUTE_ID } from "./protocol.js";
 //     no matching release was found, or history about our mined transaction is
 //     no longer served; the reason code is kept in the event history) are
 //     permanent, never block the queue and are reported for operator attention;
+//   - an `expired` row is the one row that may continue, and only as a new
+//     attempt with a re-issued approval (a different approval digest, issued
+//     after the destination showed the expired approval dead): its exact
+//     bytes, nonce, hash and inclusion are first archived, forever, in
+//     `superseded_attempts`, and the row becomes `unclaimed` without bytes.
+//     An archived nonce, transaction hash or digest is never used again;
 //   - `reverted`: our identical bytes were mined before the deadline and
 //     reverted under a guardian pause or for a lasting, transfer-specific vault
 //     condition (daily limit, liquidity, release limit, signer rotation). Their
@@ -45,7 +51,7 @@ const OWNER = /^[0-9a-f]{32}$/;
 // The highest attempt cap a destination may ask for (markBroadcast maxAttempts).
 // A destination whose adapter paces resends itself passes no cap (null).
 export const LEDGER_MAX_BROADCAST_ATTEMPTS = 32;
-export const LEDGER_SCHEMA_VERSION = 2;
+export const LEDGER_SCHEMA_VERSION = 3;
 const MAX_SIGNED_HEX = 65_536;
 const TERMINAL = Object.freeze(["finalized", "failed", "halted", "released_elsewhere", "rejected", "expired", "release_unverified", "reverted"]);
 const STATES = Object.freeze(["claimed", "unclaimed", "signed", "broadcast", ...TERMINAL]);
@@ -143,28 +149,104 @@ CREATE TRIGGER transfers_immutable BEFORE UPDATE ON transfers
       OR new.approval_digest IS NOT old.approval_digest OR new.request_hash IS NOT old.request_hash))
   BEGIN SELECT RAISE(ABORT, 'immutable'); END;`;
 const V1_ATTEMPTS = "broadcast_attempts INTEGER NOT NULL CHECK(broadcast_attempts BETWEEN 0 AND 32)";
-const SCHEMA = LEDGER_SCHEMA_V1.replace(V1_ATTEMPTS, "broadcast_attempts INTEGER NOT NULL CHECK(broadcast_attempts >= 0)");
+export const LEDGER_SCHEMA_V2 = LEDGER_SCHEMA_V1.replace(V1_ATTEMPTS, "broadcast_attempts INTEGER NOT NULL CHECK(broadcast_attempts >= 0)");
 // Forward-only migration 1 -> 2 in the opening immediate transaction: the
 // transfers table is rebuilt with the identical DDL except the attempts cap,
 // every row is copied unchanged, and its triggers are recreated from the
 // version 2 DDL. Foreign keys are off, so dropping the old table deletes no
 // row through any trigger. The result is checked against the exact version 2
-// schema before the transaction commits; any failure rolls everything back.
-const statements = SCHEMA.split(/;\n(?=CREATE )/).map((statement) => statement.replace(/;$/, ""));
+// schema before the next step; any failure rolls everything back.
+const split = (ddl) => ddl.split(/;\n(?=CREATE )/).map((statement) => statement.replace(/;$/, ""));
+const statements = split(LEDGER_SCHEMA_V2);
 const MIGRATE_V1_TO_V2 = ["ALTER TABLE transfers RENAME TO transfers_v1",
   statements.find((statement) => statement.startsWith("CREATE TABLE transfers (")),
   "INSERT INTO transfers SELECT * FROM transfers_v1",
   "DROP TABLE transfers_v1",
   ...statements.filter((statement) => statement.startsWith("CREATE TRIGGER transfers_")),
 ].map((statement) => `${statement};`).join("\n");
+
+// Schema version 3 lets an `expired` row continue as a new attempt with a
+// re-issued approval. Its bytes are archived in `superseded_attempts` (exact
+// copy enforced by trigger, never updated or deleted), and only then may the
+// row move from `expired` to `unclaimed` without bytes, under a different
+// approval digest. No archived nonce, hash or digest can be recorded again.
+// Every other rule of version 2 is unchanged.
+const REOPEN = "(old.state = 'expired' AND new.state = 'unclaimed')";
+const SAME_ATTEMPT = (alias, row) => ["transfer_id", "source_ref", "approval_digest", "request_hash", "claim_epoch", "nonce",
+  "signed_hex", "transaction_digest", "transaction_hash", "broadcast_attempts", "block_number", "block_hash"]
+  .map((column) => `${alias}.${column} = ${row}.${column}`).join(" AND ");
+const V3_ADDED = [`CREATE TABLE superseded_attempts (
+  seq INTEGER PRIMARY KEY,
+  transfer_id TEXT NOT NULL CHECK(length(transfer_id) = 66),
+  source_ref TEXT NOT NULL CHECK(length(source_ref) IN (64, 66)),
+  approval_digest TEXT NOT NULL CHECK(length(approval_digest) = 66),
+  request_hash TEXT NOT NULL CHECK(length(request_hash) = 66),
+  claim_epoch INTEGER NOT NULL CHECK(claim_epoch >= 1),
+  nonce INTEGER NOT NULL UNIQUE CHECK(nonce >= 0),
+  signed_hex TEXT NOT NULL CHECK(length(signed_hex) BETWEEN 4 AND ${MAX_SIGNED_HEX}),
+  transaction_digest TEXT NOT NULL UNIQUE CHECK(length(transaction_digest) = 66),
+  transaction_hash TEXT NOT NULL UNIQUE CHECK(length(transaction_hash) = 66),
+  broadcast_attempts INTEGER NOT NULL CHECK(broadcast_attempts >= 1),
+  block_number INTEGER NOT NULL CHECK(block_number >= 0),
+  block_hash TEXT NOT NULL CHECK(length(block_hash) = 66),
+  superseded_by TEXT NOT NULL CHECK(length(superseded_by) = 66),
+  superseded_at INTEGER NOT NULL,
+  CHECK(superseded_by <> approval_digest)
+) STRICT`,
+`CREATE TRIGGER superseded_insert BEFORE INSERT ON superseded_attempts
+  WHEN NOT EXISTS (SELECT 1 FROM transfers t WHERE t.state = 'expired' AND ${SAME_ATTEMPT("t", "new")})
+  BEGIN SELECT RAISE(ABORT, 'superseded'); END`,
+"CREATE TRIGGER superseded_no_update BEFORE UPDATE ON superseded_attempts BEGIN SELECT RAISE(ABORT, 'permanent'); END",
+"CREATE TRIGGER superseded_no_delete BEFORE DELETE ON superseded_attempts BEGIN SELECT RAISE(ABORT, 'permanent'); END",
+`CREATE TRIGGER transfers_reopen BEFORE UPDATE ON transfers
+  WHEN ${REOPEN} AND (new.signed_hex IS NOT NULL OR new.broadcast_attempts <> 0 OR new.block_hash IS NOT NULL
+    OR new.approval_digest IS old.approval_digest
+    OR NOT EXISTS (SELECT 1 FROM superseded_attempts s WHERE ${SAME_ATTEMPT("s", "old")} AND s.superseded_by = new.approval_digest))
+  BEGIN SELECT RAISE(ABORT, 'reopen'); END`,
+`CREATE TRIGGER transfers_superseded_reuse BEFORE UPDATE ON transfers
+  WHEN new.nonce IS NOT NULL AND old.nonce IS NULL AND EXISTS (SELECT 1 FROM superseded_attempts s
+    WHERE s.nonce = new.nonce OR s.transaction_hash = new.transaction_hash OR s.transaction_digest = new.transaction_digest)
+  BEGIN SELECT RAISE(ABORT, 'superseded'); END`];
+const V3_REPLACED = new Map([
+  ["transfers_terminal", `CREATE TRIGGER transfers_terminal BEFORE UPDATE ON transfers
+  WHEN old.state IN ('finalized', 'failed', 'halted', 'released_elsewhere', 'rejected', 'expired', 'release_unverified', 'reverted')
+    AND NOT ${REOPEN}
+  BEGIN SELECT RAISE(ABORT, 'terminal'); END`],
+  ["transfers_progress", `CREATE TRIGGER transfers_progress BEFORE UPDATE ON transfers
+  WHEN NOT ((old.state = 'claimed' AND new.state IN ('claimed', 'unclaimed', 'signed', 'halted', 'released_elsewhere', 'rejected',
+      'release_unverified'))
+    OR (old.state = 'unclaimed' AND new.state IN ('claimed', 'halted', 'released_elsewhere', 'rejected', 'release_unverified'))
+    OR (old.state = 'signed' AND new.state IN ('broadcast', 'halted'))
+    OR (old.state = 'broadcast' AND new.state IN ('broadcast', 'finalized', 'failed', 'halted', 'released_elsewhere', 'expired',
+      'release_unverified', 'reverted'))
+    OR ${REOPEN})
+  BEGIN SELECT RAISE(ABORT, 'transition'); END`],
+  ["transfers_immutable", `CREATE TRIGGER transfers_immutable BEFORE UPDATE ON transfers
+  WHEN new.transfer_id IS NOT old.transfer_id OR new.source_ref IS NOT old.source_ref OR new.claim_epoch IS NOT old.claim_epoch
+    OR new.created_at IS NOT old.created_at
+    OR (NOT ${REOPEN} AND (new.broadcast_attempts < old.broadcast_attempts OR new.broadcast_attempts > old.broadcast_attempts + 1
+      OR (old.signed_hex IS NOT NULL AND (new.signed_hex IS NOT old.signed_hex OR new.nonce IS NOT old.nonce
+        OR new.transaction_hash IS NOT old.transaction_hash OR new.transaction_digest IS NOT old.transaction_digest
+        OR new.approval_digest IS NOT old.approval_digest OR new.request_hash IS NOT old.request_hash))))
+  BEGIN SELECT RAISE(ABORT, 'immutable'); END`],
+]);
+const triggerName = (statement) => statement.match(/^CREATE TRIGGER (\w+) /)?.[1];
+const SCHEMA = [...statements.map((statement) => V3_REPLACED.get(triggerName(statement)) ?? statement), ...V3_ADDED]
+  .map((statement) => `${statement};`).join("\n");
+// Forward-only migration 2 -> 3 in the same opening transaction: the new
+// table and triggers are created and the three changed triggers are dropped
+// and recreated from the version 3 DDL. No row is touched.
+const MIGRATE_V2_TO_V3 = [...V3_ADDED.slice(0, 4), ...[...V3_REPLACED.keys()].map((name) => `DROP TRIGGER ${name}`),
+  ...V3_REPLACED.values(), ...V3_ADDED.slice(4)].map((statement) => `${statement};`).join("\n");
 const SCHEMA_QUERY = "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name";
 function expected(ddl) {
   const reference = new DatabaseSync(":memory:");
   try { reference.exec(ddl); return JSON.stringify(reference.prepare(SCHEMA_QUERY).all()); } finally { reference.close(); }
 }
 const EXPECTED_SCHEMA = expected(SCHEMA);
+const EXPECTED_SCHEMA_V2 = expected(LEDGER_SCHEMA_V2);
 const EXPECTED_SCHEMA_V1 = expected(LEDGER_SCHEMA_V1);
-if (SCHEMA === LEDGER_SCHEMA_V1 || EXPECTED_SCHEMA === EXPECTED_SCHEMA_V1) throw new Error("ledger schema versions must differ");
+if (new Set([EXPECTED_SCHEMA, EXPECTED_SCHEMA_V2, EXPECTED_SCHEMA_V1]).size !== 3) throw new Error("ledger schema versions must differ");
 
 const hash = (value) => typeof value === "string" && HASH.test(value) && value !== ZERO_HASH;
 const sourceRef = (value) => typeof value === "string" && SOURCE.test(value);
@@ -247,11 +329,19 @@ export class BroadcastLedger {
         this.#database.exec(SCHEMA);
         this.#database.exec(`PRAGMA user_version = ${LEDGER_SCHEMA_VERSION}`);
         this.#database.prepare("INSERT INTO ledger_binding VALUES (1, ?)").run(this.#binding);
-      } else if (this.#database.prepare("PRAGMA user_version").get().user_version === 1) {
-        // Only the exact version 1 schema with this binding is migrated.
-        this.#validate({ version: 1, schema: EXPECTED_SCHEMA_V1 });
-        this.#database.exec(MIGRATE_V1_TO_V2);
-        this.#database.exec(`PRAGMA user_version = ${LEDGER_SCHEMA_VERSION}`);
+      } else {
+        // Only the exact schema of each earlier version, with this binding, is
+        // migrated, one version at a time.
+        if (this.#database.prepare("PRAGMA user_version").get().user_version === 1) {
+          this.#validate({ version: 1, schema: EXPECTED_SCHEMA_V1 });
+          this.#database.exec(MIGRATE_V1_TO_V2);
+          this.#database.exec("PRAGMA user_version = 2");
+        }
+        if (this.#database.prepare("PRAGMA user_version").get().user_version === 2) {
+          this.#validate({ version: 2, schema: EXPECTED_SCHEMA_V2 });
+          this.#database.exec(MIGRATE_V2_TO_V3);
+          this.#database.exec(`PRAGMA user_version = ${LEDGER_SCHEMA_VERSION}`);
+        }
       }
       this.#validate();
       this.#database.exec("COMMIT");
@@ -270,8 +360,8 @@ export class BroadcastLedger {
 
   #validate({ version = LEDGER_SCHEMA_VERSION, schema = EXPECTED_SCHEMA } = {}) {
     // Exact DDL covers columns, CHECK constraints, uniqueness and every trigger.
-    // The only migration is the forward-only 1 -> 2 step above: an unknown,
-    // partial or newer schema requires offline review.
+    // The only migrations are the forward-only 1 -> 2 -> 3 steps above: an
+    // unknown, partial or newer schema requires offline review.
     if (this.#database.prepare("PRAGMA user_version").get().user_version !== version
         || JSON.stringify(this.#database.prepare(SCHEMA_QUERY).all()) !== schema) throw failure();
     const rows = this.#database.prepare("SELECT * FROM ledger_binding").all();
@@ -562,8 +652,8 @@ export class BroadcastLedger {
   }
 
   // Counts of permanent non-blocking rows an operator must review. With
-  // `stalledAfterSeconds`, also the unfinished rows whose bytes were signed
-  // longer ago than that (still waiting for inclusion, for example under a
+  // `stalledAfterSeconds`, also the unfinished rows whose current bytes were
+  // signed longer ago than that (still waiting for inclusion, for example under a
   // lasting fee rise): derived from persisted state, so it is reported in every
   // cycle, across restarts, until the row concludes. It never changes a row.
   attention({ nowMs, stalledAfterSeconds = null } = {}) {
@@ -577,7 +667,7 @@ export class BroadcastLedger {
         reverted: counts.reverted ?? 0 };
       if (stalledAfterSeconds !== null) {
         report.stalled = this.#database.prepare(`SELECT count(*) AS n FROM transfers t WHERE t.state IN ('signed', 'broadcast')
-          AND (SELECT min(e.at) FROM transfer_events e WHERE e.transfer_id = t.transfer_id AND e.state = 'signed') <= ?`)
+          AND (SELECT max(e.at) FROM transfer_events e WHERE e.transfer_id = t.transfer_id AND e.state = 'signed') <= ?`)
           .get(Math.floor(nowMs / 1000) - stalledAfterSeconds).n;
       }
       return Object.freeze(report);
@@ -658,6 +748,62 @@ export class BroadcastLedger {
       } else throw failure();
       this.#event(transferId, "released_elsewhere", "released_elsewhere", lease.epoch);
       return this.#snapshot(this.#raw(transferId));
+    }, lease);
+  }
+
+  // A row whose identical bytes ended `expired` continues as a new attempt
+  // under a re-issued approval (a different digest). Expired bytes were mined
+  // after the approval deadline and reverted: their nonce is consumed and they
+  // can never execute. The engine calls this only after the coordinator
+  // re-approved the transfer, which it does only after the destination showed
+  // the expired approval dead. The exact attempt is archived first, then the
+  // row becomes `unclaimed` without bytes; the next claim follows every rule
+  // of a new claim and signs with the next account nonce.
+  reopenExpired(lease, input) {
+    const { transferId, sourceRef: source, approvalDigest, requestHash } = identityOf(input, []);
+    return this.#transaction(() => {
+      const existing = this.#existing(transferId, source);
+      if (existing?.state === "unclaimed" && existing.approval_digest === approvalDigest && existing.request_hash === requestHash
+          && this.#database.prepare("SELECT count(*) AS n FROM superseded_attempts WHERE transfer_id = ? AND superseded_by = ?")
+            .get(transferId, approvalDigest).n === 1) return this.#snapshot(existing);
+      if (existing?.state !== "expired" || existing.approval_digest === approvalDigest) throw failure();
+      const now = Math.floor(Date.now() / 1000);
+      this.#database.prepare(`INSERT INTO superseded_attempts (transfer_id, source_ref, approval_digest, request_hash, claim_epoch, nonce,
+        signed_hex, transaction_digest, transaction_hash, broadcast_attempts, block_number, block_hash, superseded_by, superseded_at)
+        SELECT transfer_id, source_ref, approval_digest, request_hash, claim_epoch, nonce, signed_hex, transaction_digest,
+          transaction_hash, broadcast_attempts, block_number, block_hash, ?, ? FROM transfers WHERE transfer_id = ? AND state = 'expired'`)
+        .run(approvalDigest, now, transferId);
+      const result = this.#database.prepare(`UPDATE transfers SET state = 'unclaimed', approval_digest = ?, request_hash = ?, nonce = NULL,
+        signed_hex = NULL, transaction_digest = NULL, transaction_hash = NULL, broadcast_attempts = 0, block_number = NULL,
+        block_hash = NULL, updated_at = ? WHERE transfer_id = ? AND state = 'expired'`).run(approvalDigest, requestHash, now, transferId);
+      if (result.changes !== 1) throw failure();
+      this.#event(transferId, "unclaimed", "reissued", lease.epoch);
+      return this.#snapshot(this.#raw(transferId));
+    }, lease);
+  }
+
+  // Archived attempts of one transfer, oldest first.
+  superseded(transferId) {
+    try {
+      if (!hash(transferId)) throw failure();
+      this.#path.verify();
+      return Object.freeze(this.#database.prepare(`SELECT nonce, transaction_hash, approval_digest, block_number, block_hash, superseded_by,
+        superseded_at FROM superseded_attempts WHERE transfer_id = ? ORDER BY seq`).all(transferId).map((row) => Object.freeze({
+        nonce: row.nonce, transactionHash: row.transaction_hash, approvalDigest: row.approval_digest, blockNumber: row.block_number,
+        blockHash: row.block_hash, supersededBy: row.superseded_by, supersededAt: row.superseded_at })));
+    } catch { throw failure(); }
+  }
+
+  // Drops the scheduling hint of a transfer that now waits for a re-issued
+  // approval instead of for time, so the new approval is tried at once.
+  clearDeferral(lease, input) {
+    const { transferId, sourceRef: source } = plain(input, ["transferId", "sourceRef"]);
+    if (!hash(transferId) || !sourceRef(source)) throw failure();
+    return this.#transaction(() => {
+      const existing = this.#database.prepare("SELECT transfer_id FROM deferrals WHERE source_ref = ?").get(source);
+      if (existing && existing.transfer_id !== transferId) throw failure();
+      this.#database.prepare("DELETE FROM deferrals WHERE source_ref = ? AND transfer_id = ?").run(source, transferId);
+      return Object.freeze({ sourceRef: source, transferId, cleared: Boolean(existing) });
     }, lease);
   }
 

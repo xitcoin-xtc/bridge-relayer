@@ -3,7 +3,10 @@ import { open as openDefault } from "node:fs/promises";
 import { basename, dirname, isAbsolute } from "node:path";
 import { getAddress } from "ethers";
 
+import { createApprovalRetirementVerifier } from "./approval-retirement.js";
 import { runApprovalOnlyCycle } from "./coordinator.js";
+import { CronosRpcQuorum } from "./cronos-rpc.js";
+import { XitcoinRpcQuorum } from "./xitcoin-rpc.js";
 import { createCredentialedSignerClients } from "./coordinator-transport.js";
 import { connectCronosProviders, connectXitcoinClients, decodeXitcoinOutboundBlock, decodeXitcoinOutboundTransaction } from "./network.js";
 import { TESTNET_ROUTE_ID } from "./preflight.js";
@@ -59,7 +62,7 @@ export function validateCoordinatorConfig(input) {
   if (cronosRouteId !== TESTNET_ROUTE_ID.toLowerCase()) throw new Error("Cronos route is not canonical");
   const cronosChainId = integer(policy.cronosChainId, "Cronos chain ID");
   if (cronosChainId !== 338) throw new Error("Cronos chain ID is not testnet");
-  const xitcoin = keys(object(config.xitcoin, "Xitcoin config"), ["rpcUrls", "chainId", "safetyLag", "maxBatch", "allowLoopbackHttp"], "Xitcoin config");
+  const xitcoin = keys(object(config.xitcoin, "Xitcoin config"), ["rpcUrls", "restUrls", "chainId", "safetyLag", "maxBatch", "allowLoopbackHttp"], "Xitcoin config");
   if (xitcoin.chainId !== "xitcoin-testnet-v2-1") throw new Error("Xitcoin chain ID is not testnet");
   const signers = Array.isArray(config.signers) ? config.signers.map((signer) => ({ identity: text(signer?.identity, "signer identity"), url: text(signer?.url, "signer URL") })) : [];
   if (signers.length !== 3) throw new Error("exactly three signer transports are required");
@@ -67,6 +70,12 @@ export function validateCoordinatorConfig(input) {
   if (authorizedSigners.length !== 3 || new Set(authorizedSigners.map((item) => item.toLowerCase())).size !== 3) throw new Error("exactly three distinct authorized signers are required");
   const cronos = keys(object(config.cronos, "Cronos config"), ["rpcUrls", "confirmations", "maxBatch"], "Cronos config");
   const startHeights = keys(object(config.startHeights, "start heights"), ["cronos", "xitcoin"], "start heights");
+  // The REST API of the same operator as rpcUrls[i], for the destination reads
+  // an approval re-issue needs (approval-retirement.js).
+  const xitcoinRpcUrls = urls(xitcoin.rpcUrls, "Xitcoin RPCs"), xitcoinRestUrls = urls(xitcoin.restUrls, "Xitcoin REST APIs");
+  if (xitcoinRestUrls.length !== xitcoinRpcUrls.length || xitcoinRpcUrls.length > 4) {
+    throw new Error("Xitcoin REST URLs must pair with the RPC URLs (two to four origins)");
+  }
   return Object.freeze({
     version: 1, mode: "approval_only", releaseCommit,
     statePath: absolute(config.statePath, "state path"),
@@ -77,7 +86,7 @@ export function validateCoordinatorConfig(input) {
     policy: { routeId, cronosRouteId, cronosChainId, cronosVault: getAddress(policy.cronosVault), signerSetVersion: integer(policy.signerSetVersion, "signer set version") },
     authorizedSigners: Object.freeze(authorizedSigners), signers: Object.freeze(signers),
     cronos: { rpcUrls: urls(cronos.rpcUrls, "Cronos RPCs"), confirmations: integer(cronos.confirmations, "Cronos confirmations"), maxBatch: integer(cronos.maxBatch, "Cronos max batch", 1, 500) },
-    xitcoin: { rpcUrls: urls(xitcoin.rpcUrls, "Xitcoin RPCs"), chainId: xitcoin.chainId, safetyLag: integer(xitcoin.safetyLag, "Xitcoin safety lag", 0), maxBatch: integer(xitcoin.maxBatch, "Xitcoin max batch", 1, 100), allowLoopbackHttp: xitcoin.allowLoopbackHttp === true },
+    xitcoin: { rpcUrls: xitcoinRpcUrls, restUrls: xitcoinRestUrls, chainId: xitcoin.chainId, safetyLag: integer(xitcoin.safetyLag, "Xitcoin safety lag", 0), maxBatch: integer(xitcoin.maxBatch, "Xitcoin max batch", 1, 100), allowLoopbackHttp: xitcoin.allowLoopbackHttp === true },
   });
 }
 
@@ -110,6 +119,10 @@ export async function buildApprovalOnlyCoordinator(config, { credentialsDirector
   connectCronos = connectCronosProviders, connectXitcoin = connectXitcoinClients,
   makeCronosWatcher = (options) => new CronosFinalizedWatcher(options), makeXitcoinWatcher = (options) => new XitcoinFinalizedWatcher(options),
   makeSignerClients = createCredentialedSignerClients, makeStore = (path) => new RelayStore(path), runCycle = runApprovalOnlyCycle,
+  makeRetirementVerifier = (options) => createApprovalRetirementVerifier({
+    cronos: new CronosRpcQuorum({ urls: options.cronosRpcUrls }),
+    xitcoin: new XitcoinRpcQuorum({ origins: options.xitcoinOrigins, allowLoopbackHttp: options.allowLoopbackHttp }),
+    cronosVault: options.cronosVault, cronosChainId: options.cronosChainId, cronosConfirmations: options.cronosConfirmations }),
 } = {}) {
   const manifest = validateCoordinatorConfig(config);
   const credentialRoot = absolute(credentialsDirectory, "credentials directory");
@@ -120,6 +133,10 @@ export async function buildApprovalOnlyCoordinator(config, { credentialsDirector
   ]);
   const cronosWatcher = makeCronosWatcher({ providers, vault: manifest.policy.cronosVault, routeId: manifest.policy.cronosRouteId, confirmations: manifest.cronos.confirmations, maxBatch: manifest.cronos.maxBatch });
   const xitcoinWatcher = makeXitcoinWatcher({ clients: xitcoinClients, chainId: manifest.xitcoin.chainId, routeId: manifest.policy.routeId, safetyLag: manifest.xitcoin.safetyLag, maxBatch: manifest.xitcoin.maxBatch });
+  const verifyRetired = makeRetirementVerifier({ cronosRpcUrls: manifest.cronos.rpcUrls, cronosVault: manifest.policy.cronosVault,
+    cronosChainId: manifest.policy.cronosChainId, cronosConfirmations: manifest.cronos.confirmations,
+    xitcoinOrigins: manifest.xitcoin.rpcUrls.map((rpcUrl, index) => ({ rpcUrl, restUrl: manifest.xitcoin.restUrls[index] })),
+    allowLoopbackHttp: manifest.xitcoin.allowLoopbackHttp });
   const store = makeStore(manifest.statePath);
-  return Object.freeze({ manifest, async runOnce() { return runCycle({ store, cronosWatcher, xitcoinWatcher, clients: signerClients, authorizedSigners: manifest.authorizedSigners, routeId: manifest.policy.routeId, cronosRouteId: manifest.policy.cronosRouteId, cronosChainId: manifest.policy.cronosChainId, cronosVault: manifest.policy.cronosVault, xitcoinChainId: manifest.xitcoin.chainId, signerSetVersion: manifest.policy.signerSetVersion, approvalWindowSeconds: manifest.approvalWindowSeconds, startHeights: manifest.startHeights, maxBatch: Math.min(manifest.cronos.maxBatch, manifest.xitcoin.maxBatch), maximumApprovals: manifest.maximumApprovals }); }, close() { store.close(); } });
+  return Object.freeze({ manifest, async runOnce() { return runCycle({ store, cronosWatcher, xitcoinWatcher, clients: signerClients, verifyRetired, authorizedSigners: manifest.authorizedSigners, routeId: manifest.policy.routeId, cronosRouteId: manifest.policy.cronosRouteId, cronosChainId: manifest.policy.cronosChainId, cronosVault: manifest.policy.cronosVault, xitcoinChainId: manifest.xitcoin.chainId, signerSetVersion: manifest.policy.signerSetVersion, approvalWindowSeconds: manifest.approvalWindowSeconds, startHeights: manifest.startHeights, maxBatch: Math.min(manifest.cronos.maxBatch, manifest.xitcoin.maxBatch), maximumApprovals: manifest.maximumApprovals }); }, close() { store.close(); } });
 }

@@ -10,7 +10,10 @@ import {
   decodeXitcoinOutboundBlock,
   decodeXitcoinOutboundTransaction,
 } from "./network.js";
+import { createApprovalRetirementVerifier } from "./approval-retirement.js";
+import { CronosRpcQuorum } from "./cronos-rpc.js";
 import { SignerApprovalJournal } from "./signer-journal.js";
+import { XitcoinRpcQuorum } from "./xitcoin-rpc.js";
 import { createSignerPolicy } from "./signer-service.js";
 import { createSecureSignerHandler, createSecureSignerService, startLoopbackSignerServer } from "./signer-runtime.js";
 import { createCanonicalSourceVerifier } from "./source-verification.js";
@@ -58,7 +61,7 @@ export function validateSignerConfig(input) {
   const listen = keys(object(config.listen, "listener"), ["host", "port"], "listener");
   const policy = keys(object(config.policy, "policy"), ["routeId", "cronosRouteId", "cronosChainId", "cronosVault", "maximumAmount", "maximumDeadlineSeconds"], "policy");
   const cronos = keys(object(config.cronos, "Cronos config"), ["rpcUrls", "confirmations", "maxBatch"], "Cronos config");
-  const xitcoin = keys(object(config.xitcoin, "Xitcoin config"), ["rpcUrls", "chainId", "safetyLag", "maxBatch", "allowLoopbackHttp"], "Xitcoin config");
+  const xitcoin = keys(object(config.xitcoin, "Xitcoin config"), ["rpcUrls", "restUrls", "chainId", "safetyLag", "maxBatch", "allowLoopbackHttp"], "Xitcoin config");
   const identity = text(config.identity, "signer identity");
   if (!/^signer-[123]$/.test(identity)) throw new Error("signer identity is not canonical");
   const routeId = text(policy.routeId, "route ID");
@@ -89,6 +92,9 @@ export function validateSignerConfig(input) {
     },
     xitcoin: {
       rpcUrls: list(xitcoin.rpcUrls, "Xitcoin RPC URLs", 2).map((url) => text(url, "Xitcoin RPC URL")),
+      // The REST API of the same operator as rpcUrls[i]: the destination
+      // reads that an explicit re-issue needs (approval-retirement.js).
+      restUrls: list(xitcoin.restUrls, "Xitcoin REST URLs", 2).map((url) => text(url, "Xitcoin REST URL")),
       chainId: text(xitcoin.chainId, "Xitcoin chain ID"),
       safetyLag: integer(xitcoin.safetyLag, "Xitcoin safety lag", 0),
       maxBatch: integer(xitcoin.maxBatch ?? 100, "Xitcoin maximum batch"),
@@ -96,6 +102,9 @@ export function validateSignerConfig(input) {
     },
   };
   if (normalized.xitcoin.chainId !== "xitcoin-testnet-v2-1") throw new Error("Xitcoin Testnet chain ID is not canonical");
+  if (normalized.xitcoin.restUrls.length !== normalized.xitcoin.rpcUrls.length || normalized.xitcoin.rpcUrls.length > 4) {
+    throw new Error("Xitcoin REST URLs must pair with the RPC URLs (two to four origins)");
+  }
   return Object.freeze(normalized);
 }
 
@@ -124,6 +133,10 @@ export async function buildSignerRuntime(config, {
   makeCronosWatcher = (options) => new CronosFinalizedWatcher(options),
   makeXitcoinWatcher = (options) => new XitcoinFinalizedWatcher(options),
   makeVerifier = createCanonicalSourceVerifier,
+  makeRetirementVerifier = (options) => createApprovalRetirementVerifier({
+    cronos: new CronosRpcQuorum({ urls: options.cronosRpcUrls }),
+    xitcoin: new XitcoinRpcQuorum({ origins: options.xitcoinOrigins, allowLoopbackHttp: options.allowLoopbackHttp }),
+    cronosVault: options.cronosVault, cronosChainId: options.cronosChainId, cronosConfirmations: options.cronosConfirmations }),
   makeService = createSecureSignerService,
   makeJournal = (path) => new SignerApprovalJournal(path),
   makeHandler = createSecureSignerHandler,
@@ -171,6 +184,10 @@ export async function buildSignerRuntime(config, {
     policy,
     journal: makeJournal(manifest.journalPath),
     verifySource: makeVerifier({ cronosWatcher, xitcoinWatcher, cronosRouteId: manifest.policy.cronosRouteId }),
+    verifyRetirement: makeRetirementVerifier({ cronosRpcUrls: manifest.cronos.rpcUrls, cronosVault: manifest.policy.cronosVault,
+      cronosChainId: manifest.policy.cronosChainId, cronosConfirmations: manifest.cronos.confirmations,
+      xitcoinOrigins: manifest.xitcoin.rpcUrls.map((rpcUrl, index) => ({ rpcUrl, restUrl: manifest.xitcoin.restUrls[index] })),
+      allowLoopbackHttp: manifest.xitcoin.allowLoopbackHttp }),
   });
   const handler = await makeHandler({ service, transportCredentialPath: join(credentialRoot, "transport-token") });
   const server = await startServer({ handler, host: manifest.listen.host, port: manifest.listen.port });

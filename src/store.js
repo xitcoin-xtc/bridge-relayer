@@ -1,5 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 
+import { approvalContentHash, approvalSourceKey, buildApprovalRequest, reissueDeclaration } from "./approvals.js";
+
 export const STATES = Object.freeze([
   "observed", "finalized", "approved", "submitted", "completed", "failed", "reorged",
 ]);
@@ -18,6 +20,37 @@ export function isRelayStoreBusy(error) {
     const errcode = descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : undefined;
     return Number.isSafeInteger(errcode) && [5, 6].includes(errcode & 0xff); // SQLITE_BUSY, SQLITE_LOCKED
   } catch { return false; }
+}
+
+// A re-issue pair: `next` spends the same source event with the same content
+// as the expired `previous`, with a strictly later deadline that has not
+// passed, and a new digest.
+function reissuePair(previous, next, nowUnix) {
+  if (!next || typeof next !== "object" || Array.isArray(next) || JSON.stringify(next).length > 65_536) {
+    throw new Error("invalid approval request");
+  }
+  if (!Number.isSafeInteger(previous?.deadlineUnix) || !Number.isSafeInteger(next.deadlineUnix)
+      || previous.deadlineUnix >= nowUnix || next.deadlineUnix <= nowUnix || next.deadlineUnix <= previous.deadlineUnix) {
+    throw new Error("only an expired approval request may be re-issued with a later deadline");
+  }
+  let same;
+  try {
+    const before = buildApprovalRequest(previous), after = buildApprovalRequest(next);
+    same = before.digest === previous.digest && after.digest === next.digest && before.digest !== after.digest
+      && approvalSourceKey(before) === approvalSourceKey(after) && approvalContentHash(before) === approvalContentHash(after);
+  } catch { same = false; }
+  if (!same) throw new Error("re-issued approval request does not match the persisted source event");
+  return { previousEncoded: JSON.stringify(previous), nextEncoded: JSON.stringify(next),
+    declaration: reissueDeclaration({ previousDigest: previous.digest, previousDeadlineUnix: previous.deadlineUnix }) };
+}
+
+function reissueMarker(value) {
+  const digest = String(value?.digest ?? "").toLowerCase();
+  const destinationRef = value?.destinationRef === null || value?.destinationRef === undefined ? null : String(value.destinationRef).toLowerCase();
+  if (!/^0x[0-9a-f]{64}$/.test(digest) || (destinationRef !== null && !/^0x[0-9a-f]{64}$/.test(destinationRef))) {
+    throw new Error("invalid re-issue request");
+  }
+  return Object.freeze({ digest, destinationRef });
 }
 
 export class RelayStore {
@@ -69,6 +102,38 @@ export class RelayStore {
     // differ from destination_ref (our submitted transaction) when another
     // transaction released it first, for example after a front-run.
     if (!columns.has("release_ref")) this.database.exec("ALTER TABLE transfers ADD COLUMN release_ref TEXT");
+    // Set by a destination submitter that gives up an expired approval: the
+    // digest it will never send and the destination transaction it holds for
+    // it (null when it never sent one). Only then may the coordinator re-issue
+    // an approved or submitted transfer.
+    if (!columns.has("reissue_requested")) this.database.exec("ALTER TABLE transfers ADD COLUMN reissue_requested TEXT");
+    // For a re-issued approval request, the explicit declaration
+    // ({ previousDigest, previousDeadlineUnix }) sent to signers with it.
+    if (!columns.has("approval_reissue")) this.database.exec("ALTER TABLE transfers ADD COLUMN approval_reissue TEXT");
+    // Set by the coordinator when its re-issue proof shows that the replay key
+    // of a given-up approval is already used on the destination (for example
+    // with leaked signatures before the deadline): never re-issued, the
+    // destination submitter completes it from the release evidence instead.
+    if (!columns.has("processed_elsewhere")) this.database.exec("ALTER TABLE transfers ADD COLUMN processed_elsewhere TEXT");
+    // Every approval request that was replaced by a re-issue, with its
+    // approvals and the destination transaction bound to it. Append-only.
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS approval_history (
+        seq INTEGER PRIMARY KEY,
+        source_chain TEXT NOT NULL,
+        source_ref TEXT NOT NULL,
+        state TEXT NOT NULL,
+        approval_request TEXT NOT NULL,
+        approvals TEXT NOT NULL,
+        destination_ref TEXT,
+        replaced_by TEXT NOT NULL,
+        replaced_at INTEGER NOT NULL
+      ) STRICT;
+      CREATE TRIGGER IF NOT EXISTS approval_history_no_update BEFORE UPDATE ON approval_history
+        BEGIN SELECT RAISE(ABORT, 'permanent'); END;
+      CREATE TRIGGER IF NOT EXISTS approval_history_no_delete BEFORE DELETE ON approval_history
+        BEGIN SELECT RAISE(ABORT, 'permanent'); END;
+    `);
   }
 
   observe(record) {
@@ -174,28 +239,29 @@ export class RelayStore {
   }
 
   // Replaces a persisted approval request whose deadline has passed with a
-  // re-issued one for the same source event. The caller (coordinator) must
-  // have checked that `next` differs from `previous` only in its deadline (or
-  // release signer-set version); this method re-checks the persisted bytes,
-  // the lifecycle state and expiry atomically and drops approvals collected
-  // for the expired digest, which can no longer be submitted.
+  // re-issued one for the same source event (finalized transfers, whose
+  // approvals were never complete). The caller (coordinator) must have proved
+  // on the destination that the expired request can never be used
+  // (approval-retirement.js). This method re-checks atomically that `next`
+  // spends the same source event with the same content and a strictly later
+  // deadline, the persisted bytes, the lifecycle state and expiry; it archives
+  // the expired request with the approvals collected for it, which can no
+  // longer be submitted, and records the explicit re-issue declaration that
+  // signers receive with the new request.
   reissueApprovalRequest(sourceChain, sourceRef, previous, next, { nowUnix = Math.floor(Date.now() / 1000) } = {}) {
-    const previousEncoded = JSON.stringify(previous);
-    const nextEncoded = JSON.stringify(next);
-    if (!next || typeof next !== "object" || Array.isArray(next) || nextEncoded.length > 65_536) {
-      throw new Error("invalid approval request");
-    }
-    if (!Number.isSafeInteger(previous?.deadlineUnix) || !Number.isSafeInteger(next.deadlineUnix)
-        || previous.deadlineUnix >= nowUnix || next.deadlineUnix <= nowUnix) {
-      throw new Error("only an expired approval request may be re-issued with a later deadline");
-    }
+    const { previousEncoded, nextEncoded, declaration } = reissuePair(previous, next, nowUnix);
     const ref = sourceRef.toLowerCase();
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      const current = this.get(sourceChain, ref);
+      if (!current || current.state !== "finalized" || current.approval_request !== previousEncoded) {
+        throw new Error("concurrent or conflicting approval request");
+      }
+      this.#archive(current, next.digest);
       const updated = this.database.prepare(`
-        UPDATE transfers SET approval_request = ?, updated_at = ?
+        UPDATE transfers SET approval_request = ?, approval_reissue = ?, updated_at = ?
         WHERE source_chain = ? AND source_ref = ? AND state = 'finalized' AND approval_request = ?
-      `).run(nextEncoded, Math.floor(Date.now() / 1000), sourceChain, ref, previousEncoded);
+      `).run(nextEncoded, JSON.stringify(declaration), Math.floor(Date.now() / 1000), sourceChain, ref, previousEncoded);
       if (updated.changes !== 1) throw new Error("concurrent or conflicting approval request");
       this.database.prepare("DELETE FROM approvals WHERE source_chain = ? AND source_ref = ?").run(sourceChain, ref);
       this.database.exec("COMMIT");
@@ -204,6 +270,111 @@ export class RelayStore {
       throw error;
     }
     return JSON.parse(this.get(sourceChain, sourceRef).approval_request);
+  }
+
+  #archive(current, replacedBy) {
+    const approvals = this.approvals(current.source_chain, current.source_ref)
+      .map(({ signer, digest, signature }) => ({ signer, digest, signature }));
+    this.database.prepare(`
+      INSERT INTO approval_history (source_chain, source_ref, state, approval_request, approvals, destination_ref, replaced_by, replaced_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(current.source_chain, current.source_ref, current.state, current.approval_request, JSON.stringify(approvals),
+      current.destination_ref, replacedBy, Math.floor(Date.now() / 1000));
+  }
+
+  // Destination submitter side of an approved-transfer re-issue: it declares
+  // that it will never send `digest` (the current approval) and that it holds
+  // no transaction for it other than `destinationRef` (null when it never
+  // sent one). Conditional on the RelayStore row matching exactly; idempotent.
+  requestReissue(sourceChain, sourceRef, { digest, destinationRef = null }) {
+    const marker = reissueMarker({ digest, destinationRef });
+    const ref = sourceRef.toLowerCase();
+    const result = this.database.prepare(`
+      UPDATE transfers SET reissue_requested = ?
+      WHERE source_chain = ? AND source_ref = ? AND reissue_requested IS NULL
+        AND json_extract(approval_request, '$.digest') = ?
+        AND ((state = 'approved' AND destination_ref IS NULL AND ? IS NULL) OR (state = 'submitted' AND destination_ref = ?))
+    `).run(JSON.stringify(marker), sourceChain, ref, marker.digest, marker.destinationRef, marker.destinationRef);
+    if (result.changes === 1) return true;
+    return this.get(sourceChain, ref)?.reissue_requested === JSON.stringify(marker);
+  }
+
+  reissueRequested(sourceChain, sourceRef) {
+    const encoded = this.get(sourceChain, sourceRef)?.reissue_requested;
+    return encoded ? reissueMarker(JSON.parse(encoded)) : null;
+  }
+
+  // Coordinator side: the given-up approval `digest` can never be re-issued
+  // because the destination shows its replay key used. Conditional on the
+  // submitter's request for exactly that approval; idempotent.
+  markProcessedElsewhere(sourceChain, sourceRef, { digest }) {
+    const marker = reissueMarker({ digest });
+    const result = this.database.prepare(`
+      UPDATE transfers SET processed_elsewhere = ?
+      WHERE source_chain = ? AND source_ref = ? AND processed_elsewhere IS NULL AND state IN ('approved', 'submitted')
+        AND json_extract(reissue_requested, '$.digest') = ? AND json_extract(approval_request, '$.digest') = ?
+    `).run(JSON.stringify({ digest: marker.digest }), sourceChain, sourceRef.toLowerCase(), marker.digest, marker.digest);
+    if (result.changes === 1) return true;
+    return this.processedElsewhere(sourceChain, sourceRef) === marker.digest;
+  }
+
+  processedElsewhere(sourceChain, sourceRef) {
+    const encoded = this.get(sourceChain, sourceRef)?.processed_elsewhere;
+    return encoded ? reissueMarker(JSON.parse(encoded)).digest : null;
+  }
+
+  // Approved or submitted transfers whose submitter requested a re-issue.
+  reissueRequests({ limit = 100 } = {}) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) throw new Error("invalid re-issue request limit");
+    return this.database.prepare(`SELECT * FROM transfers WHERE reissue_requested IS NOT NULL AND state IN ('approved', 'submitted')
+      ORDER BY updated_at, source_chain, source_ref LIMIT ?`).all(limit);
+  }
+
+  // Coordinator side of an approved-transfer re-issue. Only after the
+  // submitter's request for exactly this approval and transaction, and after
+  // the coordinator proved on the destination that the expired approval can
+  // never be used: the transfer returns to `finalized` with a re-issued
+  // request for the same source event, its old request, approvals and
+  // destination transaction archived, so the coordinator collects new
+  // approvals (with the explicit re-issue declaration) through the normal path.
+  returnForReissue(sourceChain, sourceRef, previous, next, { nowUnix = Math.floor(Date.now() / 1000) } = {}) {
+    const { previousEncoded, nextEncoded, declaration } = reissuePair(previous, next, nowUnix);
+    const ref = sourceRef.toLowerCase();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.get(sourceChain, ref);
+      const marker = current?.reissue_requested ? reissueMarker(JSON.parse(current.reissue_requested)) : null;
+      if (!current || !marker || current.processed_elsewhere !== null || current.approval_request !== previousEncoded || marker.digest !== previous.digest
+          || !((current.state === "approved" && current.destination_ref === null && marker.destinationRef === null)
+            || (current.state === "submitted" && current.destination_ref === marker.destinationRef))) {
+        throw new Error("transfer is not awaiting this re-issue");
+      }
+      this.#archive(current, next.digest);
+      const updated = this.database.prepare(`
+        UPDATE transfers SET state = 'finalized', approval_request = ?, approval_reissue = ?, destination_ref = NULL,
+          reissue_requested = NULL, error = NULL, updated_at = ?
+        WHERE source_chain = ? AND source_ref = ? AND state = ? AND approval_request = ? AND destination_ref IS ?
+          AND reissue_requested = ?
+      `).run(nextEncoded, JSON.stringify(declaration), Math.floor(Date.now() / 1000), sourceChain, ref, current.state,
+        previousEncoded, current.destination_ref, current.reissue_requested);
+      if (updated.changes !== 1) throw new Error("transfer is not awaiting this re-issue");
+      this.database.prepare("DELETE FROM approvals WHERE source_chain = ? AND source_ref = ?").run(sourceChain, ref);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return this.get(sourceChain, sourceRef);
+  }
+
+  approvalReissue(sourceChain, sourceRef) {
+    const encoded = this.get(sourceChain, sourceRef)?.approval_reissue;
+    return encoded ? reissueDeclaration(JSON.parse(encoded)) : null;
+  }
+
+  approvalHistory(sourceChain, sourceRef) {
+    return this.database.prepare("SELECT * FROM approval_history WHERE source_chain = ? AND source_ref = ? ORDER BY seq")
+      .all(sourceChain, sourceRef.toLowerCase());
   }
 
   approvalRequest(sourceChain, sourceRef) {

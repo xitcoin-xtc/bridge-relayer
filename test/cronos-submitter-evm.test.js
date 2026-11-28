@@ -8,7 +8,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AbiCoder, Interface, JsonRpcProvider, TypedDataEncoder, ZeroAddress, ZeroHash, encryptKeystoreJsonSync, keccak256 } from "ethers";
 import { BroadcastLedger } from "../src/broadcast-ledger.js";
-import { approveFinalizedTransfer, buildTransferApprovalRequest } from "../src/coordinator.js";
+import { approveFinalizedTransfer, buildTransferApprovalRequest, returnExpiredApprovals } from "../src/coordinator.js";
+import { createApprovalRetirementVerifier } from "../src/approval-retirement.js";
+import { APPROVAL_REISSUE_GRACE_SECONDS } from "../src/approvals.js";
+import { CronosRpcQuorum } from "../src/cronos-rpc.js";
+import { buildCronosSubmission } from "../src/submission.js";
+import { XitcoinRpcQuorum } from "../src/xitcoin-rpc.js";
 import { CometBftHttpClient, decodeXitcoinOutboundBlock, decodeXitcoinOutboundTransaction } from "../src/network.js";
 import { SignerApprovalJournal } from "../src/signer-journal.js";
 import { IsolatedSignerService, createSignerPolicy } from "../src/signer-service.js";
@@ -75,9 +80,15 @@ function isolatedSigners({ vault, proxies, comets }) {
   const policy = createSignerPolicy({ routeIds: [XITCOIN_TESTNET_ROUTE_ID], cronosChainIds: [338],
     xitcoinChainIds: ["xitcoin-testnet-v2-1"], cronosVaults: [vault], maximumAmount: (10n ** 21n).toString(), maximumDeadlineSeconds: 7_200 });
   const journals = [0, 1, 2].map(() => new SignerApprovalJournal());
+  // Each signer checks an explicit re-issue on the vault itself (the Xitcoin
+  // quorum is never contacted for a release).
+  const verifyRetirement = createApprovalRetirementVerifier({ cronos: new CronosRpcQuorum({ urls: proxies.map((proxy) => proxy.url),
+    allowLoopbackHttp: true }), cronosVault: vault, cronosConfirmations: 3, xitcoin: new XitcoinRpcQuorum({ allowLoopbackHttp: true,
+    origins: [{ rpcUrl: "http://127.0.0.1:9", restUrl: "http://127.0.0.1:10" }, { rpcUrl: "http://127.0.0.1:11", restUrl: "http://127.0.0.1:12" }] }) });
   const services = [0, 1, 2].map((index) => new IsolatedSignerService({ identity: `signer-${index + 1}`, signerAddress: signers[index],
-    policy, verifySource, journal: journals[index], signDigest: async (digest) => keys[index].sign(digest).serialized }));
-  return { services, close: () => { for (const provider of providers) provider.destroy(); for (const journal of journals) journal.close?.(); } };
+    policy, verifySource, journal: journals[index], verifyRetirement, signDigest: async (digest) => keys[index].sign(digest).serialized }));
+  return { services, verifyRetirement,
+    close: () => { for (const provider of providers) provider.destroy(); for (const journal of journals) journal.close?.(); } };
 }
 
 async function scenario(run, { version = "testnet", chainId = 338, burns = 1, approved = burns, deadlineOffset = 3_600,
@@ -152,7 +163,7 @@ async function scenario(run, { version = "testnet", chainId = 338, burns = 1, ap
       mine: async (blocks = 3) => { await facts.settle(); await chain.rpc("anvil_mine", [`0x${blocks.toString(16)}`]); },
       ledger: () => new BroadcastLedger(paths.ledger, cronosLedgerBinding(manifest), journalOptions("cronos")),
     };
-    await run({ chain, proxies, bridge, burns: allBurns, store, manifest, paths, runtime, facts, directory,
+    await run({ chain, proxies, bridge, burns: allBurns, store, manifest, paths, runtime, facts, directory, signerSet,
       approve: (burn, deadline = deadlineUnix) => approve(store, burn, bridge.vault, deadline, signerSet?.services) });
   } finally {
     for (const step of cleanup.reverse()) { try { await step(); } catch { /* best effort */ } }
@@ -450,12 +461,80 @@ test("killed after signing, then a foreign transaction takes the nonce: no send,
   assert.equal(await facts.nonce(), 1);
 }));
 
-test("expired approvals wait for re-issue without claiming", options, () => scenario(async ({ runtime, facts, burns }) => {
-  const report = await (await runtime()).runOnce();
+test("an approval that expired before submission is re-issued only after the vault shows it dead, then released once", options, () => scenario(async ({ runtime, facts, burns, chain, bridge, store, signerSet }) => {
+  const burn = burns[0];
+  const original = store.approvalRequest("xitcoin", burn.requestId);
+  const rt = await runtime();
+  const report = await rt.runOnce();
   assert.deepEqual(report.waiting, ["approval_expired_awaiting_reissue"]);
   const ledger = facts.ledger();
-  try { assert.equal(ledger.inspect(burns[0].requestId).found, false); } finally { ledger.close(); }
+  try { assert.equal(ledger.inspect(burn.requestId).found, false); } finally { ledger.close(); }
   assert.equal(await facts.nonce(), 0);
+  // The submitter gave the approval up; it never claims the transfer under it.
+  assert.deepEqual({ ...store.reissueRequested("xitcoin", burn.requestId) }, { digest: original.digest, destinationRef: null });
+  assert.equal((await rt.runOnce()).action, "idle");
+
+  // Coordinator: local grace passed, but the vault's finalized time has not.
+  const now = original.deadlineUnix + APPROVAL_REISSUE_GRACE_SECONDS + 1;
+  const build = (transfer, deadlineUnix) => buildTransferApprovalRequest({ transfer: { ...transfer, state: "finalized" },
+    routeId: XITCOIN_TESTNET_ROUTE_ID, cronosRouteId: TESTNET_ROUTE_ID, cronosChainId: 338, cronosVault: bridge.vault,
+    xitcoinChainId: "xitcoin-testnet-v2-1", signerSetVersion: 1, deadlineUnix });
+  const coordinator = (nowUnix) => returnExpiredApprovals({ store, build, nowUnix, windowSeconds: 1_800, verifyRetired: signerSet.verifyRetirement });
+  assert.deepEqual(await coordinator(now), { returned: 0, processedElsewhere: 0, waiting: ["deadline_not_passed"] });
+  assert.equal(facts.relay(burn).state, "approved");
+  await chain.rpc("evm_increaseTime", [APPROVAL_REISSUE_GRACE_SECONDS + 120]);
+  await facts.mine(4);
+  assert.deepEqual(await coordinator(now), { returned: 1, processedElsewhere: 0, waiting: [] });
+  assert.equal(facts.relay(burn).state, "finalized");
+  // Signers sign the explicit re-issue only after their own check on the vault.
+  const request = store.approvalRequest("xitcoin", burn.requestId);
+  assert.notEqual(request.digest, original.digest);
+  const clients = signerSet.services.map((service) => ({ identity: service.identity, approve: (value) => service.approve(value, { nowUnix: now }) }));
+  await approveFinalizedTransfer({ store, sourceChain: "xitcoin", sourceRef: burn.requestId, request, clients,
+    authorizedSigners: [...signers], threshold: 2, nowUnix: now });
+  assert.equal(facts.relay(burn).state, "approved");
+  // The original approval can never be signed again.
+  await assert.rejects(signerSet.services[0].approve(original, { nowUnix: original.deadlineUnix - 10 }), /only an explicit re-issue/);
+  // The submitter releases once with the re-issued approval.
+  await completes(rt, facts, burn);
+  await assertSingleRelease(facts, burn);
+  const check = facts.ledger();
+  try { assert.equal(check.inspect(burn.requestId).approvalDigest, request.digest); } finally { check.close(); }
+  assert.equal(await facts.nonce(), 1);
+}, { deadlineOffset: 30 }));
+
+test("a given-up approval used by leaked signatures before its deadline completes as released elsewhere, never re-issued or signed", options, () => scenario(async ({ runtime, facts, burns, chain, bridge, store, signerSet }) => {
+  const burn = burns[0];
+  const original = store.approvalRequest("xitcoin", burn.requestId);
+  const rt = await runtime();
+  assert.deepEqual((await rt.runOnce()).waiting, ["approval_expired_awaiting_reissue"]);
+  // Someone holding the stored approvals releases the burn before the deadline.
+  const leaked = buildCronosSubmission({ request: original, approvals: store.approvals("xitcoin", burn.requestId), vault: bridge.vault });
+  const foreign = await chain.rpc("eth_sendRawTransaction", [await signedCall(chain, localKeys.deployer, { to: leaked.to, data: leaked.data,
+    gasLimit: 400_000n })]);
+  await facts.mine(4);
+  assert.equal((await chain.rpc("eth_getTransactionReceipt", [foreign])).status, "0x1");
+  // The coordinator's destination proof finds the burn processed: no re-issue.
+  const now = original.deadlineUnix + APPROVAL_REISSUE_GRACE_SECONDS + 1;
+  const build = (transfer, deadlineUnix) => buildTransferApprovalRequest({ transfer: { ...transfer, state: "finalized" },
+    routeId: XITCOIN_TESTNET_ROUTE_ID, cronosRouteId: TESTNET_ROUTE_ID, cronosChainId: 338, cronosVault: bridge.vault,
+    xitcoinChainId: "xitcoin-testnet-v2-1", signerSetVersion: 1, deadlineUnix });
+  const coordinator = () => returnExpiredApprovals({ store, build, nowUnix: now, windowSeconds: 1_800, verifyRetired: signerSet.verifyRetirement });
+  assert.deepEqual(await coordinator(), { returned: 0, processedElsewhere: 1, waiting: ["transfer_processed"] });
+  assert.deepEqual(await coordinator(), { returned: 0, processedElsewhere: 0, waiting: ["awaiting_release_elsewhere"] });
+  // The submitter completes it from the verified Released event of that transaction.
+  const report = await rt.runOnce();
+  assert.deepEqual([report.action, report.releaseHash], ["released_elsewhere", foreign]);
+  const relay = facts.relay(burn);
+  assert.deepEqual([relay.state, relay.destination_ref, relay.release_ref], ["completed", null, foreign]);
+  const ledger = facts.ledger();
+  try {
+    const row = ledger.inspect(burn.requestId);
+    assert.deepEqual([row.state, row.releaseHash, row.signedHex], ["released_elsewhere", foreign, null]);
+  } finally { ledger.close(); }
+  assert.equal(await facts.nonce(), 0); // the submitter never signed or sent anything
+  assert.equal((await rt.runOnce()).action, "idle");
+  assert.equal(store.approvalHistory("xitcoin", burn.requestId).length, 0);
 }, { deadlineOffset: 30 }));
 
 test("pinned identity mismatches and Cronos mainnet stop before any claim", options, async () => {

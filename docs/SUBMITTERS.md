@@ -170,7 +170,8 @@ service-owned parent, `O_NOFOLLOW` traversal, inode rechecks), immediate
 transactions, `synchronous=FULL` and WAL. Exclusive creation initializes it;
 reopening requires the identical table DDL, constraints, triggers, version and
 binding. There is no repair, delete, reset, expiry or retry API. The only
-migration is forward-only from schema version 1 to version 2 (below).
+migrations are forward-only, from schema version 1 to 2 and from 2 to 3
+(below).
 
 Schema version 2 lifts one rule of version 1: the `CHECK` constraint that
 capped `broadcast_attempts` at 32, which made a row that ran out of attempts
@@ -184,6 +185,35 @@ version 2 schema before anything commits. Any other schema or version is
 refused unchanged. Tests migrate a version 1 ledger with rows in every state,
 compare every row before and after, and check that every trigger still
 applies.
+
+Schema version 3 lets an `expired` row, and only an `expired` row, continue as
+a new attempt under a re-issued approval (see
+[PROTOCOL.md](PROTOCOL.md#expired-approvals)). It adds the append-only table
+`superseded_attempts` and three triggers, and changes three others; no column,
+constraint or row of version 2 changes:
+
+- `reopenExpired` first copies the expired attempt (approval digest, request
+  hash, claim epoch, nonce, exact bytes, digest, hash, send count, block) into
+  `superseded_attempts`, whose insert trigger accepts only an exact copy of an
+  `expired` row and whose rows can never be updated or deleted; it then turns
+  the row into `unclaimed` without bytes under the new approval digest. The
+  transition `expired -> unclaimed` is accepted only when the archived copy
+  exists for exactly that row and new digest, and the new digest differs;
+- no archived nonce, transaction hash or transaction digest can ever be
+  recorded again (a trigger on every `signed` write); account nonces stay
+  strictly sequential, so the new attempt signs with the next nonce;
+- `attention.stalled` measures the current attempt (its latest `signed`
+  event), and `expired` stops counting once the row continues.
+
+A version 2 ledger is migrated on open when its schema is exactly the version
+2 DDL and its binding is this deployment's: the new table and triggers are
+created and the three changed triggers recreated in the opening immediate
+transaction, and the result must equal the exact version 3 schema before
+anything commits; a version 1 ledger is migrated to 2 and then to 3 in the same
+transaction. Tests migrate a version 2 ledger with an `expired` row, compare
+every row, reopen it, and check with raw SQL that a reopen without the exact
+archived copy, under the same digest, from any other state, or reusing an
+archived nonce, hash or bytes, is refused.
 
 The binding is the destination deployment identity: destination, chain ID,
 route, target (Cronos vault address or the Xitcoin bridge module), target
@@ -219,21 +249,25 @@ The ledger enforces, in one fenced immediate transaction per change:
   recipient). `released_elsewhere` is allowed without bytes or after our
   identical bytes were sent, never from `signed`, so a reserved nonce is never
   left unused. `rejected` is allowed only without bytes;
-- durable deferrals: a transfer that cannot proceed yet (for example an expired
-  approval awaiting re-issue) is skipped until a backoff expires (1 minute,
+- durable deferrals: a transfer that cannot proceed yet (for example
+  insufficient liquidity) is skipped until a backoff expires (1 minute,
   doubling, at most 1 hour). A deferral is a scheduling hint only: it never
-  changes a transfer row and is never permission to send;
+  changes a transfer row and is never permission to send. A transfer that
+  waits for a re-issued approval instead has its deferral cleared, so the
+  re-issued approval is tried at once;
 - a claimed row has no bytes and was never sent, so it may be rebound to a
   re-issued approval. Once bytes exist the approval digest is permanent;
 - `unclaimed`: a claimed row (no bytes, no nonce) whose transfer cannot
   proceed yet, for example because its approval expired during downtime, is
-  released and deferred so it never holds the single unfinished slot. It may
-  be claimed again later;
-- two more permanent states that never block the queue and are counted in
-  every cycle report (`attention`) until an operator reviews them: `expired`
-  (our identical bytes were mined and reverted after the approval deadline,
-  consuming their nonce; the burn still awaits a new approval and RelayStore
-  keeps it `submitted`, in flight) and `release_unverified` (the outcome
+  released (and deferred, or handed back for re-issue) so it never holds the
+  single unfinished slot. It may be claimed again later, also under a
+  re-issued approval;
+- two more states that never block the queue and are counted in every cycle
+  report (`attention`): `expired` (our identical bytes were mined and reverted
+  after the approval deadline, consuming their nonce; RelayStore keeps the
+  transfer `submitted`, in flight, until the engine hands its approval back
+  and the coordinator re-issues it; the row then continues as a new attempt,
+  schema version 3) and the permanent `release_unverified` (the outcome
   could not be verified: the destination reports the transfer processed but
   no matching release was found, or history about our mined transaction is no
   longer served; never a completion, RelayStore unchanged; the reason code is
@@ -266,7 +300,8 @@ ordering:
    transfer by the source reference stored in its ledger row (never by a
    bounded window over RelayStore rows);
 2. otherwise walk all `approved` transfers in order with keyset pagination,
-   skipping rejected and still-deferred ones, and assess at most 8 per cycle;
+   skipping rejected, still-deferred and handed-back ones, and assess at most
+   8 per cycle;
 3. read the persisted approval request and approvals under size bounds and
    bind their exact stored text by SHA-256 (`requestHash`). The adapter
    revalidates the request against the transfer, route and authorized quorum
@@ -292,6 +327,33 @@ ordering:
    transaction (or none if we never signed); the new `release_ref` column
    records the transaction that actually executed the release (ours, or the
    other transaction), where a reconciler reads RelayStore.
+
+Expired approvals are handed back for re-issue, never retried with new bytes
+under the same approval:
+
+- when the adapter decides the transfer-scoped wait
+  `approval_expired_awaiting_reissue` for a transfer without bytes (its
+  approval is within `minDeadlineMarginSeconds` of, or past, its deadline), or
+  when the engine finds the transfer's ledger row `expired`, it records in
+  RelayStore (`requestReissue`, conditional on the exact row) the approval
+  digest it gives up and the only transaction it holds for it (none, or the
+  expired one), and clears the transfer's deferral;
+- from then on it never claims the transfer under that approval;
+- the coordinator re-issues it only after its own destination proof and
+  returns it to `finalized`; once it is `approved` again with the re-issued
+  approval, a row without bytes is claimed under it as usual, and an `expired`
+  row continues as a new attempt (`reopenExpired`, above) and signs with the
+  next nonce;
+- when the coordinator's proof instead shows the given-up approval's replay
+  key used (`transfer_processed`, for example leaked signatures used before
+  the deadline), it flags the transfer (`processed_elsewhere`) and never
+  re-issues it. For a flagged transfer without bytes the engine asks the
+  adapter only for the release-by-another-transaction evidence
+  (`releasedElsewhere`, independent of the approval's deadline; it never
+  decides to sign) and records `released_elsewhere` with that transaction,
+  completing RelayStore with `release_ref`; mismatching evidence halts, and a
+  used replay key without matching evidence is recorded `release_unverified`;
+- a `rejected` transfer never hands its approval back.
 
 RelayStore opens with a bounded 5-second busy timeout because the coordinator
 and the Cronos submitter both write it; a longer lock fails with `SQLITE_BUSY`,
@@ -437,8 +499,8 @@ the same transport.
   otherwise the transfer is `rejected` (the vault would refuse it forever) and
   the queue moves on. Signers refuse such approvals too;
 - the deadline leaves at least `minDeadlineMarginSeconds` against both the local
-  clock and the latest block timestamp; otherwise the transfer is deferred until
-  re-issue;
+  clock and the latest block timestamp; otherwise its approval is handed back
+  for re-issue (see the durable ledger section above);
 - amount within `maxAmount` and the vault's `maxReleaseAmount` (otherwise
   deferred);
 - on every origin at the latest block: vault not paused (`route_paused` stops
@@ -484,7 +546,8 @@ are sent without simulation; a revert after the deadline is then recorded as
 Remaining exposure: with two origins (the minimum) a strict majority is both,
 so one faulty origin still holds a signed row until the local deadline margin
 is lost, at which point its bytes are sent and the transfer typically ends
-`expired`, needing a new approval. Configure three or more independent
+`expired`, after which its approval is re-issued and it is sent again as a new
+attempt. Configure three or more independent
 origins. Confirmation, completion and every halt still need all origins.
 
 ### Confirmation
@@ -839,7 +902,8 @@ plus the maximum expected downtime.
   queue moves on;
 - the deadline leaves at least `minDeadlineMarginSeconds` against both the local
   clock and the latest block time (the chain rejects a block time after the
-  deadline); otherwise the transfer is deferred until re-issue;
+  deadline); otherwise its approval is handed back for re-issue (see the
+  durable ledger section above);
 - on every origin, identical: bridge parameters (chain ID, `axtc`, 2-of-3,
   attestation and source-deposit domains) and the route (stored route ID,
   source chain `338`, the pinned signer set and signer set version). One origin
@@ -1110,12 +1174,11 @@ canary.
 
 ## Remaining before the bridge can run end to end
 
-- Coordinator re-issue of expired approvals for transfers already `approved`
-  but not submitted (both submitters defer them and wait).
 - A scheduler and service unit for the reconciler (its chain readers exist;
   see [OPERATIONS.md](OPERATIONS.md#reconciliation)).
 - An offline review procedure for halted or failed ledger rows, and a reviewed
-  completion tool for `release_unverified`, `expired` and `reverted` rows.
+  completion tool for `release_unverified` and `reverted` rows (`expired` rows
+  continue automatically after an approval re-issue).
 - Light-client verification of the attestation record (`abci_query` with
   `prove=true` against a verified header). The submitter trusts the agreement
   of independent origins instead.

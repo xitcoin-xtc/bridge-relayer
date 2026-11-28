@@ -8,6 +8,7 @@ import { SigningKey, computeAddress } from "ethers";
 import { randomBytes } from "node:crypto";
 import { RelayStore } from "../src/store.js";
 import { FinalityViolation } from "../src/watchers.js";
+import { RetirementUnproven } from "../src/approval-retirement.js";
 
 const blockHash = `0x${"11".repeat(32)}`;
 const txHash = `0x${"22".repeat(32)}`;
@@ -228,32 +229,60 @@ test("an expired persisted approval request is re-issued for the same source dep
       payload: { depositId, nonce: "7", destination: "xtc1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg32rdvg9", amount: "10" } }]; },
   });
   const xitcoinWatcher = watcher({ async latestFinalizedHeight() { return 0; }, async events() { return []; } });
-  const cycle = (nowUnix) => runApprovalOnlyCycle({ store, cronosWatcher, xitcoinWatcher, clients,
+  // The destination check: unproven until told otherwise.
+  let proof = new RetirementUnproven("deadline_not_passed");
+  const checks = [];
+  const verifyRetired = async (input) => {
+    checks.push(input);
+    if (proof instanceof Error) throw proof;
+    return proof;
+  };
+  const cycle = (nowUnix, options = {}) => runApprovalOnlyCycle({ store, cronosWatcher, xitcoinWatcher, clients,
     authorizedSigners: addresses, routeId: XITCOIN_TESTNET_ROUTE_ID, cronosRouteId: routeBytes,
     cronosChainId: 338, cronosVault: vault, xitcoinChainId: "xitcoin-testnet-v2-1", approvalWindowSeconds: 300,
-    nowUnix, startHeights: { cronos: 10, xitcoin: 1 } });
+    nowUnix, startHeights: { cronos: 10, xitcoin: 1 }, verifyRetired, ...options });
 
   await assert.rejects(() => cycle(1_900_000_000), /quorum not reached/);
   const first = store.approvalRequest("cronos", depositId.slice(2));
   assert.equal(first.deadlineUnix, 1_900_000_300);
+  assert.ok(seen.every((request) => !Object.hasOwn(request, "reissue")));
   // Still valid: reused unchanged.
   await assert.rejects(() => cycle(1_900_000_200), /quorum not reached/);
   assert.deepEqual(store.approvalRequest("cronos", depositId.slice(2)), first);
   // Expired but inside the grace window: neither reused nor re-issued.
   const waiting = await cycle(1_900_000_400);
   assert.equal(waiting.awaitingReissue, 1);
+  assert.deepEqual(waiting.reissueWaiting, ["approval_reissue_grace"]);
   assert.equal(waiting.approved, 0);
-  // After the grace window: re-issued with a new deadline for the same deposit.
+  assert.equal(checks.length, 0);
+  // After the grace window, but the destination does not show the expired
+  // request dead (or no verifier is configured): still waiting, unchanged.
   online = true;
+  for (const [code, options] of [["deadline_not_passed", {}], ["transfer_processed", {}], ["retirement_verifier_missing", { verifyRetired: undefined }]]) {
+    proof = new RetirementUnproven(code);
+    const unproven = await cycle(1_900_000_500, options);
+    assert.deepEqual([unproven.approved, unproven.awaitingReissue, unproven.reissueWaiting], [0, 1, [code]]);
+    assert.deepEqual(store.approvalRequest("cronos", depositId.slice(2)), first);
+  }
+  assert.equal(checks.at(-1).previousDeadlineUnix, first.deadlineUnix);
+  assert.equal(checks.at(-1).request.deadlineUnix, 1_900_000_800);
+  // Proven dead: re-issued with a new deadline for the same deposit, and every
+  // signer receives the explicit re-issue declaration.
+  proof = { retired: true, destination: "xitcoin", height: 9, blockTime: 1_900_000_301 };
+  seen.length = 0;
   const result = await cycle(1_900_000_500);
   assert.equal(result.approved, 1);
   const reissued = store.approvalRequest("cronos", depositId.slice(2));
   assert.equal(reissued.deadlineUnix, 1_900_000_800);
   assert.notEqual(reissued.digest, first.digest);
   assert.deepEqual({ ...reissued.payload, deadlineUnix: 0 }, { ...first.payload, deadlineUnix: 0 });
-  assert.ok(seen.every((request) => request.deadlineUnix >= 1_900_000_000));
+  assert.equal(seen.length, 3);
+  assert.ok(seen.every((request) => request.digest === reissued.digest
+    && JSON.stringify(request.reissue) === JSON.stringify({ previousDigest: first.digest, previousDeadlineUnix: first.deadlineUnix })));
   assert.equal(store.get("cronos", depositId.slice(2)).state, "approved");
   assert.ok(store.approvals("cronos", depositId.slice(2)).every((approval) => approval.digest === reissued.digest));
+  assert.deepEqual(store.approvalHistory("cronos", depositId.slice(2)).map((row) => [JSON.parse(row.approval_request).digest, row.replaced_by]),
+    [[first.digest, reissued.digest]]);
   store.close();
 });
 
@@ -273,5 +302,32 @@ test("the store re-issues only an expired request and drops approvals for the ex
   assert.equal(store.reissueApprovalRequest("cronos", ref, old, next, { nowUnix: 2_000 }).digest, next.digest);
   assert.equal(store.approvals("cronos", ref).length, 0);
   assert.throws(() => store.reissueApprovalRequest("cronos", ref, old, next, { nowUnix: 2_000 }), /conflicting/);
+  store.close();
+});
+
+test("a given-up approval whose replay key the destination shows used is routed to its submitter, never re-issued", async () => {
+  const { approvedTransfer } = await import("./fixtures/durable-adapter.js");
+  const { returnExpiredApprovals } = await import("../src/coordinator.js");
+  const { TESTNET_ROUTE_ID } = await import("../src/preflight.js");
+  const store = new RelayStore();
+  const { sourceChain, sourceRef, request } = approvedTransfer(store, "cronos", 1, { deadlineUnix: 1_900_000_030 });
+  const build = (transfer, deadlineUnix) => buildTransferApprovalRequest({ transfer: { ...transfer, state: "finalized" },
+    routeId: XITCOIN_TESTNET_ROUTE_ID, cronosRouteId: TESTNET_ROUTE_ID, cronosChainId: 338, cronosVault: "0x1c94273C0b199b139D82da3786C9eCbE189D5919",
+    xitcoinChainId: "xitcoin-testnet-v2-1", signerSetVersion: 1, deadlineUnix });
+  const checks = [];
+  const verifyRetired = async (input) => { checks.push(input); throw new RetirementUnproven("transfer_processed"); };
+  const cycle = () => returnExpiredApprovals({ store, build, nowUnix: 1_900_000_500, windowSeconds: 600, verifyRetired });
+  // Without the submitter's request nothing happens.
+  assert.deepEqual(await cycle(), { returned: 0, processedElsewhere: 0, waiting: [] });
+  assert.equal(store.requestReissue(sourceChain, sourceRef, { digest: request.digest }), true);
+  assert.deepEqual(await cycle(), { returned: 0, processedElsewhere: 1, waiting: ["transfer_processed"] });
+  assert.equal(store.processedElsewhere(sourceChain, sourceRef), request.digest);
+  assert.equal(store.get(sourceChain, sourceRef).state, "approved");
+  assert.equal(store.approvalRequest(sourceChain, sourceRef).digest, request.digest);
+  // Flagged once: never checked or re-issued again; the submitter completes it.
+  assert.deepEqual(await cycle(), { returned: 0, processedElsewhere: 0, waiting: ["awaiting_release_elsewhere"] });
+  assert.equal(checks.length, 1);
+  assert.throws(() => store.returnForReissue(sourceChain, sourceRef, request, build(store.get(sourceChain, sourceRef), 1_900_001_000),
+    { nowUnix: 1_900_000_500 }), /not awaiting/);
   store.close();
 });
