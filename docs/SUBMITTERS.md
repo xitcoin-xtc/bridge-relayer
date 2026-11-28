@@ -754,7 +754,7 @@ submitter key. Bounds: 2–4 origins per chain, each origin an independent
 CometBFT RPC origin and an independent REST origin; `confirmations` 1–1000
 (CometBFT commits are final; this is a margin on top); `historyBlocks`
 1000–10000000; `maxGas` 100000–5000000; `gasAdjustmentPercent` 110–300;
-`gasHeadroom` 10000–1000000; `feeMultiplierPercent` 100–1000; `maxGasPrice` (axtc
+`gasHeadroom` 10000–1000000; `feeMultiplierPercent` 150–1000; `maxGasPrice` (axtc
 per gas) at most 10^15; `maxFee` (axtc) at most 10^24;
 `minDeadlineMarginSeconds` 30–3600; `maxBroadcastAttempts` 1–32;
 `cronos.confirmations` 2–10000. `check` validates the manifest and release
@@ -878,24 +878,40 @@ Before the first send, the stored bytes are decoded and re-checked (message
 equal to the request, our key, the row's sequence, gas and fee caps, valid
 signature for the account number). Once the local clock says the deadline
 margin is lost, they are sent unless a strict majority reports the route
-paused. Otherwise strict-majority reads decide: the sequence (unanimous:
-consumed halts `nonce_consumed_before_send`, regressed halts; otherwise it
-waits), the route state, the attestation (processed elsewhere: send once
-anyway so the reserved sequence is consumed), the latest block time and a
-simulation of the exact signed transaction.
+paused or a base fee their fee does not cover. Otherwise strict-majority reads
+decide: the sequence (unanimous: consumed halts `nonce_consumed_before_send`,
+regressed halts; otherwise it waits), the route state, whether the fee covers
+the base fee and minimum gas price (otherwise it waits, `fee_below_required`),
+the attestation (processed elsewhere: send once anyway so the reserved
+sequence is consumed), the latest block time and a simulation of the exact
+signed transaction.
 
 ### Confirmation
 
-A transfer completes only when, on every origin: `tx_search` returns our
-transaction with identical bytes, height and result code `0`; the block at
-that height is identical and lists our hash; it has `confirmations` blocks on
-top; and the attestation query reports `PROCESSED` with a record naming our
-transaction hash and height and every field of our approval (route ID,
+Our transaction is recognised by its signed content, not only by its hash:
+pos-chain's eth_secp256k1 verifier (`crypto/ethsecp256k1`,
+`verifySignatureECDSA`) drops a 65th signature byte without checking it and
+also accepts a 64-byte `R || S`, and the SDK's `TxRaw` decoder accepts a
+repeated `body_bytes` field (the last wins) and overlong field tags. Anyone who
+has seen our bytes can therefore re-wrap the same body, auth info and `R || S`
+into another `TxRaw` with another hash, which spends our sequence and fee
+exactly as ours would. Such a re-encoding is our signed transaction; when it
+lands first it is recognised in the block that consumed our sequence.
+
+A transfer completes only when: the transaction that consumed our sequence
+carries our signed content, a strict majority of origins returns its
+`tx_search` result identically (both of two origins, two of three) with result
+code `0` and our `acc_seq` event, the block at that height is identical on
+every origin and lists it, it has `confirmations` blocks on top, and the
+attestation query reports `PROCESSED` on every origin with a record naming
+that transaction and height and every field of our approval (route ID,
 direction, source chain and reference, nonce, recipient, amount, deadline,
 destination chain ID, payload hash, signing digest, signer set version and the
-approvers in submission order). Then the ledger records `finalized` and only
-afterwards RelayStore records `completed`. A successful transaction whose
-record differs halts (`record_mismatch_after_success`).
+approvers in submission order). Our own bytes then end `finalized`; a
+re-encoding ends `released_elsewhere` with its own hash, so RelayStore's
+`release_ref` names the transaction that actually executed (`destination_ref`
+keeps naming ours). Only then does RelayStore record `completed`. A successful
+transaction whose record differs halts (`record_mismatch_after_success`).
 
 ### Releases by other transactions
 
@@ -927,37 +943,53 @@ names ours, or none) and the queue moves on.
 
 ### Recovery decisions
 
-All from canonical observations, never from send errors:
+All from canonical observations, never from send errors. The account sequence
+on every origin decides the branch first.
 
 | Observation | Action |
 | --- | --- |
-| our transaction in any origin's mempool | wait |
-| unknown everywhere, sequence unused, complete mempool listings, route usable, attempts left | resend the identical bytes (also after the deadline or a release elsewhere, to consume the sequence) |
-| unknown everywhere and the sequence consumed (re-observed first) | halt `nonce_consumed_without_inclusion` |
+| sequences differ between origins | wait (propagation) |
 | account sequence below our row's | halt `account_sequence_regressed` |
-| a mempool listing that is not complete | wait |
-| committed on some origins only, recent | wait (indexing lag) |
-| origins return different results, bytes or blocks | temporary stop (`rpc_disagreement`) |
-| committed, fewer than `confirmations` blocks on top | wait |
-| committed with code `0` and a matching record | `finalized`; RelayStore `completed` |
-| committed with code `0` and any other record | halt `record_mismatch_after_success` |
-| failed without an `acc_seq` event (ante handler, for example a fee below a risen base fee), sequence unused, attempts left | resend the identical bytes |
-| failed without an `acc_seq` event and the sequence consumed | halt `nonce_consumed_without_inclusion` |
+| sequence unused, our signed content (our bytes or a re-encoding) in any origin's mempool, or a listing not complete | wait |
+| sequence unused, nothing in flight, route usable, our fee covers the base fee and minimum gas price a strict majority reports, attempts left | resend the identical bytes (also after the deadline or a release elsewhere, to consume the sequence) |
+| sequence unused, nothing in flight, fee below what would be admitted now | wait (`fee_below_required`) |
+| sequence unused, nothing in flight, attempts exhausted | wait (`broadcast_attempts_exhausted`); never a halt |
+| sequence consumed in a block that holds no transaction with our signed content | halt `nonce_consumed_without_inclusion` |
+| sequence consumed by our signed content, its result not served by a strict majority, block recent | wait (indexing lag) |
+| the same, block deeper than 100 blocks | settled from consensus state: a record naming it and our approval completes it, a record naming another transaction is a release elsewhere, otherwise `release_unverified` (`inclusion_history_unserved`); never a halt |
+| origins return different blocks or a result for a block that does not list it | temporary stop (`rpc_disagreement`) |
+| included, fewer than `confirmations` blocks on top | wait |
+| code `0` and a record naming it with our approval | `finalized` (our bytes) or `released_elsewhere` (a re-encoding); RelayStore `completed` |
+| code `0` and any other record | halt `record_mismatch_after_success` |
 | failed with our `acc_seq`, processed by another transaction | `released_elsewhere` |
+| failed with our `acc_seq`, record naming it | halt `record_names_failed_transaction` |
 | failed with our `acc_seq`, block time after the deadline | `expired` (non-blocking) |
 | failed with our `acc_seq`, a lasting condition at both heights (below) | `reverted` with the cause (non-blocking) |
 | failed with our `acc_seq`, history before it no longer served | `release_unverified` (`failure_history_unserved`) |
 | any other failure, including out of gas | `failed`; stop; never retried |
-| attempts exhausted | halt `broadcast_attempts_exhausted` |
+| consumed before the last `historyBlocks` blocks, no record naming our own transaction | halt `nonce_consumed_without_inclusion` |
+
+Liveness of an unused sequence. A transaction evicted from mempools, rejected
+at admission or rejected by the ante handler at execution (for example a fee
+below a base fee that rose up to 12.5% per full block, which an outsider can
+cause by filling blocks) leaves our sequence unused, and the signed bytes stay
+valid for anyone to submit. That is never a persisted halt: the identical
+bytes are resent only when nothing carrying our signed content is in any
+mempool and their fee would be admitted now, so attempts are spent on sends
+that can be admitted; once the attempts are spent the row waits. CometBFT
+removes rejected and evicted transactions from its mempool cache by default
+(`keep-invalid-txs-in-cache = false`, required on every origin), so identical
+bytes can be readmitted. `feeMultiplierPercent` must be at least 150 so that
+the fee keeps headroom over base-fee rises between signing and execution.
+Re-signing the same message at the same sequence with a higher fee is not
+done: two different signed transactions for one sequence would break the
+ledger's one-transaction rule, and the base fee falls again once blocks are
+no longer full.
 
 Failure classification. A failed message still ran the ante handler, which
 consumed our sequence and reported it as the `tx` event `acc_seq`
-(`account/sequence`) identically on every origin; a transaction rejected by the
-ante handler at execution carries no such event and leaves the sequence
-unused. CometBFT's mempool cache may refuse to readmit identical bytes it has
-already seen committed, so such a row typically ends
-`broadcast_attempts_exhausted`; `feeMultiplierPercent` exists to keep the fee
-above base-fee rises between admission and execution. For a failed message,
+(`account/sequence`); a transaction rejected by the ante handler at execution
+carries no such event and leaves the sequence unused. For a failed message,
 state is read with height-pinned queries at the end of the block before ours
 and at the end of ours on every origin; a condition counts only when it holds
 at both: route paused or disabled (`route_paused`), signer set rotated
@@ -970,8 +1002,16 @@ Out of gas (gas used at the limit) is always `failed`. Recent history an
 origin does not serve is a temporary stop; history older than `historyBlocks`
 that an origin explicitly refuses ends in the `release_unverified` alert.
 
-Every persisted halt is based on evidence every origin returns identically,
-except a mismatching processing record from a single origin (above).
+Every persisted halt is based on state and blocks every origin returns
+identically and on transaction results a strict majority of origins returns
+identically (both of two, two of three), except a mismatching processing record
+from a single origin (above). A transaction result that only a minority of
+origins returns (for example one origin answering for old history the others
+no longer index) is never used: with no strict majority it fails closed to a
+wait, a completion only on consensus state, or the non-blocking
+`release_unverified` alert, never a halt. As on the Cronos side, three or more
+origins are needed for one faulty origin to be outvoted rather than only
+ignored.
 
 ### Tests
 
@@ -999,12 +1039,19 @@ disagreement on the route, on the replay state and a stalled simulation
 quorum-signed resume; an approval too close to its deadline; signed bytes first
 sent after the deadline (`expired`, the next transfer proceeds); a third-party
 submission before any claim (no submitter transaction) and after we signed
-(our bytes consume the sequence once, then `released_elsewhere`).
+(our bytes consume the sequence once, then `released_elsewhere`); and a
+re-encoding of our signed bytes with another signature byte, which the chain
+accepts, landing first (recognised by signed content: `released_elsewhere`
+with its hash, never a halt).
 `test/xitcoin-adapter.test.js` covers the remaining decisions against a
 deterministic model of the origins: ante-handler failures, consumed and
 regressed sequences, failure classification at both heights, history no longer
 served, mismatching records from one origin, strict-majority sends with three
-origins and stored-byte tampering. `test/xitcoin-transaction.test.js` and
+origins, stored-byte tampering, re-encodings with any 65th byte or 64-byte
+signatures (also next to our own ante-rejected bytes in one block), resends
+gated on the fee and on nothing in flight with exhausted attempts waiting, and
+old transaction results from a minority of origins that can never force a
+halt while a strict majority of three can. `test/xitcoin-transaction.test.js` and
 `test/xitcoin-rpc.test.js` cover the encoding (chain vectors, strict decoding)
 and every normalizer. CI builds `xitcoind` at the pinned commit (cached by
 commit, Go version and runner) and runs these tests on every change; locally
