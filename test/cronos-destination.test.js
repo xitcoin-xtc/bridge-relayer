@@ -87,3 +87,13 @@ test("unrelated events may contain a zero topic without weakening the release ma
   evidence.logs[0].topics[0] = "0x00";
   rejects(() => inspectCronosInclusion(plan, signed, evidence));
 });
+
+// Regression: the vault route is deployment-pinned (PROTOCOL.md). The keccak of
+// the Xitcoin route label is a different value and must not identify the vault.
+test("Cronos identity requires the deployed testnet vault route, not a label hash", () => {
+  const input = outbound();
+  assert.equal(input.identity.routeId, "0x21121c16b53a726056a6683f00c7eb4da5501ce8a2abc8a4677e06f1e94b5cd9");
+  assert.equal(prepareCronosRelease(input).routeId, input.identity.routeId);
+  const label = "0xb9ae829d654d824b9046d969c96822a479b9eac3488642b4092928d65e07df5b";
+  rejects(() => prepareCronosRelease({ ...input, identity: { ...input.identity, routeId: label }, state: { ...input.state, routeId: label } }));
+});

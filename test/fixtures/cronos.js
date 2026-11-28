@@ -1,6 +1,7 @@
 import { Transaction, Interface } from "ethers";
 import { buildApprovalRequest } from "../../src/approvals.js";
-import { DIRECTION_OUTBOUND, cronosRouteId } from "../../src/protocol.js";
+import { DIRECTION_OUTBOUND } from "../../src/protocol.js";
+import { TESTNET_ROUTE_ID } from "../../src/preflight.js";
 import { keys, signers, sign } from "./destination.js";
 export function outbound() {
   const vault = "0x1000000000000000000000000000000000000001";
@@ -9,7 +10,7 @@ export function outbound() {
     amount: "10", signerSetVersion: "1", deadline: "2000000000",
   } });
   const identity = { chainId: 338, vault, codeHash: `0x${"cc".repeat(32)}`,
-    routeId: cronosRouteId("cronos-testnet-xitcoin-testnet"), submitter: signers[2] };
+    routeId: TESTNET_ROUTE_ID.toLowerCase(), submitter: signers[2] };
   return { request, approvals: sign(request), authorizedSigners: signers, nowUnix: 1_900_000_000, identity,
     state: { chainId: 338, vault, codeHash: identity.codeHash, routeId: identity.routeId,
       paused: false, processed: false, signerSetVersion: "1", blockHash: `0x${"dd".repeat(32)}` },

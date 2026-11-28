@@ -7,7 +7,7 @@ import { attestationId, DIRECTION_OUTBOUND } from "../../src/protocol.js";
 import { RelayStore } from "../../src/store.js";
 import { buildTransferApprovalRequest } from "../../src/coordinator.js";
 import { evmAddressToBech32 } from "../../src/address.js";
-import { cronosRouteId } from "../../src/protocol.js";
+import { TESTNET_ROUTE_ID } from "../../src/preflight.js";
 import { sign, signers } from "./destination.js";
 
 const encode = (value) => `0x${Buffer.from(JSON.stringify(value)).toString("hex")}`;
@@ -138,7 +138,7 @@ export function approvedTransfer(store, destination, index = 1, { deadlineUnix =
     store.observe({ sourceChain: "xitcoin", sourceRef: ref, routeId: "cronos-testnet-xitcoin-testnet", ...common, messageIndex: 0,
       payload: { requestId: ref, sender: "xtc1sender", destination: signers[0], amount: "10", nonce: String(index) } });
   } else {
-    store.observe({ sourceChain: "cronos", sourceRef: ref.slice(2), routeId: cronosRouteId("cronos-testnet-xitcoin-testnet"), ...common, logIndex: 0,
+    store.observe({ sourceChain: "cronos", sourceRef: ref.slice(2), routeId: TESTNET_ROUTE_ID, ...common, logIndex: 0,
       payload: { depositId: ref, depositor: signers[1], recipient: signers[0], destination: evmAddressToBech32(signers[0]),
         amount: "10", nonce: String(index) } });
   }
@@ -146,7 +146,7 @@ export function approvedTransfer(store, destination, index = 1, { deadlineUnix =
   const sourceRef = destination === "cronos" ? ref : ref.slice(2);
   const transfer = store.transition(sourceChain, sourceRef, "finalized");
   const request = buildTransferApprovalRequest({ transfer, routeId: "cronos-testnet-xitcoin-testnet",
-    cronosRouteId: cronosRouteId("cronos-testnet-xitcoin-testnet"), cronosChainId: 338, cronosVault: vault,
+    cronosRouteId: TESTNET_ROUTE_ID, cronosChainId: 338, cronosVault: vault,
     xitcoinChainId: "xitcoin-testnet-v2-1", signerSetVersion: 1, deadlineUnix });
   store.persistApprovalRequest(sourceChain, sourceRef, request);
   for (const approval of sign(request)) store.recordApproval(sourceChain, sourceRef, approval);

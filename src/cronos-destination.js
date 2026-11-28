@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { Interface, Transaction, getAddress, keccak256 } from "ethers";
-import { DIRECTION_OUTBOUND, cronosRouteId } from "./protocol.js";
+import { DIRECTION_OUTBOUND } from "./protocol.js";
+import { TESTNET_ROUTE_ID } from "./preflight.js";
 import { destinationSnapshot, exactFields, decimal, decimalOrSafeInteger, validateSourceEvidence, verifiedDestinationQuorum } from "./destination-validation.js";
 
 const vault = new Interface([
@@ -31,7 +32,8 @@ export function prepareCronosRelease(input) {
     exactFields(limits, ["maxGas", "maxGasPrice", "maxFee"]);
     hash(identity.codeHash); hash(state.blockHash);
     if (identity.chainId !== 338 || state.chainId !== 338
-        || identity.routeId !== cronosRouteId("cronos-testnet-xitcoin-testnet")
+        // Deployment-pinned vault route, never derived from the Xitcoin route label.
+        || identity.routeId !== TESTNET_ROUTE_ID.toLowerCase()
         || state.routeId !== identity.routeId || state.codeHash !== identity.codeHash
         || account(state.vault) !== account(identity.vault)
         || state.paused !== false || state.processed !== false) throw error();

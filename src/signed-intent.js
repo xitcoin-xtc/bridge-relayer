@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { cronosRouteId, releaseDigest } from "./protocol.js";
+import { releaseDigest } from "./protocol.js";
+import { TESTNET_ROUTE_ID } from "./preflight.js";
 import { Interface, Transaction, keccak256 } from "ethers";
 import { requireCronosCustody } from "./cronos-destination.js";
 import { DatabaseSync } from "node:sqlite";
@@ -127,7 +128,7 @@ export class SignedIntentJournal {
       if (!digest(row.transfer_id) || !digest(row.approval_digest) || !["reserved", "uncertain"].includes(row.state)
           || !tx.isSigned() || tx.type !== 0 || tx.chainId !== 338n || tx.serialized !== row.signed_hex
           || tx.from !== row.account || String(tx.nonce) !== row.nonce || tx.to !== row.vault
-          || !digest(row.code_hash) || row.route_id !== cronosRouteId("cronos-testnet-xitcoin-testnet")
+          || !digest(row.code_hash) || row.route_id !== TESTNET_ROUTE_ID.toLowerCase()
           || keccak256(row.signed_hex) !== row.transaction_hash
           || `0x${createHash("sha256").update(Buffer.from(row.signed_hex.slice(2), "hex")).digest("hex")}` !== row.transaction_digest) throw failure();
       return Object.freeze({ found: true, state: row.state, transferId: row.transfer_id,
