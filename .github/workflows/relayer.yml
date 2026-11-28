@@ -22,7 +22,7 @@ jobs:
     # pos-chain commit; they are mandatory in CI.
     needs: chain-fixtures
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -84,7 +84,7 @@ jobs:
     outputs:
       xitcoind-key: ${{ steps.key.outputs.key }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # The single pin: test/fixtures/xitcoin-chain-vectors.json "posChainCommit".
@@ -95,7 +95,7 @@ jobs:
           commit="$(sed -n 's/^  "posChainCommit": "\([0-9a-f]\{40\}\)",$/\1/p' test/fixtures/xitcoin-chain-vectors.json)"
           [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: xitcoin-xtc/pos-chain
           ref: ${{ steps.pin.outputs.commit }}
