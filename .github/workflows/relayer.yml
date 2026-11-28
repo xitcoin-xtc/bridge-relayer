@@ -32,10 +32,17 @@ jobs:
         with:
           version: v1.8.5
           cache: false
+      - name: Verify every action and image is pinned
+        run: bash scripts/verify-actions-pinned.sh
       - run: npm ci
       - run: npm run check
       - run: npm test
       - run: npm run vectors
+      # Dependency audit failure policy: retry the production audit up to three
+      # times and preserve the final nonzero exit status. An unavailable
+      # registry cannot establish that unchanged dependencies are still safe
+      # (advisories appear without lockfile changes), so there is no success
+      # fallback when the registry fails.
       - name: Audit production dependencies
         shell: bash
         run: |

@@ -68,7 +68,14 @@ npm ci
 npm run check
 npm test
 npm run vectors
+bash scripts/verify-actions-pinned.sh
 ```
+
+CI additionally scans the Git history for secrets (gitleaks, image pinned by
+digest), reviews dependency changes for high and critical advisories, audits
+production dependencies and requires every action to be pinned to a full commit
+SHA and every container image to an `@sha256` digest. Dependabot proposes npm
+and GitHub Actions updates weekly.
 
 See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) and
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
