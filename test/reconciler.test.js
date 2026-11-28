@@ -77,3 +77,56 @@ test("decodes the chain outstanding store value and sums in-flight transfers fro
   assert.deepEqual(inFlightFromStore(store), { lockedNotMinted: 7n, burnedNotReleased: 3n });
   store.close();
 });
+
+test("chain readers accept only the bounded quorum transports and the pinned vault code and route", async () => {
+  const { createCronosVaultReader, createXitcoinBridgeReader, createChainReconciliationSource } = await import("../src/reconciler-sources.js");
+  const { CronosRpcQuorum } = await import("../src/cronos-rpc.js");
+  const { XitcoinRpcQuorum } = await import("../src/xitcoin-rpc.js");
+  const rpc = new CronosRpcQuorum({ urls: ["http://127.0.0.1:1", "http://127.0.0.1:2"], allowLoopbackHttp: true });
+  const vault = "0x00000000000000000000000000000000000000aa";
+  const vaultCodeHash = `0x${"12".repeat(32)}`;
+  assert.throws(() => createCronosVaultReader({ rpc: { call() {} }, vault, vaultCodeHash, confirmations: 2 }), /quorum/);
+  for (const hash of [`0x${"0".repeat(64)}`, "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470", "0x12"]) {
+    assert.throws(() => createCronosVaultReader({ rpc, vault, vaultCodeHash: hash, confirmations: 2 }), /code hash/);
+  }
+  for (const confirmations of [0, 10_001, 1.5]) assert.throws(() => createCronosVaultReader({ rpc, vault, vaultCodeHash, confirmations }), /confirmations/);
+  const xitcoin = new XitcoinRpcQuorum({ allowLoopbackHttp: true, origins: [{ rpcUrl: "http://127.0.0.1:3", restUrl: "http://127.0.0.1:4" },
+    { rpcUrl: "http://127.0.0.1:5", restUrl: "http://127.0.0.1:6" }] });
+  assert.throws(() => createXitcoinBridgeReader({ rpc: { get() {} } }), /quorum/);
+  assert.throws(() => createXitcoinBridgeReader({ rpc: xitcoin, routeId: "another-route" }), /route/);
+  const readers = { cronos: createCronosVaultReader({ rpc, vault, vaultCodeHash, confirmations: 2 }), xitcoin: createXitcoinBridgeReader({ rpc: xitcoin }) };
+  assert.throws(() => createChainReconciliationSource({ ...readers, store: {} }), /store/);
+  // Closed loopback ports: every origin unavailable, never a deficit.
+  const store = new RelayStore(":memory:");
+  const alerts = [];
+  const reconciler = new Reconciler({ source: createChainReconciliationSource({ ...readers, store }), alert: async (event) => { alerts.push(event); } });
+  const event = await reconciler.runOnce({ nowUnix: 9 });
+  assert.equal(event.kind, "reconciliation_unavailable");
+  assert.match(event.reason, /^(cronos|xitcoin)_origin_unavailable$/);
+  assert.equal(reconciler.consecutiveDeficits, 0);
+  store.close();
+});
+
+test("read failures map to alert kinds and severities and never touch the deficit count", async () => {
+  const { ReconciliationReadError } = await import("../src/reconciler-sources.js");
+  const alerts = [];
+  let failure = null;
+  const readings = source([{ locked: 90n, outstanding: 100n }]);
+  const reconciler = new Reconciler({ alert: async (event) => { alerts.push(event); }, confirmations: 3, source: {
+    ...readings, async vaultLocked() { if (failure) throw failure; return readings.vaultLocked(); } } });
+  await reconciler.runOnce({ nowUnix: 1 });
+  for (const [kind, expected, severity] of [["unavailable", "reconciliation_unavailable", "warning"],
+    ["disagreement", "reconciliation_disagreement", "critical"], ["identity_mismatch", "reconciliation_identity_mismatch", "critical"],
+    ["invented", "reconciliation_unavailable", "warning"]]) {
+    failure = new ReconciliationReadError(kind, "cronos_test_code");
+    const event = await reconciler.runOnce({ nowUnix: 2 });
+    assert.deepEqual([event.kind, event.severity, event.reason], [expected, severity, "cronos_test_code"]);
+    assert.equal(reconciler.consecutiveDeficits, 1);
+  }
+  failure = new ReconciliationReadError("unavailable", "Not A Code");
+  assert.equal((await reconciler.runOnce({ nowUnix: 3 })).reason, "read_failed");
+  failure = null;
+  await reconciler.runOnce({ nowUnix: 4 });
+  assert.equal(reconciler.consecutiveDeficits, 2);
+  assert.ok(!alerts.some((event) => event.kind === "pause_request_dry_run"));
+});

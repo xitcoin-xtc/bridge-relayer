@@ -41,8 +41,10 @@ transfer unprocessed, agreed by every origin); the coordinator and every
 signer check this independently, and signers sign only an explicit, journaled
 re-issue. An approved transfer is re-issued only after its destination
 submitter gives the expired approval up. A
-read-only reconciler compares vault and chain accounting and raises alerts
-(dry-run by default; it never pauses anything by itself). The optional secure keystore adapter reads bounded,
+read-only reconciler compares the vault's locked balance at a finalized Cronos
+height with the bridge module's outstanding amount at a pinned Xitcoin height
+(every origin must agree) and raises alerts (dry-run by default; it never
+pauses anything by itself). The optional secure keystore adapter reads bounded,
 owner-private encrypted keystores and systemd credentials, verifies the expected
 account and exposes only digest signing; it has no environment-variable or
 command-line password fallback. Runtime

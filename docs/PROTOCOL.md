@@ -240,3 +240,21 @@ approval, and records a release by another transaction when the approved
 fields match. `ATTESTATION_STATE_PROCESSED_WITHOUT_RECORD` (processed before
 records were kept) is treated as minted but unverified. See
 [SUBMITTERS.md](SUBMITTERS.md#xitcoin-testnet-submitter).
+
+## Accounting reconciliation
+
+Every native XTC minted by the bridge module is backed by canonical XTC locked
+in the Cronos vault:
+
+```text
+vault locked = chain outstanding + deposits in flight + burns in flight + surplus
+```
+
+`vault locked` is the vault's `availableLiquidity()` (its asset balance) at a
+finalized Cronos height; `chain outstanding` is the bridge module's
+`outstanding_amount` (`GET /xitcoin/bridge/v1/outstanding`) at a committed
+Xitcoin height; the in-flight amounts are the coordinator store's unfinished
+transfers. The reconciler reads each chain value from independent origins and
+uses it only when every origin returns the identical answer for the same pinned
+height. A deficit is critical; a surplus is a warning. The reconciler only
+reads and alerts. See [OPERATIONS.md](OPERATIONS.md#reconciliation).

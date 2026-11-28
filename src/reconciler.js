@@ -33,11 +33,12 @@ function amount(value, label) {
 }
 
 // Interface for the read-only data a reconciliation needs. Implementations
-// must read both chains at finalized heights and must never sign or send.
+// must read both chains at finalized heights and must never sign or send;
+// src/reconciler-sources.js implements it on the bounded quorum transports.
 export class ReconciliationSource {
   /** @returns {Promise<{ amount: bigint|string, height: number }>} asset balance of the vault */
   async vaultLocked() { throw new Error("vaultLocked must be implemented"); }
-  /** @returns {Promise<{ amount: bigint|string, height: number }>} bridge outstanding_amount */
+  /** @returns {Promise<{ amount: bigint|string, height: number, dailyUsage?: object }>} bridge outstanding_amount */
   async chainOutstanding() { throw new Error("chainOutstanding must be implemented"); }
   /** @returns {Promise<{ lockedNotMinted: bigint|string, burnedNotReleased: bigint|string }>} */
   async inFlight() { throw new Error("inFlight must be implemented"); }
@@ -97,6 +98,26 @@ export function reconcile({ vaultLocked, chainOutstanding, lockedNotMinted, burn
   });
 }
 
+const READ_FAILURES = Object.freeze({
+  unavailable: Object.freeze({ severity: "warning", kind: "reconciliation_unavailable" }),
+  disagreement: Object.freeze({ severity: "critical", kind: "reconciliation_disagreement" }),
+  identity_mismatch: Object.freeze({ severity: "critical", kind: "reconciliation_identity_mismatch" }),
+});
+
+function readFailure(error) {
+  return error?.name === "ReconciliationReadError" && Object.hasOwn(READ_FAILURES, error.kind) ? error.kind : "unavailable";
+}
+
+function reasonOf(error) {
+  if (error?.name === "ReconciliationReadError" && typeof error.code === "string") return error.code;
+  return String(error?.message ?? error).slice(0, 200);
+}
+
+function dailyUsage(value) {
+  return Object.freeze({ utcDay: String(value.utcDay), usedAmount: amount(value.usedAmount, "daily used amount").toString(),
+    dailyLimit: amount(value.dailyLimit, "daily limit").toString(), remainingAmount: amount(value.remainingAmount, "daily remaining amount").toString() });
+}
+
 export class Reconciler {
   constructor({ source, alert, requestPause, mode = "dry_run", tolerance = 0n, confirmations = 2 } = {}) {
     if (!source || typeof source.vaultLocked !== "function" || typeof source.chainOutstanding !== "function"
@@ -127,11 +148,15 @@ export class Reconciler {
         lockedNotMinted: pending.lockedNotMinted, burnedNotReleased: pending.burnedNotReleased,
         tolerance: this.tolerance,
       });
-      report = Object.freeze({ ...report, cronosHeight: vault.height, xitcoinHeight: chain.height, checkedAt: nowUnix });
+      report = Object.freeze({ ...report, cronosHeight: vault.height, xitcoinHeight: chain.height,
+        ...(chain.dailyUsage ? { xitcoinDailyUsage: dailyUsage(chain.dailyUsage) } : {}), checkedAt: nowUnix });
     } catch (error) {
       // An unreadable chain is not evidence of a mismatch, but it is not
       // evidence of health either: alert, keep the deficit counter unchanged.
-      const event = Object.freeze({ severity: "warning", kind: "reconciliation_unavailable", reason: String(error?.message ?? error).slice(0, 200), checkedAt: nowUnix });
+      // Origins that disagree about a pinned height, or a vault or route that
+      // is not the pinned one, are critical but still never count as a
+      // deficit and never request a pause (src/reconciler-sources.js).
+      const event = Object.freeze({ ...READ_FAILURES[readFailure(error)], reason: reasonOf(error), checkedAt: nowUnix });
       await this.alert(event);
       return event;
     }

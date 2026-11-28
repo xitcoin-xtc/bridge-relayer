@@ -1165,7 +1165,8 @@ canary.
 
 ## Remaining before the bridge can run end to end
 
-- Reconciler chain readers (vault locked balance and chain outstanding amount).
+- A scheduler and service unit for the reconciler (its chain readers exist;
+  see [OPERATIONS.md](OPERATIONS.md#reconciliation)).
 - An offline review procedure for halted or failed ledger rows, and a reviewed
   completion tool for `release_unverified` and `reverted` rows (`expired` rows
   continue automatically after an approval re-issue).

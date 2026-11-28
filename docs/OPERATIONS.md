@@ -151,16 +151,48 @@ before burning, because the vault refuses to release to them.
 vault locked = chain outstanding + deposits in flight + burns in flight + surplus
 ```
 
-What exists: the comparison, interfaces for the two read-only chain readers
-(`ReconciliationSource`), a decoder for the chain's store value
-(`/store/bridge/key`, key `0x07`), alerts, and a pause request after a
-configurable number of consecutive deficits. What does not exist: chain reader
-adapters, a scheduler, and any automatic pause. The default mode is `dry_run`,
-which only alerts (`pause_request_dry_run`). In `request_pause` mode the
-reconciler calls an injected hook with a structured request; the guardian must
-still sign and submit the pause on each chain. A surplus (for example a donated
-or refunded-pending deposit) is a warning only. An unreadable chain raises a
-`reconciliation_unavailable` warning and does not count as a deficit.
+What exists: the comparison, alerts, a pause request after a configurable
+number of consecutive deficits, and the two read-only chain readers behind
+`ReconciliationSource` (`src/reconciler-sources.js`). Both read through the
+bounded quorum transports used by the submitters, from at least two
+independent origins per chain, and hold no key:
+
+- Cronos: the vault's locked balance, `availableLiquidity()` (the vault's
+  `asset.balanceOf(vault)`), at the finalized height `tip - confirmations`,
+  where `tip` is the lowest head across origins. Every origin must return the
+  identical block hash (read before and after the call), the vault runtime
+  code matching the pinned code hash, and the identical balance at that
+  height.
+- Xitcoin: `outstanding_amount` from `GET /xitcoin/bridge/v1/outstanding` and
+  the route's daily usage from `GET /xitcoin/bridge/v1/daily_usage`, both
+  pinned with `x-cosmos-block-height` to the lowest committed height across
+  origins (CometBFT commits are final). Every origin must serve that block
+  with the identical hash and return identical answers for the pinned route;
+  the daily usage's block time must equal that block's time. The report
+  carries the daily usage (`xitcoinDailyUsage`) for information.
+
+In-flight amounts come from the coordinator store (`inFlightFromStore`). What
+does not exist: a scheduler or service unit, and any automatic pause. The
+default mode is `dry_run`, which only alerts (`pause_request_dry_run`). In
+`request_pause` mode the reconciler calls an injected hook with a structured
+request; the guardian must still sign and submit the pause on each chain. A
+surplus (for example a donated or refunded-pending deposit) is a warning only.
+
+A failed read is never evidence of a deficit; it neither counts towards nor
+resets the consecutive-deficit count, and it never requests a pause:
+
+| Alert | Severity | Cause (`reason`) |
+| --- | --- | --- |
+| `reconciliation_unavailable` | warning | an origin did not answer, answered with an error or with an invalid response, or does not serve the pinned height yet (`cronos_origin_unavailable`, `xitcoin_origin_unavailable`, `cronos_history_too_short`, `xitcoin_inconsistent_height`, ...) |
+| `reconciliation_disagreement` | critical | origins returned different valid answers for the same pinned height (`cronos_origin_disagreement`, `xitcoin_outstanding_disagreement`, `xitcoin_daily_usage_disagreement`, `cronos_block_changed`, ...) |
+| `reconciliation_identity_mismatch` | critical | every origin agrees, but on a vault code, route or chain that is not the pinned one (`vault_code_mismatch`, `xitcoin_route_mismatch`, `cronos_chain_mismatch`, `xitcoin_chain_mismatch`) |
+
+A disagreement at a finalized height means at least one origin is faulty or
+compromised: identify it before trusting any of them. The three readings are
+taken at slightly different moments, so a transfer that completes on its
+destination before the coordinator store records it can show as a short
+deficit (or surplus) for one round; `confirmations` consecutive deficits are
+required before a pause request.
 
 ## Encrypted signer credentials
 
