@@ -34,14 +34,16 @@ protocol v2 is the source-deposit replay key (see [PROTOCOL.md](PROTOCOL.md));
 `processed: true` therefore means "this deposit has been minted", whichever
 approval minted it.
 
-## Reconciliation readers (interfaces only)
+## Reconciliation readers
 
 `src/reconciler.js` defines `ReconciliationSource` with three read-only methods
-(`vaultLocked`, `chainOutstanding`, `inFlight`). Only `inFlight` has an
-implementation (`inFlightFromStore`). The two chain readers are not
-implemented: they must read the vault's asset balance and the bridge store key
-`0x07` at finalized heights from independent providers, and must never hold a
-key or send a transaction. See [OPERATIONS.md](OPERATIONS.md#reconciliation).
+(`vaultLocked`, `chainOutstanding`, `inFlight`). `src/reconciler-sources.js`
+implements the two chain readers on the bounded quorum transports
+(`CronosRpcQuorum`, `XitcoinRpcQuorum`): the vault's locked balance at a
+finalized Cronos height and the bridge module's outstanding amount and daily
+usage at a pinned Xitcoin height, each agreed by every origin. `inFlight` is
+`inFlightFromStore`. The readers never hold a key or send a transaction. See
+[OPERATIONS.md](OPERATIONS.md#reconciliation).
 
 ## Independent durable component
 
