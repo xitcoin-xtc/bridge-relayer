@@ -83,11 +83,13 @@ state tampering or rollback. Do not delete pending state to change releases.
 - Cronos: verify deployed testnet vault code identity, independent receipts,
   transaction input, replay state, route/pause state and authorized signer quorum;
   implement account nonce ownership and bounded fees.
-- Both: a bounded transport enforcing timeouts while streaming responses,
-  durable signed-byte custody, approval-to-transfer revalidation, pending-send
-  reconciliation, canonical finality verification and crash-safe integration
-  with RelayStore. An absent replay flag must never authorize a retry after an
-  uncertain send.
+- Both: a bounded transport enforcing timeouts while streaming responses and
+  canonical finality verification. Durable signed-byte custody, the exclusive
+  claim, write-ahead broadcast markers, approval-to-transfer binding,
+  pending-send recovery and crash-safe RelayStore integration are now provided
+  by the destination-generic [durable broadcast ledger](SUBMITTERS.md#durable-broadcast-ledger);
+  each destination adapter must still supply verified chain observations. An
+  absent replay flag must never authorize a retry after an uncertain send.
 
 `submitApprovedTransfer` requires a plain adapter status with own data fields
 `processed: false` and `mayBroadcast: true` before calling `adapter.submit`.

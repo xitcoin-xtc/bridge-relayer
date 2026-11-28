@@ -98,6 +98,12 @@ implementation and staging review. No new EVM transaction format is needed.
 
 ### Durable duplicate-broadcast protection for both destinations
 
+Update: the durable layer described below now exists as
+[`src/broadcast-ledger.js`](../src/broadcast-ledger.js) and
+[`src/durable-broadcast.js`](../src/durable-broadcast.js). See
+[Durable broadcast ledger](#durable-broadcast-ledger). The paragraph that
+follows describes the original phase-one gap.
+
 The existing helper checks destination status before sending, saves the returned
 transaction reference and resumes submitted/completed rows without resending.
 Its staging tests cover canonical processed-status recovery and normal retries.
@@ -122,3 +128,90 @@ no store or broadcast dependency. Tests verify repeated inspection returns the
 same disabled report and repeated startup refuses, plus CLI failure handling
 and systemd network denial. These tests do not instrument network calls or
 assert that an on-disk lifecycle store remains unchanged.
+
+## Durable broadcast ledger
+
+`BroadcastLedger` is one exact-schema SQLite database per destination
+submitter account. It reuses the private-path checks of the offline journals
+(Linux service identity `xitcoin-bridge-submitter-<destination>`, private
+service-owned parent, `O_NOFOLLOW` traversal, inode rechecks), immediate
+transactions, `synchronous=FULL` and WAL. Exclusive creation initializes it;
+reopening requires the identical table DDL, constraints, triggers, version and
+binding. There is no migration, repair, delete, reset, expiry or retry API.
+
+The binding is the destination deployment identity: destination, chain ID,
+route, target (Cronos vault address or the Xitcoin bridge module), target
+identity (Cronos runtime code hash or the pinned chain schema commit) and the
+submitter account. It deliberately excludes the release commit so that a
+reviewed upgrade with the identical schema can resume pending state instead of
+abandoning it. Cronos chain ID `25` and the empty-code hash are rejected.
+
+The ledger enforces, in one fenced immediate transaction per change:
+
+- a worker lease with a fencing epoch. Another worker may take over only after
+  expiry, which increments the epoch; every later write by the previous holder
+  fails;
+- one row per transfer (`claimed`), created only by the lease holder, and at
+  most one unfinished transfer per account;
+- exact signed bytes, their SHA-256 digest, the destination transaction hash
+  and the account nonce committed (`signed`) before any send. Nonces are
+  strictly sequential; a transaction hash, digest or nonce can never be reused
+  by another transfer, and bytes can never be replaced;
+- a write-ahead `broadcast` marker committed before every send of those
+  identical bytes, bounded to at most 32 attempts (destination policy may be
+  lower);
+- forward-only states `claimed -> signed -> broadcast -> finalized | failed`,
+  plus `halted` from any unfinished state. `finalized`, `failed` and `halted`
+  are permanent, and any `failed` or `halted` row blocks every new claim until
+  an offline review;
+- a claimed row has no bytes and was never sent, so it may be rebound to a
+  re-issued approval. Once bytes exist the approval digest is permanent.
+
+SQLite triggers repeat these rules (no delete, no regression, no replacement,
+sequential nonce, monotonic lease epoch) as defense in depth against
+accidental raw writes. Every read rehashes stored bytes. The bytes are opaque
+to the ledger; the destination adapter validates them against the approved
+request on every use. As with the offline journals, a malicious local owner,
+root, or a consistent restore of an older database is outside SQLite
+self-consistency guarantees and is not detected.
+
+`runDurableSubmissionCycle` composes the ledger with RelayStore and a trusted
+destination adapter (chain reads, signing and byte validation). It owns the
+ordering:
+
+1. reject any blocking ledger row; reconcile RelayStore `submitted` rows,
+   which must reference a transaction the ledger holds;
+2. read the persisted approval request and approvals under size bounds and
+   bind their exact stored text by SHA-256 (`requestHash`). The adapter
+   revalidates the request against the transfer, route and authorized quorum
+   and decides `sign`, `wait` (for example a paused route or an expired
+   approval awaiting re-issue; nothing is claimed) or `halt`;
+3. claim, sign, and commit the bytes before anything else;
+4. bind RelayStore to that single transaction hash (`approved -> submitted`);
+5. commit the broadcast marker, then send the identical bytes. Send errors are
+   never decision inputs, and the first observation happens in a later cycle;
+6. observe: `pending`, `wait`, `rebroadcast` (identical bytes only, when the
+   adapter proves the transaction is unknown and its nonce unused), `failed`
+   (finalized failed execution; permanent and blocking), `finalized`, or a
+   persisted `halt`;
+7. complete RelayStore only after the ledger records finality.
+
+A changed stored request or approval, a RelayStore reference to any other
+transaction, a RelayStore `submitted` row without ledger custody, or a
+malformed adapter decision halts or fails closed. The RelayStore is never
+ahead of the ledger, and lifecycle state is never reset.
+
+Tests use real SQLite files: competing child processes, expired-lease
+takeovers, SIGKILL at every ledger commit and inside an uncommitted signed
+write, fencing, trigger enforcement, incompatible schema/binding, filesystem
+attacks, and engine crash points at every boundary (claim, signed, RelayStore
+submitted, broadcast marker, sent, ledger finalized, RelayStore completed) for
+both destinations. Engine tests use a deterministic in-memory destination model
+for reorganization, lost and ambiguous sends, bounded attempts, failed
+execution, nonce conflicts, replay processed elsewhere, pauses, expired
+approvals, RPC failures and tampering. That model is not a chain adapter. These
+are process-crash tests, not power-loss or storage-rollback proofs.
+
+This change does not connect the engine to startup. Both `submitter:start`
+paths still fail closed. A production adapter must still provide independent,
+bounded canonical observations for every decision.
