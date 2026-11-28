@@ -6,10 +6,11 @@ import { readBoundedText, withDeadline } from "./bounded-response.js";
 // before retention and before JSON parsing; redirects are forbidden; errors are
 // sanitized to stable codes and never contain URLs, bodies or upstream text.
 export class TransportError extends Error {
-  constructor(code, rpcCode) {
+  constructor(code, rpcCode, httpStatus) {
     super("bounded transport unavailable");
     this.code = code;
     if (Number.isSafeInteger(rpcCode)) this.rpcCode = rpcCode;
+    if (Number.isSafeInteger(httpStatus)) this.httpStatus = httpStatus;
   }
 }
 
@@ -17,6 +18,9 @@ const LOOPBACK = new Set(["127.0.0.1", "[::1]", "localhost"]);
 const TRANSPORT_CODES = Object.freeze({ SIGNER_TIMEOUT: "timeout", SIGNER_SIZE: "response_too_large",
   SIGNER_LENGTH: "response_too_large", SIGNER_ENCODING: "invalid_encoding", SIGNER_STREAM: "invalid_response" });
 export const TRANSPORT_LIMITS = Object.freeze({ maxTimeoutMs: 60_000, maxBytes: 16 * 1024 * 1024, maxRequestBytes: 131_072 });
+// The only request header a caller may add: a Cosmos SDK REST query at one
+// committed height. Everything else is fixed by this module.
+const REQUEST_HEADERS = Object.freeze({ "x-cosmos-block-height": /^[1-9][0-9]{0,18}$/ });
 
 // HTTPS only, or loopback HTTP when explicitly allowed (reviewed local tunnels).
 // Credentials, query strings and fragments are rejected: API keys never belong
@@ -48,11 +52,15 @@ function limits(timeoutMs, maxBytes) {
 }
 
 export async function boundedRequest(url, { method = "GET", body, timeoutMs = 10_000, maxBytes = 1_048_576,
-  fetchImpl = globalThis.fetch, signal } = {}) {
+  fetchImpl = globalThis.fetch, signal, headers = {} } = {}) {
   limits(timeoutMs, maxBytes);
   if (!(url instanceof URL) || typeof fetchImpl !== "function" || !["GET", "POST"].includes(method)
       || (method === "POST" && (typeof body !== "string" || Buffer.byteLength(body) > TRANSPORT_LIMITS.maxRequestBytes))
       || (method === "GET" && body !== undefined)) throw new TransportError("invalid_request");
+  if (!headers || typeof headers !== "object" || Array.isArray(headers) || types.isProxy(headers)
+      || Object.getPrototypeOf(headers) !== Object.prototype
+      || Object.entries(headers).some(([name, value]) => !Object.hasOwn(REQUEST_HEADERS, name)
+        || typeof value !== "string" || !REQUEST_HEADERS[name].test(value))) throw new TransportError("invalid_request");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const forward = () => controller.abort();
@@ -62,10 +70,13 @@ export async function boundedRequest(url, { method = "GET", body, timeoutMs = 10
   try {
     response = await withDeadline(() => fetchImpl(url, {
       method, body, redirect: "error", signal: controller.signal, cache: "no-store", credentials: "omit",
-      headers: method === "POST" ? { accept: "application/json", "content-type": "application/json" } : { accept: "application/json" },
+      headers: method === "POST" ? { ...headers, accept: "application/json", "content-type": "application/json" }
+        : { ...headers, accept: "application/json" },
     }), controller.signal);
     if (!response || typeof response !== "object" || !Number.isSafeInteger(response.status)) throw new TransportError("invalid_response");
-    if (response.status < 200 || response.status > 299 || response.redirected === true) throw new TransportError("http_status");
+    if (response.status < 200 || response.status > 299 || response.redirected === true) {
+      throw new TransportError("http_status", undefined, response.status);
+    }
     reading = true;
     return await readBoundedText(response, { maxBytes, signal: controller.signal });
   } catch (error) {
