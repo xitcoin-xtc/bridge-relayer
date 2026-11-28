@@ -344,6 +344,15 @@ under the same approval:
   approval, a row without bytes is claimed under it as usual, and an `expired`
   row continues as a new attempt (`reopenExpired`, above) and signs with the
   next nonce;
+- when the coordinator's proof instead shows the given-up approval's replay
+  key used (`transfer_processed`, for example leaked signatures used before
+  the deadline), it flags the transfer (`processed_elsewhere`) and never
+  re-issues it. For a flagged transfer without bytes the engine asks the
+  adapter only for the release-by-another-transaction evidence
+  (`releasedElsewhere`, independent of the approval's deadline; it never
+  decides to sign) and records `released_elsewhere` with that transaction,
+  completing RelayStore with `release_ref`; mismatching evidence halts, and a
+  used replay key without matching evidence is recorded `release_unverified`;
 - a `rejected` transfer never hands its approval back.
 
 RelayStore opens with a bounded 5-second busy timeout because the coordinator

@@ -165,8 +165,9 @@ independent origins per chain, and hold no key:
   height.
 - Xitcoin: `outstanding_amount` from `GET /xitcoin/bridge/v1/outstanding` and
   the route's daily usage from `GET /xitcoin/bridge/v1/daily_usage`, both
-  pinned with `x-cosmos-block-height` to the lowest committed height across
-  origins (CometBFT commits are final). Every origin must serve that block
+  pinned with `x-cosmos-block-height` to one block below the lowest height
+  any origin reports (CometBFT stores a block before the application commits
+  it; commits are final). Every origin must serve that block
   with the identical hash and return identical answers for the pinned route;
   the daily usage's block time must equal that block's time. The report
   carries the daily usage (`xitcoinDailyUsage`) for information.
@@ -241,11 +242,17 @@ activation.
   waiting transfer: `approval_reissue_grace` (local grace),
   `deadline_not_passed` (the destination's final block time has not passed the
   old deadline yet), `destination_unavailable`, `destination_disagreement`,
-  `destination_mismatch` and `retirement_verifier_missing`. A lasting
-  `transfer_processed` means the destination already shows the old approval
-  used although no completion was recorded: never re-issue by hand; verify the
-  destination record as in [Reviewing non-blocking rows](#reviewing-non-blocking-rows)
-  and treat an unexplained use as a possible approval leak.
+  `destination_mismatch` and `retirement_verifier_missing`.
+  `transfer_processed` means the destination shows the given-up approval (or an
+  earlier one) already used by another transaction: the transfer is never
+  re-issued, `processedElsewhere` counts it once, and it then waits as
+  `awaiting_release_elsewhere` until its destination submitter completes it as
+  `released_elsewhere` (RelayStore `release_ref` names that transaction). A
+  use the relayer did not make is a possible approval leak: identify the
+  transaction and how its submitter obtained the approvals. If the submitter
+  instead records `release_unverified` or halts on mismatching evidence,
+  review it as in [Reviewing non-blocking rows](#reviewing-non-blocking-rows).
+  Never re-issue by hand.
 - A critical watcher, approval or submission worker failure halts the runtime;
   operators must investigate instead of skipping the failed stage.
 - `/livez` reports process liveness. `/readyz` becomes successful only after

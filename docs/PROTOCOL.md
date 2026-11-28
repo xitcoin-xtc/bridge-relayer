@@ -137,10 +137,12 @@ a second usable approval:
    serves, with the identical block and answers from every origin, block H's
    time is strictly later than the previous deadline, and the replay key is
    unused at H (Cronos: `processedBurns(sourceBurnId)` is false at
-   `tip - confirmations`; Xitcoin: the attestation query at the lowest
-   committed height returns `ATTESTATION_STATE_ABSENT`). No later block can
-   accept the previous approval, and it was not used before H. A processed
-   replay key is never a reason to re-issue.
+   `tip - confirmations`; Xitcoin: the attestation query one block below the
+   lowest height any origin reports returns `ATTESTATION_STATE_ABSENT`). No
+   later block can
+   accept the previous approval, and it was not used before H. A replay key
+   that every origin shows used at a final height is never re-issued (see
+   below).
 2. The coordinator checks this itself, after the local
    `APPROVAL_REISSUE_GRACE_SECONDS` (120 s) filter, before it asks signers.
 3. Every signer checks it again itself before signing (below), and signs only
@@ -169,6 +171,18 @@ The coordinator re-issues in two situations:
   destination transaction are archived) and is approved again through the
   normal path. The submitter then sends it, as a new attempt for an `expired`
   row (see [SUBMITTERS.md](SUBMITTERS.md#durable-broadcast-ledger)).
+  If the proof instead finds the replay key used (`transfer_processed`: the
+  given-up approval, or an earlier one, was used by another transaction before
+  its deadline, for example with leaked signatures), the coordinator never
+  re-issues it and flags it in RelayStore (`processed_elsewhere`). The
+  submitter then completes it from the destination's evidence of that
+  transaction, exactly as for any release by another transaction: the vault's
+  matching `Released` event, or the attestation processing record with every
+  approved field. Its ledger row becomes `released_elsewhere` with that
+  transaction, RelayStore becomes `completed` with `release_ref` naming it,
+  and nothing is ever signed for the transfer again. Evidence whose fields
+  differ halts; a used replay key without matching evidence is a permanent
+  `release_unverified` alert, never a completion.
 
 A transfer the submitter rejected (for example an invalid recipient) never asks
 for a re-issue and stays rejected; its refund path is manual
