@@ -17,7 +17,10 @@ jobs:
   protocol:
     name: Protocol and state tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    # The Xitcoin chain integration tests need xitcoind built at the pinned
+    # pos-chain commit; they are mandatory in CI.
+    needs: chain-fixtures
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -34,9 +37,17 @@ jobs:
           cache: false
       - name: Verify every action and image is pinned
         run: bash scripts/verify-actions-pinned.sh
+      - name: Restore xitcoind built at the pinned pos-chain commit
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: xitcoind-bin
+          key: ${{ needs.chain-fixtures.outputs.xitcoind-key }}
+          fail-on-cache-miss: true
       - run: npm ci
       - run: npm run check
       - run: npm test
+        env:
+          XITCOIND_BIN: ${{ github.workspace }}/xitcoind-bin/xitcoind
       - run: npm run vectors
       # Dependency audit failure policy: retry the production audit up to three
       # times and preserve the final nonzero exit status. An unavailable
@@ -67,9 +78,11 @@ jobs:
           exit "$audit_status"
 
   chain-fixtures:
-    name: Chain fixtures against the pinned pos-chain commit
+    name: Chain fixtures and xitcoind at the pinned pos-chain commit
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    outputs:
+      xitcoind-key: ${{ steps.key.outputs.key }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -89,6 +102,7 @@ jobs:
           path: pos-chain
           persist-credentials: false
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
+        id: go
         with:
           go-version-file: pos-chain/evmd/go.mod
           cache-dependency-path: |
@@ -98,3 +112,23 @@ jobs:
       # byte-identical to what the chain's own Go code produces.
       - name: Check proto fixtures and chain-generated vectors
         run: bash scripts/check-chain-fixtures.sh pos-chain
+      # The binary depends only on the pinned commit, the Go version and the
+      # runner; it is rebuilt when any of them changes.
+      - name: Compute the xitcoind cache key
+        id: key
+        env:
+          COMMIT: ${{ steps.pin.outputs.commit }}
+          GO_VERSION: ${{ steps.go.outputs.go-version }}
+        run: echo "key=xitcoind-${RUNNER_OS}-${RUNNER_ARCH}-${COMMIT}-go${GO_VERSION}" >> "$GITHUB_OUTPUT"
+      - name: Restore xitcoind
+        id: xitcoind
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: xitcoind-bin
+          key: ${{ steps.key.outputs.key }}
+      - name: Build xitcoind from the pinned commit
+        if: steps.xitcoind.outputs.cache-hit != 'true'
+        working-directory: pos-chain/evmd
+        run: CGO_ENABLED=1 go build -tags netgo -trimpath -o "$GITHUB_WORKSPACE/xitcoind-bin/xitcoind" ./cmd/evmd
+      - name: Check the xitcoind binary
+        run: xitcoind-bin/xitcoind version
