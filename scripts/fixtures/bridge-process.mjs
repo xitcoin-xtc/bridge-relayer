@@ -8,6 +8,7 @@ import { buildApprovalRequest, collectApprovalQuorum } from '../../src/approvals
 import { createCanonicalSourceVerifier } from '../../src/source-verification.js';
 import { IsolatedSignerService, createSignerPolicy } from '../../src/signer-service.js';
 import { SignerApprovalJournal } from '../../src/signer-journal.js';
+import { RetirementUnproven } from '../../src/approval-retirement.js';
 import { XITCOIN_TESTNET_ROUTE_ID, attestationDigest, attestationId, attestationPayloadHash, depositId, DIRECTION_INBOUND, DIRECTION_OUTBOUND } from '../../src/protocol.js';
 import { evmAddressToBech32 } from '../../src/address.js';
 import { TESTNET_ROUTE_ID } from '../../src/preflight.js';
@@ -49,20 +50,29 @@ async function attest(args, direction, payload, record) {
   const request = buildApprovalRequest({ direction, payload });
   const verifySource = createCanonicalSourceVerifier({ cronosWatcher: watcher, xitcoinWatcher: watcher, cronosRouteId: TESTNET_ROUTE_ID });
   await verifySource(request);
+  // Offline destination: the replaced approval is dead once the synthetic
+  // clock is past its deadline and the replay key is still unused.
+  const verifyRetirement = async ({ request: next, previousDeadlineUnix }) => {
+    if (state.consumed.includes(record.replayKey)) throw new RetirementUnproven('transfer_processed');
+    if (now <= previousDeadlineUnix) throw new RetirementUnproven('deadline_not_passed');
+    return { retired: true, destination: next.direction === DIRECTION_INBOUND ? 'xitcoin' : 'cronos', height: 1, blockTime: now };
+  };
   const clients = (args.signers ?? [0, 1]).map((n, i) => {
     const signer = wallets[n];
     const service = new IsolatedSignerService({ identity: `fixture-signer-${n + 1}`, signerAddress: signer.address, policy, verifySource, journal: journals[n],
-      signDigest: async (digest) => signer.signingKey.sign(args.badSignature ? id('wrong synthetic message') : digest).serialized });
+      verifyRetirement, signDigest: async (digest) => signer.signingKey.sign(args.badSignature ? id('wrong synthetic message') : digest).serialized });
     return { identity: `fixture-client-${i}`, approve: (expected) => service.approve(expected, { nowUnix: now }) };
   });
-  const approvals = await collectApprovalQuorum({ request, clients, authorizedSigners: wallets.map(w => w.address), threshold: 2, nowUnix: now });
+  const approvals = await collectApprovalQuorum({ request, clients, authorizedSigners: wallets.map(w => w.address), threshold: 2, nowUnix: now,
+    reissue: args.reissue ?? null });
   requireThat(approvals.length === 2, 'quorum');
   return request;
 }
 function inboundPayload(args, ref, deposit) {
   const sourceEvidence = { blockHeight: 10, blockHash: id('synthetic block'), transactionHash: id(ref), eventIndex: 0 };
   const payload = { destinationChainId: args.cosmosChainId ?? cosmosChainId, routeId: route, sourceChainId: '338', sourceRef: ref, nonce: deposit.nonce, destination: cosmos, amount: deposit.amount, deadlineUnix: String(args.deadline ?? 2000), sourceEvidence };
-  const record = { ...sourceEvidence, logIndex: 0, routeId: TESTNET_ROUTE_ID, payload: { depositId: ref, destination: cosmos, amount: deposit.amount, nonce: deposit.nonce } };
+  const record = { ...sourceEvidence, logIndex: 0, routeId: TESTNET_ROUTE_ID, payload: { depositId: ref, destination: cosmos, amount: deposit.amount, nonce: deposit.nonce },
+    replayKey: attestationId({ ...payload, direction: DIRECTION_INBOUND }) };
   return { payload, record };
 }
 // Shared with pos-chain x/bridge/types/remediation_test.go.
@@ -109,7 +119,7 @@ async function execute(args) {
     requireThat(BigInt(burn.amount) <= BigInt(state.locked), 'insufficient vault balance');
     const sourceEvidence = { blockHeight: 20, blockHash: id('synthetic Cosmos block'), transactionHash: id(args.ref), eventIndex: 0 };
     const payload = { routeId: route, chainId: 338, vault, sourceBurnId: args.ref, recipient, amount: burn.amount, signerSetVersion: 1, deadline: args.deadline ?? 2000, sourceEvidence };
-    const record = { ...sourceEvidence, messageIndex: 0, routeId: route, payload: { requestId: args.ref, destination: recipient, amount: burn.amount } };
+    const record = { ...sourceEvidence, messageIndex: 0, routeId: route, payload: { requestId: args.ref, destination: recipient, amount: burn.amount }, replayKey: args.ref };
     const request = await attest(args, DIRECTION_OUTBOUND, payload, record);
     state.locked = String(BigInt(state.locked) - BigInt(burn.amount)); state.returned = String(BigInt(state.returned) + BigInt(burn.amount)); state.consumed.push(args.ref); await persist(); return { digest: request.digest };
   }

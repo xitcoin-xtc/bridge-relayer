@@ -31,9 +31,9 @@ function outbound(overrides = {}) {
   } });
 }
 
-function service(journal) {
+function service(journal, { verifyRetirement } = {}) {
   return new IsolatedSignerService({
-    identity: "signer-1", signerAddress: ADDRESS, journal,
+    identity: "signer-1", signerAddress: ADDRESS, journal, verifyRetirement,
     policy: createSignerPolicy({ routeIds: ["cronos-xitcoin-xtc-v1"], cronosChainIds: [25], xitcoinChainIds: ["xitcoin"], cronosVaults: [VAULT], maximumAmount: "100000", maximumDeadlineSeconds: 900 }),
     // A compromised coordinator and a lying source verifier: the journal
     // alone must stop conflicting approvals.
@@ -63,13 +63,87 @@ test("a signer never signs two different requests for one source deposit", async
     await assert.rejects(() => signer.approve(inbound(change), { nowUnix: NOW }), /conflicting request/);
     await assert.rejects(() => signer.approve(inbound({ ...change, deadlineUnix: NOW + 1300 }), { nowUnix: NOW + 1000 }), /conflicting request/);
   }
-  // Same deposit, new deadline: refused while the first approval can still be used.
-  await assert.rejects(() => signer.approve(inbound({ deadlineUnix: NOW + 600 }), { nowUnix: NOW }), /unexpired approval/);
+  // Same deposit, new deadline, without an explicit re-issue: refused, even
+  // long after the first approval expired.
+  await assert.rejects(() => signer.approve(inbound({ deadlineUnix: NOW + 600 }), { nowUnix: NOW }), /only an explicit re-issue/);
+  await assert.rejects(() => signer.approve(inbound({ deadlineUnix: NOW + 90_300 }), { nowUnix: NOW + 90_000 }), /only an explicit re-issue/);
+  assert.equal(first.digest, inbound().digest);
+});
+
+// A destination check that records what it was asked and answers as told.
+function destination(answer) {
+  const calls = [];
+  const verify = async (input) => {
+    calls.push(input);
+    if (answer instanceof Error) throw answer;
+    return typeof answer === "function" ? answer(input) : answer;
+  };
+  return Object.assign(verify, { calls });
+}
+const reissueOf = (request) => ({ previousDigest: request.digest, previousDeadlineUnix: request.deadlineUnix });
+
+test("an explicit re-issue is signed only with a strictly later deadline and after the destination shows the old approval dead", async () => {
+  const journal = new SignerApprovalJournal();
   const graceEnd = NOW + 300 + APPROVAL_REISSUE_GRACE_SECONDS;
-  await assert.rejects(() => signer.approve(inbound({ deadlineUnix: graceEnd + 300 }), { nowUnix: graceEnd }), /unexpired approval/);
-  const reissued = await signer.approve(inbound({ deadlineUnix: graceEnd + 301 }), { nowUnix: graceEnd + 1 });
+  const retired = destination(({ previousDeadlineUnix }) => ({ retired: true, destination: "xitcoin", height: 77, blockTime: previousDeadlineUnix + 1 }));
+  const first = await service(journal, { verifyRetirement: retired }).approve(inbound(), { nowUnix: NOW });
+  const next = (deadlineUnix, declared = reissueOf(inbound())) => ({ ...inbound({ deadlineUnix }), reissue: declared });
+  // Without a destination verifier a re-issue is never signed.
+  await assert.rejects(() => service(journal).approve(next(graceEnd + 301), { nowUnix: graceEnd + 1 }), /retirement verifier/);
+  // Local grace, strictly later deadline and a well-formed declaration first.
+  await assert.rejects(() => service(journal, { verifyRetirement: retired }).approve(next(graceEnd + 300), { nowUnix: graceEnd }), /unexpired approval/);
+  await assert.rejects(() => service(journal, { verifyRetirement: retired }).approve(next(graceEnd + 301, { previousDigest: first.digest, previousDeadlineUnix: graceEnd + 301 }),
+    { nowUnix: graceEnd + 1 }), /strictly later/);
+  for (const declared of [{ previousDigest: first.digest }, { previousDigest: "0x12", previousDeadlineUnix: NOW + 300 },
+    { ...reissueOf(inbound()), extra: 1 }, "yes"]) {
+    await assert.rejects(() => service(journal, { verifyRetirement: retired }).approve(next(graceEnd + 301, declared), { nowUnix: graceEnd + 1 }),
+      /declaration is invalid/);
+  }
+  // The destination does not (yet) show the old approval dead: refused.
+  const { RetirementUnproven } = await import("../src/approval-retirement.js");
+  for (const answer of [new RetirementUnproven("deadline_not_passed"), new RetirementUnproven("transfer_processed"),
+    { retired: true, destination: "xitcoin", height: 77, blockTime: NOW + 300 }, { retired: false }, null]) {
+    await assert.rejects(() => service(journal, { verifyRetirement: destination(answer) }).approve(next(graceEnd + 301), { nowUnix: graceEnd + 1 }));
+  }
+  assert.equal(journal.get(approvalSourceKey(inbound())).digest, first.digest);
+  assert.deepEqual(journal.reissues(approvalSourceKey(inbound())), []);
+  // Proven dead: signed and journaled with its evidence.
+  const reissued = await service(journal, { verifyRetirement: retired }).approve(next(graceEnd + 301), { nowUnix: graceEnd + 1 });
   assert.notEqual(reissued.digest, first.digest);
-  assert.equal(reissued.signer, ADDRESS);
+  assert.deepEqual(retired.calls.at(-1).previousDeadlineUnix, NOW + 300);
+  const [record] = journal.reissues(approvalSourceKey(inbound()));
+  assert.deepEqual([record.replaced_digest, record.declared_digest, record.retired_after, record.digest, record.deadline,
+    record.destination, record.destination_height, record.destination_block_time],
+  [first.digest, first.digest, NOW + 300, reissued.digest, graceEnd + 301, "xitcoin", 77, NOW + 301]);
+  // The identical re-issued request is idempotent; the replaced one is never signed again.
+  assert.deepEqual(await service(journal).approve(next(graceEnd + 301), { nowUnix: graceEnd + 2 }), reissued);
+  await assert.rejects(() => service(journal, { verifyRetirement: retired }).approve(inbound(), { nowUnix: NOW }), /only an explicit re-issue/);
+  await assert.rejects(() => service(journal, { verifyRetirement: retired }).approve(next(graceEnd + 700, reissueOf(inbound())),
+    { nowUnix: graceEnd + 400 }), /unexpired approval/);
+  // A declaration naming an older deadline than the signer's own never lowers
+  // what must be proven dead: the signer checks its own, later deadline.
+  const third = graceEnd + 301 + APPROVAL_REISSUE_GRACE_SECONDS + 1;
+  await service(journal, { verifyRetirement: retired }).approve(next(third + 300, reissueOf(inbound())), { nowUnix: third });
+  assert.equal(retired.calls.at(-1).previousDeadlineUnix, graceEnd + 301);
+  assert.equal(journal.reissues(approvalSourceKey(inbound())).length, 2);
+  // Re-issue records are permanent.
+  assert.throws(() => journal.database.exec("DELETE FROM approval_reissues"), /permanent/);
+  assert.throws(() => journal.database.exec("UPDATE approval_reissues SET deadline = 1"), /permanent/);
+});
+
+test("a signer that never signed the replaced approval still checks the declared one on the destination", async () => {
+  const journal = new SignerApprovalJournal();
+  const retired = destination(({ previousDeadlineUnix }) => ({ retired: true, destination: "cronos", height: 5, blockTime: previousDeadlineUnix + 9 }));
+  const request = { ...outbound({ deadline: NOW + 600 }), reissue: reissueOf(outbound()) };
+  await assert.rejects(() => service(journal).approve(request, { nowUnix: NOW + 400 }), /retirement verifier/);
+  const signed = await service(journal, { verifyRetirement: retired }).approve(request, { nowUnix: NOW + 400 });
+  assert.equal(retired.calls[0].previousDeadlineUnix, NOW + 300);
+  assert.equal(journal.reissues(approvalSourceKey(outbound()))[0].replaced_digest, null);
+  assert.equal(signed.digest, outbound({ deadline: NOW + 600 }).digest);
+  // A declared deadline that is not earlier than the new one is refused.
+  await assert.rejects(() => service(new SignerApprovalJournal(), { verifyRetirement: retired }).approve(
+    { ...outbound({ deadline: NOW + 600 }), reissue: { previousDigest: outbound().digest, previousDeadlineUnix: NOW + 600 } }, { nowUnix: NOW }),
+  /strictly later/);
 });
 
 test("the journal survives restarts and closed source events are never signed", async () => {

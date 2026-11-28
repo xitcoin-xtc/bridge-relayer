@@ -25,6 +25,7 @@ export async function createSecureSignerService({
   policy,
   journal,
   verifySource,
+  verifyRetirement,
   loadSigner = createEncryptedKeystoreDigestSigner,
 }) {
   if (typeof loadSigner !== "function") throw new Error("secure signer loader is required");
@@ -39,6 +40,7 @@ export async function createSecureSignerService({
     policy,
     journal,
     verifySource,
+    verifyRetirement,
     signDigest: key.signDigest,
   });
 }

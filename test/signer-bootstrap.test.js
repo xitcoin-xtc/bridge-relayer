@@ -25,6 +25,7 @@ const CONFIG = Object.freeze({
   },
   xitcoin: {
     rpcUrls: ["https://xitcoin-a.example.test", "http://127.0.0.1:41657"],
+    restUrls: ["https://xitcoin-a-rest.example.test", "http://127.0.0.1:41317"],
     chainId: "xitcoin-testnet-v2-1",
     safetyLag: 1,
     allowLoopbackHttp: true,
@@ -47,6 +48,11 @@ test("accepts only a strict pinned testnet signer configuration", () => {
   assert.equal(omitted, config.journalPath);
   assert.throws(() => validateSignerConfig(withoutJournal), /journal path is required/);
   assert.throws(() => validateSignerConfig({ ...CONFIG, journalPath: "approvals.sqlite" }), /journal path must be absolute/);
+  // Every signer needs the destination reads that an explicit re-issue requires.
+  const { restUrls, ...withoutRest } = CONFIG.xitcoin;
+  assert.deepEqual(config.xitcoin.restUrls, restUrls);
+  assert.throws(() => validateSignerConfig({ ...CONFIG, xitcoin: withoutRest }), /REST URLs are required/);
+  assert.throws(() => validateSignerConfig({ ...CONFIG, xitcoin: { ...withoutRest, restUrls: [restUrls[0], restUrls[1], "https://c.example.test"] } }), /pair/);
 });
 
 test("loads only a root-owned non-writable regular config without following links", async () => {
@@ -85,6 +91,7 @@ test("composes both independent watchers and starts only after credentials load"
     makeCronosWatcher: (options) => ({ kind: "cronos", ...options }),
     makeXitcoinWatcher: (options) => ({ kind: "xitcoin", ...options }),
     makeVerifier: (watchers) => { calls.push(["verifier", watchers]); return async () => ({ canonical: true, finalized: true }); },
+    makeRetirementVerifier: (options) => { calls.push(["retirement", options]); return "verify-retirement"; },
     makeService: async (options) => { calls.push(["service", options]); return { approve: async () => ({}) }; },
     makeJournal: (path) => { calls.push(["journal", path]); return { plan() {}, record() {}, path }; },
     makeHandler: async (options) => { calls.push(["handler", options]); return async () => {}; },
@@ -101,4 +108,22 @@ test("composes both independent watchers and starts only after credentials load"
   assert.equal(calls.find(([name]) => name === "journal")[1], CONFIG.journalPath);
   assert.equal(calls.find(([name]) => name === "service")[1].journal.path, CONFIG.journalPath);
   assert.deepEqual([...calls.find(([name]) => name === "service")[1].policy.destinations], ["xitcoin-testnet-v2-1"]);
+  assert.equal(calls.find(([name]) => name === "service")[1].verifyRetirement, "verify-retirement");
+  const retirement = calls.find(([name]) => name === "retirement")[1];
+  assert.deepEqual(retirement.xitcoinOrigins, [{ rpcUrl: CONFIG.xitcoin.rpcUrls[0], restUrl: CONFIG.xitcoin.restUrls[0] },
+    { rpcUrl: CONFIG.xitcoin.rpcUrls[1], restUrl: CONFIG.xitcoin.restUrls[1] }]);
+  assert.deepEqual([retirement.cronosRpcUrls, retirement.cronosVault, retirement.cronosChainId, retirement.cronosConfirmations],
+    [CONFIG.cronos.rpcUrls, CONFIG.policy.cronosVault, 338, 64]);
+});
+
+test("the default destination retirement verifier is built on the bounded quorum transports", async () => {
+  let service;
+  await buildSignerRuntime(CONFIG, {
+    credentialsDirectory: "/run/credentials/xitcoin-bridge-signer-1.service",
+    connectCronos: async () => ["c1", "c2"], connectXitcoin: () => ["x1", "x2"],
+    makeCronosWatcher: () => ({}), makeXitcoinWatcher: () => ({}), makeVerifier: () => async () => ({}),
+    makeService: async (options) => { service = options; return {}; }, makeJournal: () => ({}),
+    makeHandler: async () => async () => {}, startServer: async () => ({}),
+  });
+  assert.equal(typeof service.verifyRetirement, "function");
 });

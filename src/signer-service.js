@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { ZeroAddress, getAddress, isHexString, recoverAddress, Signature } from "ethers";
 
 import { approvalContentHash, approvalSourceKey, buildApprovalRequest } from "./approvals.js";
+import { retirementEvidence } from "./approval-retirement.js";
 import { DIRECTION_INBOUND, DIRECTION_OUTBOUND, validateChainId, validateRouteId } from "./protocol.js";
 
 function positiveInteger(value, label, minimum = 1) {
@@ -64,7 +65,10 @@ export class IsolatedSignerService {
   // journal: a SignerApprovalJournal (signer-journal.js). It is mandatory: a
   // signer that keeps no record of what it signed can be asked to sign two
   // different requests for one source event.
-  constructor({ identity, signerAddress, policy, verifySource, signDigest, journal }) {
+  // verifyRetirement: the destination check (approval-retirement.js) that an
+  // explicit re-issue needs before signing. Without it every re-issue is
+  // refused.
+  constructor({ identity, signerAddress, policy, verifySource, signDigest, journal, verifyRetirement }) {
     this.identity = exactString(identity, "signer identity");
     this.signerAddress = getAddress(signerAddress);
     if (!policy) throw new Error("signer policy is required");
@@ -73,7 +77,9 @@ export class IsolatedSignerService {
     if (!journal || typeof journal.plan !== "function" || typeof journal.record !== "function") {
       throw new Error("durable signer approval journal is required");
     }
+    if (verifyRetirement !== undefined && typeof verifyRetirement !== "function") throw new Error("retirement verifier must be a function");
     this.journal = journal;
+    this.verifyRetirement = verifyRetirement;
     this.policy = policy;
     this.verifySource = verifySource;
     this.signDigest = signDigest;
@@ -83,7 +89,8 @@ export class IsolatedSignerService {
     const canonical = authorizeSignerRequest({ request, policy: this.policy, nowUnix });
     const sourceKey = approvalSourceKey(canonical);
     const contentHash = approvalContentHash(canonical);
-    const plan = this.journal.plan({ sourceKey, contentHash, digest: canonical.digest, nowUnix });
+    const reissue = request && typeof request === "object" && Object.hasOwn(request, "reissue") ? request.reissue : null;
+    const plan = this.journal.plan({ sourceKey, contentHash, digest: canonical.digest, deadline: canonical.deadlineUnix, nowUnix, reissue });
     if (plan.action === "reuse") {
       return Object.freeze({ signer: this.signerAddress, digest: canonical.digest, signature: plan.signature });
     }
@@ -94,6 +101,13 @@ export class IsolatedSignerService {
     if (verification.digest && String(verification.digest).toLowerCase() !== canonical.digest) {
       throw new Error("source verification digest mismatch");
     }
+    // An explicit re-issue: this signer checks on the destination itself that
+    // no approval with a deadline up to retireAfter can still be used.
+    let evidence;
+    if (plan.action === "reissue") {
+      if (!this.verifyRetirement) throw new Error("re-issue requires a destination retirement verifier");
+      evidence = retirementEvidence(await this.verifyRetirement({ request: canonical, previousDeadlineUnix: plan.retireAfter }), plan.retireAfter);
+    }
     const raw = await this.signDigest(canonical.digest, Object.freeze({ identity: this.identity, direction: canonical.direction }));
     if (!isHexString(raw, 65)) throw new Error("external signer returned an invalid signature");
     const signature = Signature.from(raw).serialized;
@@ -103,7 +117,9 @@ export class IsolatedSignerService {
     // Persist before release; a failed conditional write discards the signature.
     this.journal.record({
       sourceKey, direction: canonical.direction, contentHash, digest: canonical.digest,
-      deadline: canonical.deadlineUnix, signature, nowUnix, reissueOf: plan.reissueOf,
+      deadline: canonical.deadlineUnix, signature, nowUnix,
+      ...(plan.action === "reissue" ? { reissue: { replacedDigest: plan.replacedDigest, declared: plan.declared,
+        retireAfter: plan.retireAfter, evidence } } : {}),
     });
     return Object.freeze({ signer: this.signerAddress, digest: canonical.digest, signature });
   }
