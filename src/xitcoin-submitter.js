@@ -308,7 +308,7 @@ export function createXitcoinAdapter({ manifest, rpc, signer, verifySource }) {
   // base fee). The signed bytes stay valid for anyone, so this is never a
   // persisted halt: the identical bytes are resent only when nothing carrying
   // them is in flight and they would be admitted now, and otherwise it waits.
-  async function notConsumed(row, request, approvals, ours, decoded) {
+  async function notConsumed(row, request, approvals, ours, decoded, nowUnix) {
     const mempools = await rpc.mempools();
     if (mempools.some((mempool) => mempool.txs.some((tx) => sameSignedContent(signedContent(tx), ours)))) return { action: "pending" };
     // A mempool listing that is not complete cannot prove the transaction gone.
@@ -322,8 +322,16 @@ export function createXitcoinAdapter({ manifest, rpc, signer, verifySource }) {
     // the deadline passed, so the reserved sequence is consumed (the observation
     // then records released_elsewhere or expired).
     if (!await admissibleFee(decoded)) return wait("fee_below_required");
-    if (row.broadcastAttempts >= x.maxBroadcastAttempts) return wait("broadcast_attempts_exhausted");
+    // No terminal cap: every send is still recorded before it is made (the
+    // write-ahead marker), and resends back off from one minute, doubling, up
+    // to maxResendIntervalSeconds after the previous one.
+    if (!Number.isSafeInteger(row.updatedAt) || !Number.isSafeInteger(nowUnix)) throw unavailable("invalid_ledger_row");
+    if (nowUnix < row.updatedAt + resendDelay(row.broadcastAttempts)) return wait("resend_backoff");
     return { action: "rebroadcast" };
+  }
+
+  function resendDelay(attempts) {
+    return Math.min(60 * 2 ** Math.min(Math.max(attempts, 1) - 1, 20), x.maxResendIntervalSeconds);
   }
 
   // Our sequence is consumed. Find the transaction that consumed it and decide
@@ -341,7 +349,7 @@ export function createXitcoinAdapter({ manifest, rpc, signer, verifySource }) {
       // carrying our signed content: our bytes or a re-encoding of them.
       const consumedAt = await sequenceConsumedAt(row.nonce, tip);
       if (consumedAt === undefined) return { action: "pending" }; // not yet at every origin's height
-      if (consumedAt === null) return consumedBeforeWindow(row, request, approvals);
+      if (consumedAt === null) return consumedBeforeWindow(row, request, approvals, ours);
       const block = await rpc.block(consumedAt);
       const candidates = block.txs.flatMap((tx, index) => (sameSignedContent(signedContent(tx), ours) ? [block.txHashes[index]] : []));
       if (!candidates.length) return halt("nonce_consumed_without_inclusion");
@@ -415,22 +423,31 @@ export function createXitcoinAdapter({ manifest, rpc, signer, verifySource }) {
   }
 
   // Consumed before the searched window: complete only on a record naming our
-  // own transaction and approval in a block every origin still serves.
-  async function consumedBeforeWindow(row, request, approvals) {
+  // approval and a transaction carrying our signed content (our bytes or a
+  // re-encoding processed during long downtime), found in the record's block
+  // as every origin serves it. The record exists only because that
+  // transaction succeeded: its writes roll back with any failure.
+  async function consumedBeforeWindow(row, request, approvals, ours) {
     const state = await attestationState(request, approvals);
     if (state.mismatch) return halt("processed_with_mismatching_record");
     const record = state.processed;
-    if (record && lower(record.txHash) === row.transactionHash && recordMatches(record, request, approvals, { exact: true })) {
+    if (record && recordMatches(record, request, approvals, { exact: true })) {
+      const named = lower(record.txHash);
       const block = await rpc.block(record.height);
-      if (!block.txHashes.includes(row.transactionHash)) throw new XitcoinRpcDisagreement();
-      return { action: "finalized", blockNumber: record.height, blockHash: block.hash };
+      const index = block.txHashes.indexOf(named);
+      if (index === -1) throw new XitcoinRpcDisagreement();
+      if (sameSignedContent(signedContent(block.txs[index]), ours)) {
+        return ownInclusion(row, named, { blockNumber: record.height, blockHash: block.hash });
+      }
     }
     return halt("nonce_consumed_without_inclusion");
   }
 
   return Object.freeze({
     destination: "xitcoin",
-    maxBroadcastAttempts: x.maxBroadcastAttempts,
+    // Resends of the identical bytes are paced by the adapter, never capped.
+    maxBroadcastAttempts: null,
+    stalledAlertSeconds: x.stalledAlertSeconds,
 
     transferId(request) { return attestationId({ ...request?.payload, direction: request?.direction }); },
 
@@ -558,7 +575,7 @@ export function createXitcoinAdapter({ manifest, rpc, signer, verifySource }) {
 
     async send({ row }) { await rpc.broadcast(row.signedHex); },
 
-    async observe({ row, request, approvals }) {
+    async observe({ row, request, approvals, nowUnix }) {
       await rpc.chainId();
       const decoded = await parseStored(row, request, approvals);
       const ours = signedContent(row.signedHex);
@@ -566,7 +583,7 @@ export function createXitcoinAdapter({ manifest, rpc, signer, verifySource }) {
       const sequence = await sequences();
       if (sequence === null) return { action: "pending" }; // propagation lag
       if (sequence < row.nonce) return halt("account_sequence_regressed");
-      if (sequence === row.nonce) return notConsumed(row, request, approvals, ours, decoded);
+      if (sequence === row.nonce) return notConsumed(row, request, approvals, ours, decoded, nowUnix);
       return consumed(row, request, approvals, ours, tip);
     },
   });
