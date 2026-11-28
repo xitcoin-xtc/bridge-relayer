@@ -426,7 +426,11 @@ Recovery decisions (all from canonical observations, never from send errors):
 `test/cronos-submitter-evm.test.js` runs the complete flow on a local anvil
 chain with chain ID `338`, two independent fault-injecting JSON-RPC origins,
 two fake CometBFT origins and the vendored reviewed vault, compiled with forge
-(solc 0.8.30, optimizer 200, `paris`, OpenZeppelin 5.4.0). Vendored sources are
+(solc 0.8.30, optimizer 200, `paris`, OpenZeppelin 5.4.0). Approvals come from
+the coordinator's `approveFinalizedTransfer` round with three in-process
+`IsolatedSignerService` instances, each enforcing its policy, verifying the burn
+on the Xitcoin origins and keeping its own approval journal (scenarios that test
+the submitter's own source checks bypass them deliberately). Vendored sources are
 checked against their git blob hashes in `test/evm/provenance.json`: the vault
 recorded for the deployed testnet vault (`d3ae705`) and current contracts main
 (`96ee420`). Scenarios: approve, release and complete on both vault versions;

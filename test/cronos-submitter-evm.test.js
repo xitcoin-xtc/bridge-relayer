@@ -6,9 +6,14 @@ import { spawn } from "node:child_process";
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Interface, ZeroHash, encryptKeystoreJsonSync, keccak256 } from "ethers";
+import { Interface, JsonRpcProvider, ZeroHash, encryptKeystoreJsonSync, keccak256 } from "ethers";
 import { BroadcastLedger } from "../src/broadcast-ledger.js";
-import { buildTransferApprovalRequest } from "../src/coordinator.js";
+import { approveFinalizedTransfer, buildTransferApprovalRequest } from "../src/coordinator.js";
+import { CometBftHttpClient, decodeXitcoinOutboundBlock, decodeXitcoinOutboundTransaction } from "../src/network.js";
+import { SignerApprovalJournal } from "../src/signer-journal.js";
+import { IsolatedSignerService, createSignerPolicy } from "../src/signer-service.js";
+import { createCanonicalSourceVerifier } from "../src/source-verification.js";
+import { CronosFinalizedWatcher, XitcoinFinalizedWatcher } from "../src/watchers.js";
 import { buildCronosSubmitterRuntime, cronosLedgerBinding } from "../src/cronos-submitter.js";
 import { SubmissionHalt } from "../src/durable-broadcast.js";
 import { TESTNET_ROUTE_ID } from "../src/preflight.js";
@@ -34,20 +39,45 @@ function artifacts(version) {
     token: compile(evm.forge, "token").MockERC20 };
 }
 
-function approve(store, burn, vault, deadlineUnix) {
+// Coordinator-side persistence of a finalized Xitcoin burn and its approval
+// request. Approvals come from three isolated signer services that each verify
+// the burn on the Xitcoin origins and keep their own durable journal, unless a
+// scenario deliberately bypasses them to test the submitter's own checks.
+async function approve(store, burn, vault, deadlineUnix, signerServices) {
   store.observe({ sourceChain: "xitcoin", sourceRef: burn.requestId, routeId: "cronos-testnet-xitcoin-testnet",
     blockHeight: burn.height, blockHash: blockHash(burn.height), transactionHash: burn.transactionHash, messageIndex: 0,
     payload: { requestId: burn.requestId, sender: "xtc1sender", destination: burn.recipient, amount: burn.amount, nonce: burn.nonce } });
   const transfer = store.transition("xitcoin", burn.requestId, "finalized");
   const request = buildTransferApprovalRequest({ transfer, routeId: "cronos-testnet-xitcoin-testnet", cronosRouteId: TESTNET_ROUTE_ID,
     cronosChainId: 338, cronosVault: vault, signerSetVersion: 1, deadlineUnix });
+  if (signerServices) {
+    const clients = signerServices.map((service) => ({ identity: service.identity, approve: (value) => service.approve(value) }));
+    await approveFinalizedTransfer({ store, sourceChain: "xitcoin", sourceRef: burn.requestId, request, clients,
+      authorizedSigners: [...signers], threshold: 2, nowUnix: Math.floor(Date.now() / 1000) });
+    return;
+  }
   store.persistApprovalRequest("xitcoin", burn.requestId, request);
   for (const approval of sign(request)) store.recordApproval("xitcoin", burn.requestId, approval);
   store.transition("xitcoin", burn.requestId, "approved");
 }
 
+function isolatedSigners({ vault, proxies, comets }) {
+  const providers = proxies.map((proxy) => new JsonRpcProvider(proxy.url, 338, { staticNetwork: true }));
+  const clients = comets.map((comet) => new CometBftHttpClient({ url: comet.url, chainId: "xitcoin-testnet-v2-1", allowHttp: true,
+    decodeBlock: decodeXitcoinOutboundBlock, decodeTransaction: decodeXitcoinOutboundTransaction }));
+  const verifySource = createCanonicalSourceVerifier({ cronosRouteId: TESTNET_ROUTE_ID,
+    cronosWatcher: new CronosFinalizedWatcher({ providers, vault, routeId: TESTNET_ROUTE_ID, confirmations: 3 }),
+    xitcoinWatcher: new XitcoinFinalizedWatcher({ clients, chainId: "xitcoin-testnet-v2-1", routeId: "cronos-testnet-xitcoin-testnet", safetyLag: 2 }) });
+  const policy = createSignerPolicy({ routeIds: ["cronos-testnet-xitcoin-testnet"], cronosChainIds: [338],
+    xitcoinChainIds: ["xitcoin-testnet-v2-1"], cronosVaults: [vault], maximumAmount: (10n ** 21n).toString(), maximumDeadlineSeconds: 7_200 });
+  const journals = [0, 1, 2].map(() => new SignerApprovalJournal());
+  const services = [0, 1, 2].map((index) => new IsolatedSignerService({ identity: `signer-${index + 1}`, signerAddress: signers[index],
+    policy, verifySource, journal: journals[index], signDigest: async (digest) => keys[index].sign(digest).serialized }));
+  return { services, close: () => { for (const provider of providers) provider.destroy(); for (const journal of journals) journal.close?.(); } };
+}
+
 async function scenario(run, { version = "testnet", chainId = 338, burns = 1, approved = burns, deadlineOffset = 3_600,
-  patch = {}, cronosPatch = {}, cometBurns = (items) => [items, items] } = {}) {
+  patch = {}, cronosPatch = {}, cometBurns = (items) => [items, items], approvals = "signers" } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "cronos-submitter-"));
   const cleanup = [];
   try {
@@ -66,7 +96,9 @@ async function scenario(run, { version = "testnet", chainId = 338, burns = 1, ap
     const store = new RelayStore(paths.store);
     cleanup.push(() => store.close());
     const deadlineUnix = Math.floor(Date.now() / 1000) + deadlineOffset;
-    for (const burn of allBurns.slice(0, approved)) approve(store, burn, bridge.vault, deadlineUnix);
+    const signerSet = approvals === "signers" ? isolatedSigners({ vault: bridge.vault, proxies, comets }) : null;
+    if (signerSet) cleanup.push(signerSet.close);
+    for (const burn of allBurns.slice(0, approved)) await approve(store, burn, bridge.vault, deadlineUnix, signerSet?.services);
     writeFileSync(paths.keystore, encryptKeystoreJsonSync({ address: SUBMITTER, privateKey: localKeys.submitter.privateKey },
       "synthetic-local-test-password", { scrypt: { N: 1 << 10 } }), { mode: 0o600 });
     mkdirSync(paths.credentials, { mode: 0o700 });
@@ -112,7 +144,7 @@ async function scenario(run, { version = "testnet", chainId = 338, burns = 1, ap
       ledger: () => new BroadcastLedger(paths.ledger, cronosLedgerBinding(manifest), journalOptions("cronos")),
     };
     await run({ chain, proxies, bridge, burns: allBurns, store, manifest, paths, runtime, facts, directory,
-      approve: (burn) => approve(store, burn, bridge.vault, deadlineUnix) });
+      approve: (burn) => approve(store, burn, bridge.vault, deadlineUnix, signerSet?.services) });
   } finally {
     for (const step of cleanup.reverse()) { try { await step(); } catch { /* best effort */ } }
     rmSync(directory, { recursive: true, force: true });
@@ -355,7 +387,7 @@ test("forged receipt event or transaction input from every origin halts instead 
 test("a foreign use of the submitter account nonce halts the next transfer before signing", options, () => scenario(async ({ chain, runtime, facts, burns, approve }) => {
   const rt = await runtime();
   await completes(rt, facts, burns[0]);
-  approve(burns[1]);
+  await approve(burns[1]);
   await chain.rpc("eth_sendRawTransaction", [await signedCall(chain, localKeys.submitter, { to: localAddress(localKeys.deployer), data: "0x", gasLimit: 21_000n })]);
   await assert.rejects(rt.runOnce(), (error) => error.code === "account_nonce_not_owned");
   assert.equal(await facts.processed(burns[1]), false);
@@ -402,7 +434,7 @@ test("source finality is re-verified on independent Xitcoin origins before signi
       assert.equal(facts.relay(burns[0]).state, "approved");
       const ledger = facts.ledger();
       try { assert.equal(ledger.inspect(burns[0].requestId).found, false); } finally { ledger.close(); }
-    }, { cometBurns });
+    }, { cometBurns, approvals: "direct" });
   }
 });
 
