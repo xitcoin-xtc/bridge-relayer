@@ -7,6 +7,7 @@ const units = [
   "xitcoin-bridge-coordinator.service",
   "xitcoin-bridge-submitter@.service",
   "xitcoin-bridge-submitter-cronos-testnet.service",
+  "xitcoin-bridge-submitter-xitcoin-testnet.service",
 ];
 
 test("runs every Node runtime without JIT under executable-memory denial", async () => {
@@ -31,4 +32,19 @@ test("Cronos testnet submitter template is hardened, credentialed and never rest
   assert.doesNotMatch(body, /^Environment/m);
   assert.doesNotMatch(body, /PRIVATE_KEY|MNEMONIC|--password/i);
   assert.doesNotMatch(body, /start xitcoin/);
+});
+
+test("Xitcoin testnet submitter template is hardened, credentialed and never restarts", async () => {
+  const body = await readFile(new URL("../ops/systemd/xitcoin-bridge-submitter-xitcoin-testnet.service", import.meta.url), "utf8");
+  assert.match(body, /^ExecStart=\S+ --jitless \/opt\/xitcoin-bridge-relayer\/current\/src\/submitter-cli\.js start xitcoin \/etc\/xitcoin-bridge\/submitter-xitcoin\.json$/m);
+  assert.match(body, /^User=xitcoin-bridge-submitter-xitcoin$/m);
+  assert.match(body, /^LoadCredentialEncrypted=keystore-password:\/etc\/credstore\.encrypted\/xitcoin-bridge-submitter-xitcoin-keystore-password$/m);
+  assert.match(body, /^StateDirectory=xitcoin-bridge\/submitter-xitcoin$/m);
+  for (const line of ["Restart=no", "LimitCORE=0", "UMask=0077", "StateDirectoryMode=0700", "IPAddressDeny=any",
+    "IPAddressAllow=localhost", "NoNewPrivileges=true", "ProtectSystem=strict", "CapabilityBoundingSet="]) {
+    assert.match(body, new RegExp(`^${line}$`, "m"), line);
+  }
+  assert.doesNotMatch(body, /^Environment/m);
+  assert.doesNotMatch(body, /PRIVATE_KEY|MNEMONIC|--password/i);
+  assert.doesNotMatch(body, /start cronos|submitter-cronos/);
 });

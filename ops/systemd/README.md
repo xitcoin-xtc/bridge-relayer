@@ -10,6 +10,9 @@ networking and remains blocked for both destinations. The separate
 `xitcoin-bridge-submitter-cronos-testnet.service` template documents the
 Cronos testnet submitter: an encrypted keystore credential, a private state
 directory for the broadcast ledger, loopback-only RPC egress and no restart.
+`xitcoin-bridge-submitter-xitcoin-testnet.service` documents the Xitcoin
+testnet submitter the same way, under its own identity, credential and state
+directory.
 See [submitter requirements](../../docs/SUBMITTERS.md).
 Never add keys, mnemonics, tokens or private production endpoints to templates
 or manifests.

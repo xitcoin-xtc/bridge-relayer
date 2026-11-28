@@ -100,3 +100,22 @@ export function createOutboundSourceVerifier({ xitcoinWatcher }) {
     return Object.freeze({ canonical: true, finalized: true, digest: canonical.digest });
   };
 }
+
+// Destination submitters for Xitcoin re-verify only the Cronos deposit of an
+// inbound request; any other direction is rejected rather than routed.
+export function createInboundSourceVerifier({ cronosWatcher, cronosRouteId }) {
+  const expectedCronosRouteId = normalizeBytes32(cronosRouteId);
+  if (!cronosWatcher || typeof cronosWatcher.events !== "function" || typeof cronosWatcher.verifyCanonicalEvent !== "function") {
+    throw new Error("Cronos source watcher is required");
+  }
+  return async function verifyInboundSource(request) {
+    const canonical = buildApprovalRequest(request);
+    if (canonical.direction !== DIRECTION_INBOUND) throw new Error("inbound approval request is required");
+    const expected = evidence(canonical.payload, canonical.direction);
+    const records = await cronosWatcher.events(expected.blockHeight, expected.blockHeight);
+    const matches = records.filter((record) => matchingInbound(record, canonical.payload, expected, expectedCronosRouteId));
+    if (matches.length !== 1) throw new Error("canonical source event does not match approval request");
+    await cronosWatcher.verifyCanonicalEvent(matches[0]);
+    return Object.freeze({ canonical: true, finalized: true, digest: canonical.digest });
+  };
+}
