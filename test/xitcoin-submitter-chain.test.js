@@ -7,6 +7,7 @@
 import assert from "node:assert/strict";
 import test, { after, before } from "node:test";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,7 +26,8 @@ import { RelayStore } from "../src/store.js";
 import { validateXitcoinTestnetManifest } from "../src/submitter-manifest.js";
 import { CronosFinalizedWatcher, XitcoinFinalizedWatcher } from "../src/watchers.js";
 import { buildXitcoinSubmitterRuntime, isTemporaryStop, xitcoinLedgerBinding } from "../src/xitcoin-submitter.js";
-import { XITCOIN_CHAIN_SCHEMA_COMMIT, assembleTxRaw, buildXitcoinSignDoc, cosmosSignature, encodeSubmitAttestation } from "../src/xitcoin-transaction.js";
+import { XITCOIN_CHAIN_SCHEMA_COMMIT, assembleTxRaw, buildXitcoinSignDoc, cosmosSignature, decodeXitcoinTransaction,
+  encodeSubmitAttestation } from "../src/xitcoin-transaction.js";
 import { journalOptions } from "./journal-fixture.js";
 import { keys, signers } from "./fixtures/destination.js";
 import { compile, deployBridge, evmAvailability, localAddress, localKeys, signedCall, startAnvil, startProxy } from "./evm/harness.js";
@@ -470,3 +472,37 @@ test("a third-party submission after we signed still consumes our sequence once,
   assert.equal(facts.relay().release_ref, foreign.hash);
   assert.equal(await facts.balance(), AMOUNT);
 }));
+
+test("a re-encoding of our signed bytes that lands first is our inclusion, recorded by its hash, never a halt", options, () => scenario(async ({ runtime, facts, manifest, paths }) => {
+  // Killed after the broadcast marker, before our bytes were sent.
+  await killedAt("broadcast-recorded", manifest, paths);
+  const row = facts.row();
+  assert.equal(row.state, "broadcast");
+  // Anyone who has seen our bytes can re-wrap the same signed content: the
+  // chain's eth_secp256k1 verifier drops the 65th signature byte unchecked.
+  const decoded = decodeXitcoinTransaction(row.signedHex);
+  const signature = Buffer.from(decoded.signatureHex.slice(2), "hex");
+  signature[64] += 27;
+  const field = (n, bytes) => Buffer.concat([Buffer.from([n * 8 + 2]), varint(bytes.length), bytes]);
+  const variant = Buffer.concat([field(1, decoded.bodyBytes), field(2, decoded.authInfoBytes), field(3, signature)]);
+  const variantHash = `0x${createHash("sha256").update(variant).digest("hex")}`;
+  assert.notEqual(variantHash, row.transactionHash);
+  assert.equal((await node.broadcast(`0x${variant.toString("hex")}`)).code, 0);
+  assert.equal((await node.committed(variantHash)).tx_result.code, 0);
+  const rt = await runtime({ offsetMs: 2 * 60_000 }); // the killed worker's lease has expired
+  const reports = await completes(rt, facts);
+  assert.deepEqual([reports.at(-1).action, reports.at(-1).releaseHash], ["released_elsewhere", variantHash]);
+  assert.equal(facts.row().state, "released_elsewhere");
+  assert.equal(facts.row().releaseHash, variantHash);
+  assert.equal(facts.relay().destination_ref, row.transactionHash);
+  assert.equal(facts.relay().release_ref, variantHash);
+  assert.equal(`0x${(await facts.attestation()).record.tx_hash.toLowerCase()}`, variantHash);
+  assert.equal(await facts.sequence(), 1);
+  assert.equal(await facts.balance(), AMOUNT);
+}));
+
+function varint(value) {
+  const bytes = [];
+  do { bytes.push((value & 127) | (value > 127 ? 128 : 0)); value >>>= 7; } while (value);
+  return Buffer.from(bytes);
+}

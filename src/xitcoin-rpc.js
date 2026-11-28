@@ -118,8 +118,10 @@ export function normalizeBlock(value, expectedHeight) {
   if (!Array.isArray(txs) || txs.length > 100_000) throw invalid();
   const height = safeDecimal(header.height);
   if (height !== expectedHeight) throw invalid();
+  const bytes = txs.map((tx) => base64(tx, 1_048_576));
   return Object.freeze({ height, hash: upperHash(has(result.block_id, ["hash"]).hash), chainId: text(header.chain_id, 64),
-    time: cometTime(header.time), txHashes: Object.freeze(txs.map((tx) => `0x${sha256(base64(tx, 1_048_576)).toString("hex")}`)) });
+    time: cometTime(header.time), txHashes: Object.freeze(bytes.map((tx) => `0x${sha256(tx).toString("hex")}`)),
+    txs: Object.freeze(bytes.map((tx) => `0x${tx.toString("hex")}`)) });
 }
 
 // tx_search for one hash: absent (null) is explicit (total_count "0").
@@ -162,8 +164,9 @@ export function normalizeMempool(value) {
   if (!Array.isArray(txs) || txs.length > 1_000 || txs.length !== safeDecimal(result.n_txs)) throw invalid();
   const total = safeDecimal(result.total);
   if (total < txs.length) throw invalid();
-  return Object.freeze({ complete: total === txs.length,
-    hashes: Object.freeze(txs.map((tx) => `0x${sha256(base64(tx, 1_048_576)).toString("hex")}`)) });
+  const bytes = txs.map((tx) => base64(tx, 1_048_576));
+  return Object.freeze({ complete: total === txs.length, hashes: Object.freeze(bytes.map((tx) => `0x${sha256(tx).toString("hex")}`)),
+    txs: Object.freeze(bytes.map((tx) => `0x${tx.toString("hex")}`)) });
 }
 
 // ABCI query response of the tx service's Simulate: code 0 with the gas used,
@@ -558,4 +561,13 @@ export class XitcoinRpcQuorum {
   }
 
   feeMarkets() { return this.each((origin) => origin.rest.get("/cosmos/evm/feemarket/v1/params"), normalizeFeeMarket); }
+
+  // Fee parameters from the origins that answer, when a strict majority does
+  // (values may differ between heights). Only used to decide send or wait.
+  async feeMarketsMajority() {
+    const answers = (await this.settled((origin) => origin.rest.get("/cosmos/evm/feemarket/v1/params"), normalizeFeeMarket))
+      .filter((answer) => answer.ok);
+    if (answers.length < this.majoritySize) throw new XitcoinRpcDisagreement();
+    return Object.freeze(answers.map((answer) => answer.value));
+  }
 }

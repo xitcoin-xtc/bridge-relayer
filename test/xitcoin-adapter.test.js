@@ -11,7 +11,7 @@ import { XITCOIN_TESTNET_ROUTE_ID, attestationId } from "../src/protocol.js";
 import { validateXitcoinTestnetManifest } from "../src/submitter-manifest.js";
 import { createXitcoinAdapter, isTemporaryStop, xitcoinLedgerBinding } from "../src/xitcoin-submitter.js";
 import { XitcoinRpcQuorum } from "../src/xitcoin-rpc.js";
-import { XITCOIN_CHAIN_SCHEMA_COMMIT } from "../src/xitcoin-transaction.js";
+import { XITCOIN_CHAIN_SCHEMA_COMMIT, decodeXitcoinTransaction } from "../src/xitcoin-transaction.js";
 import { keys, sign, signers } from "./fixtures/destination.js";
 import { SUBMITTER, SUBMITTER_KEY, recordFor, xitcoinModel } from "./fixtures/xitcoin-model.js";
 
@@ -109,9 +109,10 @@ test("our sequence consumed without our transaction anywhere halts; a regression
   const { row } = await signed(context);
   context.model.state.account.sequence = 1;
   assert.deepEqual(await observe(context, row), { action: "halt", code: "nonce_consumed_without_inclusion" });
-  // Visible again (committed or gossiped meanwhile): pending, never a halt.
+  // Our bytes still waiting in a mempool do not change that: the sequence was
+  // consumed by a transaction that does not carry our signed content.
   context.model.state.mempool = [row.signedHex];
-  assert.deepEqual(await observe(context, row), { action: "pending" });
+  assert.deepEqual(await observe(context, row), { action: "halt", code: "nonce_consumed_without_inclusion" });
   context.model.state.mempool = [];
   // The transaction index lags: our sequence was consumed in block 97 and that
   // block (consensus data) contains our transaction: pending, never a halt.
@@ -139,13 +140,19 @@ test("our sequence consumed without our transaction anywhere halts; a regression
   await assert.rejects(observe(regressed, { ...second.row, nonce: 3 }), (error) => error.code === "stored_transaction_mismatch");
 });
 
-test("a failure in the ante handler leaves the sequence unused: identical bytes only, bounded attempts", async () => {
+test("a failure in the ante handler leaves the sequence unused: identical bytes only, never a halt", async () => {
   const context = setup();
   const { row } = await signed(context);
   context.model.commit(row.signedHex, { code: 13, gasUsed: 20_000, accSeq: [] });
   context.model.state.height = 105;
   assert.deepEqual(await observe(context, row), { action: "rebroadcast" });
-  assert.deepEqual(await observe(context, { ...row, broadcastAttempts: 3 }), { action: "halt", code: "broadcast_attempts_exhausted" });
+  // Bytes still in a mempool are in flight: nothing is resent.
+  context.model.state.mempool = [row.signedHex];
+  assert.deepEqual(await observe(context, row), { action: "pending" });
+  context.model.state.mempool = [];
+  // With every attempt spent and nothing in flight the row waits; the sequence
+  // is unused and the bytes stay valid, so no halt is ever persisted.
+  assert.deepEqual(await observe(context, { ...row, broadcastAttempts: 3 }), { action: "wait", code: "broadcast_attempts_exhausted" });
   context.model.state.account.sequence = 1; // something else used our sequence
   assert.deepEqual(await observe(context, row), { action: "halt", code: "nonce_consumed_without_inclusion" });
 });
@@ -309,4 +316,136 @@ test("stored bytes are revalidated against the request, key, sequence and caps o
   }
   const tighter = setup({ patch: { maxFee: "1000" } });
   assert.deepEqual(await tighter.adapter.verifyStored({ ...tighter.stored, row }), { action: "halt", code: "stored_transaction_mismatch" });
+});
+
+// Re-encodings of our signed content: pos-chain's eth_secp256k1 verifier drops a
+// 65th signature byte without checking it and accepts 64-byte R || S, so the
+// same body, auth info and R || S can be wrapped into another TxRaw (another
+// hash) that spends our sequence and fee.
+function reencode(signedHex, signature) {
+  const decoded = decodeXitcoinTransaction(signedHex);
+  const r = Buffer.from(decoded.signatureHex.slice(2, 130), "hex");
+  const sig = signature === "rs" ? r : Buffer.concat([r, Buffer.from([signature])]);
+  const field = (n, bytes) => Buffer.concat([Buffer.from([n * 8 + 2]), varint(bytes.length), bytes]);
+  return `0x${Buffer.concat([field(1, decoded.bodyBytes), field(2, decoded.authInfoBytes), field(3, sig)]).toString("hex")}`;
+}
+function varint(value) {
+  const bytes = [];
+  do { bytes.push((value & 127) | (value > 127 ? 128 : 0)); value >>>= 7; } while (value);
+  return Buffer.from(bytes);
+}
+
+test("a re-encoding of our signed transaction that lands first is recognised by signed content, never a halt", async () => {
+  for (const signature of [27, 2, "rs"]) {
+    const context = setup();
+    const { row } = await signed(context);
+    const variant = reencode(row.signedHex, signature);
+    assert.notEqual(variant, row.signedHex);
+    const hash = context.model.commit(variant, { height: 100, accSeq: [`${SUBMITTER}/0`] });
+    assert.notEqual(hash, row.transactionHash);
+    context.model.state.account.sequence = 1;
+    context.model.state.account.sequenceAt = (height) => (height >= 100 ? 1 : 0);
+    context.model.state.attestations.set(context.transferId, { status: "processed",
+      record: recordFor(context.request, context.approvals, { txHash: hash, height: 100 }) });
+    context.model.state.height = 101;
+    assert.deepEqual(await observe(context, row), { action: "pending" }); // confirmations not reached
+    context.model.state.height = 105;
+    // RelayStore keeps naming our own transaction and records the release by the variant.
+    assert.deepEqual(await observe(context, row), { action: "released_elsewhere", releaseHash: hash, blockNumber: 100,
+      blockHash: context.model.blockHash(100) });
+  }
+  // Our own bytes in the same block, rejected by the ante handler after the
+  // variant consumed the sequence: the variant is our inclusion.
+  const both = setup();
+  const pair = await signed(both);
+  const variant = reencode(pair.row.signedHex, 28);
+  const hash = both.model.commit(variant, { height: 100, accSeq: [`${SUBMITTER}/0`] });
+  both.model.commit(pair.row.signedHex, { height: 100, code: 32, gasUsed: 30_000, accSeq: [] });
+  both.model.state.account.sequence = 1;
+  both.model.state.account.sequenceAt = (height) => (height >= 100 ? 1 : 0);
+  both.model.state.attestations.set(both.transferId, { status: "processed", record: recordFor(both.request, both.approvals, { txHash: hash, height: 100 }) });
+  both.model.state.height = 105;
+  assert.deepEqual(await observe(both, pair.row), { action: "released_elsewhere", releaseHash: hash, blockNumber: 100,
+    blockHash: both.model.blockHash(100) });
+  // A variant whose message failed after the deadline: expired, like our own bytes.
+  const late = setup();
+  const lateRow = (await signed(late)).row;
+  late.model.commit(reencode(lateRow.signedHex, 27), { height: 100, code: 1, accSeq: [`${SUBMITTER}/0`] });
+  late.model.state.account.sequence = 1;
+  late.model.state.account.sequenceAt = (height) => (height >= 100 ? 1 : 0);
+  late.model.state.blockTimes.set(100, late.request.deadlineUnix + 1);
+  late.model.state.height = 105;
+  assert.deepEqual(await observe(late, lateRow), { action: "expired", blockNumber: 100, blockHash: late.model.blockHash(100) });
+  // A transaction with the same body and auth info but another R || S is not ours.
+  const forged = setup();
+  const forgedRow = (await signed(forged)).row;
+  const other = Buffer.from(reencode(forgedRow.signedHex, 27).slice(2), "hex");
+  other[other.length - 2] ^= 1; // flips a bit of S
+  forged.model.commit(`0x${other.toString("hex")}`, { height: 100, accSeq: [`${SUBMITTER}/0`] });
+  forged.model.state.account.sequence = 1;
+  forged.model.state.account.sequenceAt = (height) => (height >= 100 ? 1 : 0);
+  forged.model.state.height = 105;
+  assert.deepEqual(await observe(forged, forgedRow), { action: "halt", code: "nonce_consumed_without_inclusion" });
+});
+
+test("resends wait for an admissible fee and nothing in flight; exhausted attempts wait instead of halting", async () => {
+  const context = setup();
+  const { row } = await signed(context);
+  // Dropped or evicted: unknown everywhere, sequence unused.
+  assert.deepEqual(await observe(context, row), { action: "rebroadcast" });
+  // A re-encoding of our bytes in a mempool is in flight too.
+  context.model.state.mempool = [reencode(row.signedHex, 27)];
+  assert.deepEqual(await observe(context, row), { action: "pending" });
+  context.model.state.mempool = [];
+  // The base fee rose above our price: resending would not be admitted.
+  const decoded = decodeXitcoinTransaction(row.signedHex);
+  const price = BigInt(decoded.feeAmount) / BigInt(decoded.gasLimit);
+  context.model.state.baseFee = `${price + 1n}.000000000000000000`;
+  assert.deepEqual(await observe(context, row), { action: "wait", code: "fee_below_required" });
+  assert.deepEqual(await context.adapter.beforeFirstSend({ ...context.stored, row: { ...row, state: "signed", broadcastAttempts: 0 } }),
+    { action: "wait", code: "fee_below_required" });
+  context.model.state.baseFee = `${price}.000000000000000000`;
+  assert.deepEqual(await observe(context, row), { action: "rebroadcast" });
+  assert.deepEqual(await observe(context, { ...row, broadcastAttempts: 3 }), { action: "wait", code: "broadcast_attempts_exhausted" });
+});
+
+test("one origin's transaction result for old history can never force a halt; a strict majority can", async () => {
+  // Our transaction succeeded at height 100 (the record, consensus state on
+  // every origin, names it). Long after, one of two origins reports it failed
+  // while the other no longer serves the transaction index.
+  const lying = async ({ origins, liars, code, record }) => {
+    const context = setup({ origins });
+    const { row } = await signed(context);
+    context.model.commit(row.signedHex, { height: 100, accSeq: [`${SUBMITTER}/0`] });
+    context.model.state.account.sequence = 1;
+    context.model.state.account.sequenceAt = (height) => (height >= 100 ? 1 : 0);
+    context.model.state.attestations.set(context.transferId, { status: "processed",
+      record: record(context, row) });
+    context.model.state.height = 100 + 300; // deeper than indexing lag, inside historyBlocks
+    context.model.faults.forEach((_, index) => {
+      context.model.faults[index] = ({ kind, method, body }) => {
+        if (kind !== "rpc" || method !== "tx_search") return undefined;
+        if (!liars.includes(index)) return { ...body, result: { txs: [], total_count: "0" } };
+        const tx = body.result.txs[0];
+        return tx ? { ...body, result: { ...body.result, txs: [{ ...tx, tx_result: { ...tx.tx_result, code } }] } } : undefined;
+      };
+    });
+    return { context, row, result: await observe(context, row) };
+  };
+  const own = (context, row) => recordFor(context.request, context.approvals, { txHash: row.transactionHash, height: 100 });
+  // A lying minority origin reporting a failure: the record settles it.
+  let outcome = await lying({ origins: 2, liars: [0], code: 1, record: own });
+  assert.deepEqual(outcome.result, { action: "finalized", blockNumber: 100, blockHash: outcome.context.model.blockHash(100) });
+  outcome = await lying({ origins: 3, liars: [2], code: 1, record: own });
+  assert.equal(outcome.result.action, "finalized");
+  // A lying minority origin reporting success while the record names another
+  // transaction: an alert, never record_mismatch_after_success.
+  const foreign = (context) => recordFor(context.request, context.approvals, { txHash: `0x${"66".repeat(32)}`, height: 99 });
+  outcome = await lying({ origins: 2, liars: [1], code: 0, record: foreign });
+  assert.deepEqual([outcome.result.action, outcome.result.code], ["release_unverified", "inclusion_history_unserved"]);
+  // The same evidence from a strict majority of three origins is acted on.
+  outcome = await lying({ origins: 3, liars: [0, 1], code: 1, record: own });
+  assert.deepEqual(outcome.result, { action: "halt", code: "record_names_failed_transaction" });
+  outcome = await lying({ origins: 3, liars: [0, 1], code: 0, record: foreign });
+  assert.deepEqual(outcome.result, { action: "halt", code: "record_mismatch_after_success" });
 });
