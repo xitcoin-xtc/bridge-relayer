@@ -119,6 +119,9 @@ export async function createEncryptedKeystoreDigestSigner({
     const signingKey = wallet.signingKey;
     return Object.freeze({
       signerAddress: expected,
+      // Public data: the compressed secp256k1 key, which Cosmos transactions
+      // carry in their signer info (eth_secp256k1).
+      compressedPublicKey: signingKey.compressedPublicKey,
       async signDigest(digest) {
         if (!isHexString(digest, 32)) throw new Error("approval digest must contain 32 bytes");
         return signingKey.sign(String(digest).toLowerCase()).serialized;

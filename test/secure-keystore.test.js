@@ -107,6 +107,8 @@ test("accepts a service-owned keystore with a root-owned systemd credential", as
     decrypt: async () => ({ address: ADDRESS, signingKey: KEY }),
   });
   assert.equal(signer.signerAddress, ADDRESS);
+  assert.equal(signer.compressedPublicKey, KEY.compressedPublicKey);
+  assert.deepEqual(Object.keys(signer).sort(), ["compressedPublicKey", "signDigest", "signerAddress"]);
 });
 
 test("accepts only a root-owned systemd bearer credential by default", async () => {
