@@ -182,6 +182,26 @@ test("a revert counts only when every origin reports an execution error; rate li
   }
 });
 
+test("per-origin block reads keep transaction hashes and tell a refusal from a transport failure or a wrong block", async () => {
+  const h = (byte) => `0x${byte.repeat(64)}`;
+  const block = (number, transactions = [h("e")]) => ({ result: { number, hash: h("c"), parentHash: h("d"), timestamp: "0x10", transactions } });
+  const build = (answers) => new CronosRpcQuorum({ urls: Object.keys(answers).map((host) => `https://${host}`), fetchImpl: async (target, init) => {
+    const { id, params } = JSON.parse(init.body);
+    assert.deepEqual(params, ["0x5", false]);
+    const answer = answers[new URL(target).host];
+    if (answer === "down") throw new Error("connection refused");
+    return json({ jsonrpc: "2.0", id, ...answer });
+  } });
+  const [served, refused, error, down] = await build({ "a.example": block("0x5"), "b.example": { result: null },
+    "c.example": { error: { code: -32000, message: "pruned" } }, "d.example": "down" }).blocksSettled(5);
+  assert.deepEqual(served.value.transactions, [h("e")]); assert.equal(served.value.hash, h("c"));
+  assert.deepEqual({ ...refused }, { ok: true, value: null });
+  assert.equal(error.ok, false); assert.equal(error.explicit, true);
+  const [wrong, invalidHash] = await build({ "e.example": block("0x6"), "f.example": block("0x5", ["0x12"]) }).blocksSettled(5);
+  for (const failure of [down, wrong, invalidHash]) { assert.equal(failure.ok, false); assert.equal(failure.explicit, false); }
+  assert.throws(() => build({ "a.example": block("0x5"), "b.example": block("0x5") }).blocksSettled(-1), (failure) => failure.code === "rpc_invalid_response");
+});
+
 test("strict-majority reads tolerate one faulty origin among three, never among two", async () => {
   const build = (answers) => new CronosRpcQuorum({ urls: Object.keys(answers).map((host) => `https://${host}`), fetchImpl: async (target, init) => {
     const { id } = JSON.parse(init.body);

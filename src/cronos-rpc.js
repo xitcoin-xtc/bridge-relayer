@@ -230,6 +230,18 @@ export class CronosRpcQuorum {
 
   latestBlocks() { return this.each("eth_getBlockByNumber", ["latest", false], normalizeBlock); }
 
+  // Each origin's block at a height with its transaction hashes (null when it
+  // does not serve that block), without throwing.
+  blocksSettled(number) {
+    if (!Number.isSafeInteger(number) || number < 0) throw invalid();
+    return this.settled("eth_getBlockByNumber", [hex(number), false], (value) => {
+      if (value === null) return null;
+      const block = normalizeBlock(value);
+      if (block.number !== number || !Array.isArray(value.transactions) || value.transactions.length > 50_000) throw invalid();
+      return Object.freeze({ ...block, transactions: Object.freeze(value.transactions.map(hash32)) });
+    });
+  }
+
   code(account, number) { return this.agree("eth_getCode", [account, hex(number)], (value) => data(value, 1_048_576)); }
 
   call(request, blockTag) {
