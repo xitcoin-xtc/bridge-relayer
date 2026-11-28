@@ -71,6 +71,7 @@ for (const destination of ["cronos", "xitcoin"]) {
     const final = await cycle();
     assert.equal(final.action, "finalized"); assert.equal(final.transactionHash, first.transactionHash);
     assert.equal(setup.store.get(sourceChain, sourceRef).state, "completed");
+    assert.equal(setup.store.get(sourceChain, sourceRef).release_ref, first.transactionHash);
     assert.equal(setup.ledger.inspect(final.transferId).state, "finalized");
     assert.equal((await cycle()).action, "idle");
     assert.equal(chain.distinctDeliveries(), 1); assert.equal(chain.deliveries.length, 1);
@@ -182,6 +183,7 @@ for (const destination of ["cronos", "xitcoin"]) {
     assert.equal(row.state, "released_elsewhere"); assert.equal(row.signedHex, null); assert.equal(row.releaseHash, releaseHash);
     assert.equal(setup.store.get(sourceChain, sourceRef).state, "completed");
     assert.equal(setup.store.get(sourceChain, sourceRef).destination_ref, null);
+    assert.equal(setup.store.get(sourceChain, sourceRef).release_ref, releaseHash); // where a reconciler reads it
     assert.equal(setup.ledger.blocking().length, 0);
     assert.equal(chain.deliveries.filter((hash) => hash === releaseHash).length, 0);
   }));
@@ -201,6 +203,7 @@ for (const destination of ["cronos", "xitcoin"]) {
     assert.equal(row.state, "released_elsewhere"); assert.equal(row.transactionHash, sent.transactionHash);
     const relay = setup.store.get(sourceChain, sourceRef);
     assert.equal(relay.state, "completed"); assert.equal(relay.destination_ref, sent.transactionHash);
+    assert.equal(relay.release_ref, releaseHash); // the front-run, not our reverted transaction
     assert.equal(setup.ledger.blocking().length, 0);
     await until(cycle, chain, () => setup.store.get(next.sourceChain, next.sourceRef).state === "completed");
     assert.deepEqual([0, 1], [row.nonce, setup.ledger.inspect(modelAdapter(destination, chain).transferId(next.request)).nonce]);
@@ -235,6 +238,76 @@ for (const destination of ["cronos", "xitcoin"]) {
     assert.equal((await cycle()).action, "released_elsewhere");
     assert.equal(setup.ledger.blocking().length, 0);
     assert.equal(chain.distinctDeliveries(), 1);
+  }));
+
+
+  test(`${destination}: an expired approval on a claimed row releases the claim without a nonce and the queue moves on`, () => harness(destination, async ({ chain, cycle, setup }) => {
+    const first = approvedTransfer(setup.store, destination, 1, { deadlineUnix: 1_900_000_100 });
+    setup.store.database.exec("UPDATE transfers SET updated_at = updated_at - 100");
+    approvedTransfer(setup.store, destination, 2);
+    const transferId = modelAdapter(destination, chain).transferId(first.request);
+    await assert.rejects(cycle({ crashAt: "claimed" }), Crash);
+    assert.equal(setup.ledger.inspect(transferId).state, "claimed");
+    const later = NOW + 200_000; // downtime beyond the approval deadline
+    const released = await cycle({ nowMs: later });
+    assert.equal(released.action, "waiting"); assert.equal(released.unclaimed, true);
+    const row = setup.ledger.inspect(transferId);
+    assert.equal(row.state, "unclaimed"); assert.equal(row.nonce, null); assert.equal(row.signedHex, null);
+    assert.equal(setup.ledger.nextNonce(), null);
+    const next = await cycle({ nowMs: later + 1_000 });
+    assert.equal(next.action, "submitted"); assert.notEqual(next.transferId, transferId);
+    assert.equal(setup.ledger.inspect(next.transferId).nonce, 0);
+    assert.equal(setup.store.get(first.sourceChain, first.sourceRef).state, "approved"); // kept, deferred, retried later
+    assert.equal(chain.deliveries.length, 1);
+  }));
+
+  test(`${destination}: a signed row whose approval expired sends its bytes once and records a non-blocking expiry`, () => harness(destination, async ({ chain, cycle, setup }) => {
+    const first = approvedTransfer(setup.store, destination, 1, { deadlineUnix: 1_900_000_100 });
+    setup.store.database.exec("UPDATE transfers SET updated_at = updated_at - 100");
+    const second = approvedTransfer(setup.store, destination, 2);
+    const transferId = modelAdapter(destination, chain).transferId(first.request);
+    await assert.rejects(cycle({ crashAt: "signed" }), Crash);
+    chain.time = 1_900_000_500;
+    const sent = await cycle({ nowMs: 1_900_000_500_000 });
+    assert.equal(sent.action, "submitted"); // the stored bytes, once, so their nonce is consumed
+    chain.mine(); chain.confirm(3);
+    const expired = await cycle({ nowMs: 1_900_000_501_000 });
+    assert.equal(expired.action, "expired"); assert.equal(expired.transactionHash, sent.transactionHash);
+    const row = setup.ledger.inspect(transferId);
+    assert.equal(row.state, "expired"); assert.equal(row.nonce, 0);
+    assert.equal(setup.ledger.blocking().length, 0);
+    const relay = setup.store.get(first.sourceChain, first.sourceRef);
+    assert.equal(relay.state, "submitted"); assert.equal(relay.destination_ref, sent.transactionHash); assert.equal(relay.release_ref, null);
+    const reports = [];
+    for (let i = 0; i < 12 && setup.store.get(second.sourceChain, second.sourceRef).state !== "completed"; i++) {
+      reports.push(await cycle({ nowMs: 1_900_000_502_000 + i * 1_000 }));
+      chain.mine(); chain.confirm(1);
+    }
+    assert.equal(setup.store.get(second.sourceChain, second.sourceRef).state, "completed");
+    assert.equal(setup.ledger.inspect(modelAdapter(destination, chain).transferId(second.request)).nonce, 1);
+    assert.ok(reports.every((report) => report.attention.expired === 1));
+  }));
+
+  test(`${destination}: a processed transfer without verifiable release evidence is a persistent non-blocking alert`, () => harness(destination, async ({ chain, cycle, setup }) => {
+    const bad = approvedTransfer(setup.store, destination, 1);
+    setup.store.database.exec("UPDATE transfers SET updated_at = updated_at - 100");
+    const good = approvedTransfer(setup.store, destination, 2);
+    const transferId = modelAdapter(destination, chain).transferId(bad.request);
+    chain.unverified.add(transferId);
+    const first = await cycle();
+    assert.equal(first.action, "submitted"); assert.notEqual(first.transferId, transferId);
+    const row = setup.ledger.inspect(transferId);
+    assert.equal(row.state, "release_unverified"); assert.equal(row.signedHex, null);
+    assert.equal(setup.store.get(bad.sourceChain, bad.sourceRef).state, "approved"); // never a completion
+    assert.equal(setup.ledger.blocking().length, 0);
+    const reports = [];
+    for (let i = 0; i < 12 && setup.store.get(good.sourceChain, good.sourceRef).state !== "completed"; i++) {
+      reports.push(await cycle({ nowMs: NOW + (i + 1) * 1_000 }));
+      chain.mine(); chain.confirm(1);
+    }
+    reports.push(await cycle({ nowMs: NOW + 60_000 }));
+    assert.ok(reports.length > 1 && reports.every((report) => report.attention.releaseUnverified === 1));
+    assert.equal(reports.at(-1).action, "idle");
   }));
 
   test(`${destination}: an unsendable transfer is rejected alone and never blocks the queue`, () => harness(destination, async ({ chain, cycle, setup }) => {

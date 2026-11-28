@@ -16,7 +16,8 @@ const decode = (hex) => JSON.parse(Buffer.from(hex.slice(2), "hex").toString());
 export class ModelChain {
   constructor() {
     Object.assign(this, { height: 100, nonce: 0, paused: false, mempool: new Map(), receipts: new Map(),
-      processed: new Map(), deliveries: [], foreign: 0, failNext: false, sendMode: "deliver", invalid: new Set() });
+      processed: new Map(), deliveries: [], foreign: 0, failNext: false, sendMode: "deliver", invalid: new Set(),
+      time: 1_900_000_000, unverified: new Set() });
   }
   receive(signedHex) {
     const hash = keccak256(signedHex);
@@ -29,9 +30,11 @@ export class ModelChain {
       const tx = decode(hex);
       if (tx.nonce !== this.nonce) continue;
       this.height += 1;
-      const status = this.failNext || this.paused || this.processed.has(tx.transferId) ? 0 : 1;
+      const expired = this.time > tx.deadline;
+      const status = this.failNext || this.paused || this.processed.has(tx.transferId) || expired ? 0 : 1;
       this.failNext = false;
-      this.receipts.set(hash, { blockNumber: this.height, blockHash: `0x${this.height.toString(16).padStart(64, "0")}`, status });
+      this.receipts.set(hash, { blockNumber: this.height, blockHash: `0x${this.height.toString(16).padStart(64, "0")}`, status,
+        timestamp: this.time });
       if (status === 1) this.processed.set(tx.transferId, hash);
       this.nonce += 1;
       this.mempool.delete(hash);
@@ -76,6 +79,7 @@ export function modelAdapter(destination, chain, { maxBroadcastAttempts = 3, con
       if (chain.rpcFailure) throw new Error("rpc_disagreement");
       if (chain.paused) return { action: "wait", code: "route_paused" };
       if (chain.invalid.has(id)) return { action: "reject", code: "invalid_recipient" };
+      if (chain.unverified.has(id)) return { action: "release_unverified" };
       if (chain.processed.has(id)) return elsewhere(id, null);
       if (request.deadlineUnix < nowUnix + marginSeconds) return { action: "wait", code: "approval_expired_awaiting_reissue", defer: true };
       return { action: "sign", context: { ok: true } };
@@ -84,7 +88,7 @@ export function modelAdapter(destination, chain, { maxBroadcastAttempts = 3, con
       if (!context?.ok) throw new Error("missing context");
       if (expectedNonce !== null && expectedNonce !== chain.nonce) return { action: "halt", code: "account_nonce_not_owned" };
       if (chain.mempool.size) return { action: "halt", code: "foreign_pending_transaction" };
-      const signedHex = encode({ transferId: id, nonce: chain.nonce, approvalDigest: request.digest, destination });
+      const signedHex = encode({ transferId: id, nonce: chain.nonce, approvalDigest: request.digest, destination, deadline: request.deadlineUnix });
       return { action: "signed", nonce: chain.nonce, signedHex, transactionHash: keccak256(signedHex) };
     },
     async verifyStored({ row, request }) {
@@ -93,8 +97,10 @@ export function modelAdapter(destination, chain, { maxBroadcastAttempts = 3, con
           || keccak256(row.signedHex) !== row.transactionHash) return { action: "halt", code: "stored_transaction_mismatch" };
       return { action: "valid" };
     },
-    async beforeFirstSend({ row }) {
+    async beforeFirstSend({ row, request, nowUnix }) {
       if (chain.nonce !== row.nonce) return { action: "halt", code: "nonce_consumed_before_send" };
+      // Approval no longer usable: send the identical bytes once to consume the nonce.
+      if (request.deadlineUnix < Math.max(nowUnix, chain.time) + marginSeconds) return { action: "send" };
       if (chain.paused) return { action: "wait", code: "route_paused" };
       // Released elsewhere: still send the identical bytes once so their
       // reserved nonce is consumed (they revert); then observe the release.
@@ -117,6 +123,9 @@ export function modelAdapter(destination, chain, { maxBroadcastAttempts = 3, con
         if (receipt.status === 0 && chain.processed.has(row.transferId)) {
           const released = elsewhere(row.transferId, row.transactionHash);
           return released?.action === "released_elsewhere" ? released : { action: "pending" };
+        }
+        if (receipt.status === 0 && receipt.timestamp > decode(row.signedHex).deadline) {
+          return { action: "expired", blockNumber: receipt.blockNumber, blockHash: receipt.blockHash };
         }
         return { action: receipt.status === 1 ? "finalized" : "failed", blockNumber: receipt.blockNumber, blockHash: receipt.blockHash };
       }

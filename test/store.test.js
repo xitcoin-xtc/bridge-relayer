@@ -69,3 +69,20 @@ test("persists one immutable approval request before contacting signers", () => 
   }), /conflicting/);
   store.close();
 });
+
+test("release reference records the executing transaction once, only on completion", () => {
+  const store = new RelayStore();
+  const ref = `0x${"ab".repeat(32)}`;
+  store.observe({ sourceChain: "xitcoin", sourceRef: ref, routeId: "cronos-testnet-xitcoin-testnet", blockHeight: 1,
+    blockHash: `0x${"11".repeat(32)}`, transactionHash: `0x${"22".repeat(32)}`, messageIndex: 0, payload: { amount: "1" } });
+  for (const state of ["finalized", "approved"]) store.transition("xitcoin", ref, state);
+  const ours = `0x${"33".repeat(32)}`, release = `0x${"44".repeat(32)}`;
+  assert.throws(() => store.transition("xitcoin", ref, "submitted", { destinationRef: ours, releaseRef: release }), /release reference/);
+  store.transition("xitcoin", ref, "submitted", { destinationRef: ours });
+  for (const releaseRef of ["0x1234", `0x${"AB".repeat(32)}`, 7]) {
+    assert.throws(() => store.transition("xitcoin", ref, "completed", { releaseRef }), /release reference/);
+  }
+  const completed = store.transition("xitcoin", ref, "completed", { releaseRef: release });
+  assert.equal(completed.destination_ref, ours); assert.equal(completed.release_ref, release);
+  store.close();
+});

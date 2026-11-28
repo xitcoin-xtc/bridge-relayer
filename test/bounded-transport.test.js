@@ -159,3 +159,23 @@ test("receipt, transaction and block normalizers accept only exact bounded shape
   assert.deepEqual(normalizeBlock({ number: "0x5", hash: h("c"), parentHash: h("d"), timestamp: "0x10", transactions: [] }),
     { number: 5, hash: h("c"), parentHash: h("d"), timestamp: 16 });
 });
+
+test("a revert counts only when every origin reports an execution error; rate limits and mixed answers are temporary", async () => {
+  const origins = ["https://a.example", "https://b.example"];
+  const quorum = (answers) => new CronosRpcQuorum({ urls: origins, fetchImpl: async (target, init) => {
+    const { id } = JSON.parse(init.body);
+    const answer = answers[new URL(target).host];
+    return json({ jsonrpc: "2.0", id, ...answer });
+  } });
+  const revert = { error: { code: 3, message: "execution reverted" } };
+  const ok = { result: "0x" };
+  assert.deepEqual({ ...await quorum({ "a.example": ok, "b.example": ok }).callVerdict({ to: `0x${"1".repeat(40)}` }) },
+    { reverted: false, values: ["0x", "0x"] });
+  assert.equal((await quorum({ "a.example": revert, "b.example": revert }).callVerdict({})).reverted, true);
+  assert.equal((await quorum({ "a.example": { error: { code: -32000 } }, "b.example": revert }).estimateVerdict({})).reverted, true);
+  await assert.rejects(quorum({ "a.example": revert, "b.example": ok }).callVerdict({}), (error) => error.code === "rpc_disagreement");
+  for (const fault of [{ error: { code: -32005, message: "limit exceeded" } }, { error: { code: -32603 } }, { error: { message: "no code" } }]) {
+    await assert.rejects(quorum({ "a.example": fault, "b.example": revert }).callVerdict({}), (error) => error instanceof TransportError);
+    await assert.rejects(quorum({ "a.example": { result: "0x5208" }, "b.example": fault }).estimateVerdict({}), (error) => error instanceof TransportError);
+  }
+});

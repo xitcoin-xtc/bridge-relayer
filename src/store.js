@@ -40,6 +40,7 @@ export class RelayStore {
         destination_ref TEXT,
         error TEXT,
         updated_at INTEGER NOT NULL,
+        release_ref TEXT,
         PRIMARY KEY (source_chain, source_ref)
       ) STRICT;
       CREATE TABLE IF NOT EXISTS checkpoints (
@@ -64,6 +65,10 @@ export class RelayStore {
     if (!columns.has("transaction_hash")) this.database.exec("ALTER TABLE transfers ADD COLUMN transaction_hash TEXT");
     if (!columns.has("event_index")) this.database.exec("ALTER TABLE transfers ADD COLUMN event_index INTEGER");
     if (!columns.has("approval_request")) this.database.exec("ALTER TABLE transfers ADD COLUMN approval_request TEXT");
+    // The destination transaction that actually executed the transfer. It may
+    // differ from destination_ref (our submitted transaction) when another
+    // transaction released it first, for example after a front-run.
+    if (!columns.has("release_ref")) this.database.exec("ALTER TABLE transfers ADD COLUMN release_ref TEXT");
   }
 
   observe(record) {
@@ -105,18 +110,23 @@ export class RelayStore {
         || (current.destination_ref !== null && current.destination_ref !== details.destinationRef))) {
       throw new Error("destination reference is immutable");
     }
+    if (details.releaseRef != null && (nextState !== "completed" || !/^0x[0-9a-f]{64}$/.test(details.releaseRef)
+        || (current.release_ref !== null && current.release_ref !== details.releaseRef))) {
+      throw new Error("release reference is immutable and recorded only on completion");
+    }
     const terminalOverride = nextState === "failed" || nextState === "reorged";
     if (!terminalOverride && progress.get(nextState) !== progress.get(current.state) + 1) {
       throw new Error(`invalid lifecycle transition ${current.state} -> ${nextState}`);
     }
     const result = this.database.prepare(`
       UPDATE transfers
-      SET state = ?, destination_ref = COALESCE(?, destination_ref),
+      SET state = ?, destination_ref = COALESCE(?, destination_ref), release_ref = COALESCE(?, release_ref),
           error = ?, updated_at = ?
       WHERE source_chain = ? AND source_ref = ? AND state = ? AND destination_ref IS ?
     `).run(
       nextState,
       details.destinationRef ?? null,
+      details.releaseRef ?? null,
       details.error ?? null,
       Math.floor(Date.now() / 1000),
       sourceChain,

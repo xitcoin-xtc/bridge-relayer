@@ -118,9 +118,9 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
   }
 
   async function viewEach(name, args, parse) {
-    const results = await rpc.callEach(view(name, args), "latest");
-    if (results.some((result) => !result.ok)) throw unavailable("vault_read_reverted");
-    return results.map((result) => parse(result.value));
+    const result = await rpc.callVerdict(view(name, args), "latest");
+    if (result.reverted) throw unavailable("vault_read_reverted");
+    return result.values.map(parse);
   }
 
   async function live(transferId) {
@@ -128,53 +128,66 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
       viewEach("processedBurns", [transferId], boolean), viewEach("availableLiquidity", [], uint), rpc.latestBlocks()]);
     const times = blocks.map((block) => block.timestamp);
     return { paused: paused.some(Boolean), processedAll: processed.every(Boolean), processedAny: processed.some(Boolean),
-      liquidity: min(liquidity), chainTime: Math.max(...times), agreedChainTime: Math.min(...times) };
+      liquidity: min(liquidity), chainTime: Math.max(...times) };
   }
 
-  // A permanent deadline decision needs every origin to agree that the margin
-  // is lost; a single origin (or the local clock) can only stop temporarily.
-  function marginLost(request, nowUnix, state) {
-    if (request.deadlineUnix < state.agreedChainTime + margin) return true;
-    if (request.deadlineUnix < Math.max(nowUnix, state.chainTime) + margin) throw unavailable("deadline_evidence_disagreement");
-    return false;
+  // Highest block whose timestamp is at or before the approval deadline. No
+  // release using this request or an earlier one (re-issues only extend the
+  // deadline) can be later, so release evidence is searched back from here and
+  // never from the moving chain tip.
+  async function deadlineBlock(deadline, tip) {
+    if ((await rpc.block(tip)).timestamp <= deadline) return tip;
+    let low = 0, high = tip - 1;
+    if ((await rpc.block(0)).timestamp > deadline) return 0;
+    while (low < high) {
+      const middle = Math.floor((low + high + 1) / 2);
+      if ((await rpc.block(middle)).timestamp <= deadline) low = middle; else high = middle - 1;
+    }
+    return low;
   }
 
   // The vault's Released event for this burn from any transaction, identical
   // on every origin, searched backwards over a bounded window. Every approved
   // field the event carries must match; the receipt must succeed and contain
   // it, and its block must be canonical. Null when no event is in the window.
-  async function releaseElsewhere(request, ownHash = null) {
+  async function releaseElsewhere(request, ownHash = null, ownBlock = null) {
     const p = request.payload, burn = String(p.sourceBurnId).toLowerCase();
     const expected = VAULT.encodeEventLog(VAULT.getEvent("Released"), [p.sourceBurnId, p.recipient, p.amount, p.signerSetVersion]);
     const tip = await rpc.tip();
-    const lowest = Math.max(0, tip - cronos.releaseLookbackBlocks);
-    for (let to = tip; to >= lowest; to -= cronos.logRangeBlocks) {
-      const from = Math.max(lowest, to - cronos.logRangeBlocks + 1);
-      const logs = (await rpc.logs({ address: vault, topics: [RELEASED_TOPIC, burn], fromBlock: hex(from), toBlock: hex(to) }))
-        .filter((log) => !log.removed && log.address === vault.toLowerCase() && log.topics[0] === RELEASED_TOPIC && log.topics[1] === burn);
-      if (!logs.length) continue;
-      const log = logs[0];
-      if (logs.length > 1 || stable(log.topics) !== stable(expected.topics.map((topic) => topic.toLowerCase()))
-          || log.data !== expected.data.toLowerCase()) return { mismatch: true };
-      if (log.transactionHash === ownHash) return { final: false };
-      const receipts = await rpc.receipts(log.transactionHash);
-      if (receipts.some((receipt) => receipt === null)) return { final: false };
-      if (receipts.some((receipt) => stable(receipt) !== stable(receipts[0]))) throw new RpcDisagreement();
-      const receipt = receipts[0];
-      if (receipt.status !== "0x1" || receipt.blockHash !== log.blockHash || receipt.blockNumber !== log.blockNumber
-          || !receipt.logs.some((item) => stable(item) === stable(log))) return { mismatch: true };
-      if ((await rpc.block(log.blockNumber)).hash !== log.blockHash || log.blockNumber > tip - cronos.confirmations) return { final: false };
-      return { final: true, releaseHash: log.transactionHash, blockNumber: log.blockNumber, blockHash: log.blockHash };
+    // Windows end at the deadline block and, when our own transaction was
+    // mined, at its block: a front-run is mined no later than our revert.
+    const anchors = [...new Set([await deadlineBlock(request.deadlineUnix, tip), ...(ownBlock === null ? [] : [ownBlock])])];
+    for (const anchor of anchors) {
+      const lowest = Math.max(0, anchor - cronos.releaseLookbackBlocks);
+      for (let to = anchor; to >= lowest; to -= cronos.logRangeBlocks) {
+        const from = Math.max(lowest, to - cronos.logRangeBlocks + 1);
+        const logs = (await rpc.logs({ address: vault, topics: [RELEASED_TOPIC, burn], fromBlock: hex(from), toBlock: hex(to) }))
+          .filter((log) => !log.removed && log.address === vault.toLowerCase() && log.topics[0] === RELEASED_TOPIC && log.topics[1] === burn);
+        if (!logs.length) continue;
+        const log = logs[0];
+        if (logs.length > 1 || stable(log.topics) !== stable(expected.topics.map((topic) => topic.toLowerCase()))
+            || log.data !== expected.data.toLowerCase()) return { mismatch: true };
+        if (log.transactionHash === ownHash) return { final: false };
+        const receipts = await rpc.receipts(log.transactionHash);
+        if (receipts.some((receipt) => receipt === null)) return { final: false };
+        if (receipts.some((receipt) => stable(receipt) !== stable(receipts[0]))) throw new RpcDisagreement();
+        const receipt = receipts[0];
+        if (receipt.status !== "0x1" || receipt.blockHash !== log.blockHash || receipt.blockNumber !== log.blockNumber
+            || !receipt.logs.some((item) => stable(item) === stable(log))) return { mismatch: true };
+        if ((await rpc.block(log.blockNumber)).hash !== log.blockHash || log.blockNumber > tip - cronos.confirmations) return { final: false };
+        return { final: true, releaseHash: log.transactionHash, blockNumber: log.blockNumber, blockHash: log.blockHash };
+      }
     }
     return null;
   }
   const released = (evidence) => ({ action: "released_elsewhere", releaseHash: evidence.releaseHash,
     blockNumber: evidence.blockNumber, blockHash: evidence.blockHash });
 
+  // False only when every origin reports an execution revert.
   async function simulate(request) {
-    const results = await rpc.callEach(request, "latest");
-    if (results.some((result) => !result.ok)) return false;
-    if (results.some((result) => result.value !== "0x")) throw unavailable("simulation_invalid");
+    const result = await rpc.callVerdict(request, "latest");
+    if (result.reverted) return false;
+    if (result.values.some((value) => value !== "0x")) throw unavailable("simulation_invalid");
     return true;
   }
 
@@ -243,8 +256,12 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
         // Released by another transaction (anyone may call the vault with valid approvals).
         const evidence = await releaseElsewhere(request);
         if (evidence?.mismatch) return halt("processed_with_mismatching_release");
-        if (!evidence) return defer("processed_elsewhere_unverified");
-        return evidence.final ? released(evidence) : defer("release_elsewhere_not_final");
+        if (evidence) return evidence.final ? released(evidence) : defer("release_elsewhere_not_final");
+        // Processed at a finalized height yet no matching release in the
+        // searched window: a persistent, non-blocking alert, never a completion.
+        const finalized = Math.max(0, await rpc.tip() - cronos.confirmations);
+        if (boolean(await rpc.call(view("processedBurns", [transferId]), finalized))) return { action: "release_unverified" };
+        return defer("release_elsewhere_not_final");
       }
       if (state.processedAny) return defer("replay_state_unsettled");
       if (request.deadlineUnix < Math.max(nowUnix, state.chainTime) + margin) return defer("approval_expired_awaiting_reissue");
@@ -253,9 +270,9 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
       const data = calldata(request, approvals);
       const gasPrice = max(await rpc.gasPrices());
       if (gasPrice < 1n || gasPrice > maxGasPrice) return wait("gas_price_above_cap");
-      const estimates = await rpc.estimateEach({ from: submitter, to: vault, data });
-      if (estimates.some((estimate) => !estimate.ok)) return defer("release_simulation_reverted");
-      if (estimates.some((estimate) => estimate.value > gasLimit)) return defer("gas_estimate_above_limit");
+      const estimate = await rpc.estimateVerdict({ from: submitter, to: vault, data });
+      if (estimate.reverted) return defer("release_simulation_reverted");
+      if (estimate.values.some((value) => value > gasLimit)) return defer("gas_estimate_above_limit");
       if (!await simulate({ from: submitter, to: vault, data })) return defer("release_simulation_reverted");
       if (min(await rpc.balances(submitter)) < gasLimit * gasPrice) return wait("submitter_balance_insufficient");
       return { action: "sign", context: Object.freeze({ gasPrice: gasPrice.toString(), blockHash: identity.blockHash }) };
@@ -306,14 +323,18 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
       if (state.processedAll) {
         // Released elsewhere after our bytes were committed. Send the identical
         // bytes once anyway: they revert, but consume the nonce the ledger
-        // reserved for them, so the next transfer keeps sequential nonces.
+        // reserved for them, so the next transfer keeps sequential nonces. The
+        // observation then records the release (or an unverified-release alert).
         const evidence = await releaseElsewhere(request);
         if (evidence?.mismatch) return halt("processed_with_mismatching_release");
-        if (!evidence) throw unavailable("release_evidence_unavailable");
         return { action: "send" };
       }
+      // The approval can no longer be relied on (by any clock or origin): send
+      // the stored bytes once, without simulation, so their reserved nonce is
+      // consumed. A revert after the deadline is then recorded as `expired`,
+      // which never blocks the queue. Sending our own bytes is never unsafe.
+      if (request.deadlineUnix < Math.max(nowUnix, state.chainTime) + margin) return { action: "send" };
       if (state.processedAny) return wait("replay_state_unsettled");
-      if (marginLost(request, nowUnix, state)) return halt("approval_expired_before_broadcast");
       const exact = { from: submitter, to: vault, data: tx.data, gas: `0x${tx.gasLimit.toString(16)}`, gasPrice: `0x${tx.gasPrice.toString(16)}` };
       if (!await simulate(exact)) return wait("release_simulation_reverted");
       return { action: "send" };
@@ -350,8 +371,9 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
           // Resend the identical bytes so the reserved nonce is consumed.
           const evidence = await releaseElsewhere(request, row.transactionHash);
           if (evidence?.mismatch) return halt("processed_with_mismatching_release");
-          if (!evidence) throw unavailable("release_evidence_unavailable");
-        } else if (marginLost(request, nowUnix, state)) return halt("approval_expired_before_inclusion");
+        }
+        // Even after the deadline the identical bytes are resent: they then
+        // revert and consume the reserved nonce (`expired`, never blocking).
         if (row.broadcastAttempts >= cronos.maxBroadcastAttempts) return halt("broadcast_attempts_exhausted");
         return { action: "rebroadcast" };
       }
@@ -370,7 +392,8 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
         return { action: "pending" };
       }
       const tip = await rpc.tip();
-      if ((await rpc.block(receipt.blockNumber)).hash !== receipt.blockHash) return { action: "pending" }; // reorganizing
+      const block = await rpc.block(receipt.blockNumber);
+      if (block.hash !== receipt.blockHash) return { action: "pending" }; // reorganizing
       if (receipt.status === "0x1" && !releasedMatches(receipt, request)) return halt("release_event_mismatch");
       const finalizedHeight = tip - cronos.confirmations;
       if (receipt.blockNumber > finalizedHeight) return { action: "pending" };
@@ -378,11 +401,19 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
       if (receipt.status === "0x0") {
         // A revert because another finalized transaction already released this
         // transfer (for example a front-run copying our calldata) is not a failure.
-        if (!boolean(await rpc.call(view("processedBurns", [row.transferId]), finalizedHeight))) return { action: "failed", ...inclusion };
-        const evidence = await releaseElsewhere(request, row.transactionHash);
-        if (evidence?.mismatch) return halt("processed_with_mismatching_release");
-        if (!evidence) throw unavailable("release_evidence_unavailable");
-        return evidence.final ? released(evidence) : { action: "pending" };
+        if (boolean(await rpc.call(view("processedBurns", [row.transferId]), finalizedHeight))) {
+          const evidence = await releaseElsewhere(request, row.transactionHash, receipt.blockNumber);
+          if (evidence?.mismatch) return halt("processed_with_mismatching_release");
+          // Searched back from the deadline block and our receipt, not the tip, so downtime
+          // cannot push the evidence out of the window. If it is still absent,
+          // record a persistent non-blocking alert instead of retrying forever.
+          if (!evidence) return { action: "release_unverified", ...inclusion };
+          return evidence.final ? released(evidence) : { action: "pending" };
+        }
+        // Mined after the approval deadline (agreed block timestamp): the
+        // approval expired; our nonce is consumed and the queue moves on.
+        if (block.timestamp > request.deadlineUnix) return { action: "expired", ...inclusion };
+        return { action: "failed", ...inclusion };
       }
       if (!boolean(await rpc.call(view("processedBurns", [row.transferId]), finalizedHeight))) return halt("replay_flag_missing_after_release");
       return { action: "finalized", ...inclusion };
@@ -407,8 +438,7 @@ export function openExistingRelayStore(path, options) {
 // Conditions that persist nothing and may clear by themselves: the runtime
 // pauses and retries. Persisted halts, identity or configuration mismatches and
 // unknown errors still stop the process for an operator.
-const TEMPORARY_CODES = new Set(["deadline_evidence_disagreement", "release_evidence_unavailable",
-  "rpc_transaction_mismatch", "source_finality_unverified"]);
+const TEMPORARY_CODES = new Set(["rpc_transaction_mismatch", "source_finality_unverified"]);
 export function isTemporaryStop(error) {
   return error instanceof TransportError || error instanceof RpcDisagreement || error instanceof RpcInvalid
     || isRelayStoreBusy(error) || (error instanceof SubmissionUnavailable && TEMPORARY_CODES.has(error.code));
