@@ -42,7 +42,10 @@ const ZERO_HASH = `0x${"0".repeat(64)}`;
 const EMPTY_CODE_HASH = "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470";
 const CODE = /^[a-z][a-z0-9_]{0,63}$/;
 const OWNER = /^[0-9a-f]{32}$/;
+// The highest attempt cap a destination may ask for (markBroadcast maxAttempts).
+// A destination whose adapter paces resends itself passes no cap (null).
 export const LEDGER_MAX_BROADCAST_ATTEMPTS = 32;
+export const LEDGER_SCHEMA_VERSION = 2;
 const MAX_SIGNED_HEX = 65_536;
 const TERMINAL = Object.freeze(["finalized", "failed", "halted", "released_elsewhere", "rejected", "expired", "release_unverified", "reverted"]);
 const STATES = Object.freeze(["claimed", "unclaimed", "signed", "broadcast", ...TERMINAL]);
@@ -50,7 +53,11 @@ const SOURCE = /^(?:0x)?[0-9a-f]{64}$/;
 const DEFER_BASE_MS = 60_000;
 const DEFER_MAX_MS = 3_600_000;
 
-const SCHEMA = `CREATE TABLE ledger_binding (id INTEGER PRIMARY KEY CHECK(id = 1), binding TEXT NOT NULL) STRICT;
+// Schema version 1 capped broadcast_attempts at 32 in a CHECK constraint,
+// which made a row that ran out of attempts terminal although resending the
+// identical stored bytes is always safe. Version 2 keeps every other rule and
+// only lifts that cap; version 1 ledgers are migrated forward on open (below).
+export const LEDGER_SCHEMA_V1 = `CREATE TABLE ledger_binding (id INTEGER PRIMARY KEY CHECK(id = 1), binding TEXT NOT NULL) STRICT;
 CREATE TABLE worker_lease (
   id INTEGER PRIMARY KEY CHECK(id = 1), owner TEXT NOT NULL CHECK(length(owner) = 32),
   epoch INTEGER NOT NULL CHECK(epoch >= 1), expires_at INTEGER NOT NULL CHECK(expires_at >= 0)
@@ -68,7 +75,7 @@ CREATE TABLE transfers (
   signed_hex TEXT CHECK(length(signed_hex) BETWEEN 4 AND ${MAX_SIGNED_HEX}),
   transaction_digest TEXT UNIQUE CHECK(length(transaction_digest) = 66),
   transaction_hash TEXT UNIQUE CHECK(length(transaction_hash) = 66),
-  broadcast_attempts INTEGER NOT NULL CHECK(broadcast_attempts BETWEEN 0 AND ${LEDGER_MAX_BROADCAST_ATTEMPTS}),
+  broadcast_attempts INTEGER NOT NULL CHECK(broadcast_attempts BETWEEN 0 AND 32),
   release_hash TEXT CHECK(length(release_hash) = 66),
   block_number INTEGER CHECK(block_number >= 0),
   block_hash TEXT CHECK(length(block_hash) = 66),
@@ -135,11 +142,29 @@ CREATE TRIGGER transfers_immutable BEFORE UPDATE ON transfers
       OR new.transaction_hash IS NOT old.transaction_hash OR new.transaction_digest IS NOT old.transaction_digest
       OR new.approval_digest IS NOT old.approval_digest OR new.request_hash IS NOT old.request_hash))
   BEGIN SELECT RAISE(ABORT, 'immutable'); END;`;
+const V1_ATTEMPTS = "broadcast_attempts INTEGER NOT NULL CHECK(broadcast_attempts BETWEEN 0 AND 32)";
+const SCHEMA = LEDGER_SCHEMA_V1.replace(V1_ATTEMPTS, "broadcast_attempts INTEGER NOT NULL CHECK(broadcast_attempts >= 0)");
+// Forward-only migration 1 -> 2 in the opening immediate transaction: the
+// transfers table is rebuilt with the identical DDL except the attempts cap,
+// every row is copied unchanged, and its triggers are recreated from the
+// version 2 DDL. Foreign keys are off, so dropping the old table deletes no
+// row through any trigger. The result is checked against the exact version 2
+// schema before the transaction commits; any failure rolls everything back.
+const statements = SCHEMA.split(/;\n(?=CREATE )/).map((statement) => statement.replace(/;$/, ""));
+const MIGRATE_V1_TO_V2 = ["ALTER TABLE transfers RENAME TO transfers_v1",
+  statements.find((statement) => statement.startsWith("CREATE TABLE transfers (")),
+  "INSERT INTO transfers SELECT * FROM transfers_v1",
+  "DROP TABLE transfers_v1",
+  ...statements.filter((statement) => statement.startsWith("CREATE TRIGGER transfers_")),
+].map((statement) => `${statement};`).join("\n");
 const SCHEMA_QUERY = "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name";
-const reference = new DatabaseSync(":memory:");
-reference.exec(SCHEMA);
-const EXPECTED_SCHEMA = JSON.stringify(reference.prepare(SCHEMA_QUERY).all());
-reference.close();
+function expected(ddl) {
+  const reference = new DatabaseSync(":memory:");
+  try { reference.exec(ddl); return JSON.stringify(reference.prepare(SCHEMA_QUERY).all()); } finally { reference.close(); }
+}
+const EXPECTED_SCHEMA = expected(SCHEMA);
+const EXPECTED_SCHEMA_V1 = expected(LEDGER_SCHEMA_V1);
+if (SCHEMA === LEDGER_SCHEMA_V1 || EXPECTED_SCHEMA === EXPECTED_SCHEMA_V1) throw new Error("ledger schema versions must differ");
 
 const hash = (value) => typeof value === "string" && HASH.test(value) && value !== ZERO_HASH;
 const sourceRef = (value) => typeof value === "string" && SOURCE.test(value);
@@ -220,8 +245,13 @@ export class BroadcastLedger {
       if (this.#path.fresh) {
         if (this.#database.prepare("SELECT count(*) AS n FROM sqlite_schema").get().n !== 0) throw failure();
         this.#database.exec(SCHEMA);
-        this.#database.exec("PRAGMA user_version = 1");
+        this.#database.exec(`PRAGMA user_version = ${LEDGER_SCHEMA_VERSION}`);
         this.#database.prepare("INSERT INTO ledger_binding VALUES (1, ?)").run(this.#binding);
+      } else if (this.#database.prepare("PRAGMA user_version").get().user_version === 1) {
+        // Only the exact version 1 schema with this binding is migrated.
+        this.#validate({ version: 1, schema: EXPECTED_SCHEMA_V1 });
+        this.#database.exec(MIGRATE_V1_TO_V2);
+        this.#database.exec(`PRAGMA user_version = ${LEDGER_SCHEMA_VERSION}`);
       }
       this.#validate();
       this.#database.exec("COMMIT");
@@ -238,11 +268,12 @@ export class BroadcastLedger {
 
   get destination() { return this.#destination; }
 
-  #validate() {
+  #validate({ version = LEDGER_SCHEMA_VERSION, schema = EXPECTED_SCHEMA } = {}) {
     // Exact DDL covers columns, CHECK constraints, uniqueness and every trigger.
-    // There is no migration: an unknown or partial schema requires offline review.
-    if (this.#database.prepare("PRAGMA user_version").get().user_version !== 1
-        || JSON.stringify(this.#database.prepare(SCHEMA_QUERY).all()) !== EXPECTED_SCHEMA) throw failure();
+    // The only migration is the forward-only 1 -> 2 step above: an unknown,
+    // partial or newer schema requires offline review.
+    if (this.#database.prepare("PRAGMA user_version").get().user_version !== version
+        || JSON.stringify(this.#database.prepare(SCHEMA_QUERY).all()) !== schema) throw failure();
     const rows = this.#database.prepare("SELECT * FROM ledger_binding").all();
     if (rows.length !== 1 || rows[0].id !== 1 || rows[0].binding !== this.#binding) throw failure();
     if (this.#database.prepare("PRAGMA quick_check").get().quick_check !== "ok") throw failure();
@@ -314,7 +345,7 @@ export class BroadcastLedger {
         || !STATES.includes(row.state)
         || !Number.isSafeInteger(row.claim_epoch) || row.claim_epoch < 1
         || !Number.isSafeInteger(row.broadcast_attempts) || row.broadcast_attempts < 0
-        || row.broadcast_attempts > LEDGER_MAX_BROADCAST_ATTEMPTS) throw failure();
+        || !Number.isSafeInteger(row.updated_at)) throw failure();
     if (row.signed_hex !== null) {
       if (typeof row.signed_hex !== "string" || row.signed_hex.length > MAX_SIGNED_HEX
           || !/^0x(?:[0-9a-f]{2})+$/.test(row.signed_hex) || !hash(row.transaction_hash)
@@ -328,7 +359,7 @@ export class BroadcastLedger {
       requestHash: row.request_hash, state: row.state, claimEpoch: row.claim_epoch, nonce: row.nonce,
       signedHex: row.signed_hex, transactionDigest: row.transaction_digest, transactionHash: row.transaction_hash,
       broadcastAttempts: row.broadcast_attempts, releaseHash: row.release_hash, blockNumber: row.block_number,
-      blockHash: row.block_hash, reasonCode: row.reason_code, mayRetry: false });
+      blockHash: row.block_hash, reasonCode: row.reason_code, updatedAt: row.updated_at, mayRetry: false });
   }
 
   inspect(transferId) {
@@ -436,11 +467,16 @@ export class BroadcastLedger {
   }
 
   // Write-ahead marker: committed BEFORE each send of the identical bytes.
+  // maxAttempts caps the sends of a destination that asks for a cap (at most
+  // LEDGER_MAX_BROADCAST_ATTEMPTS); null records every send without a cap, for
+  // an adapter that paces resends of the identical bytes itself.
   markBroadcast(lease, transferId, { maxAttempts } = {}) {
-    if (!hash(transferId) || !Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > LEDGER_MAX_BROADCAST_ATTEMPTS) throw failure();
+    if (!hash(transferId) || (maxAttempts !== null && (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1
+        || maxAttempts > LEDGER_MAX_BROADCAST_ATTEMPTS))) throw failure();
     return this.#transaction(() => {
       const existing = this.#raw(transferId);
-      if (!existing || !["signed", "broadcast"].includes(existing.state) || existing.broadcast_attempts >= maxAttempts) throw failure();
+      if (!existing || !["signed", "broadcast"].includes(existing.state)
+          || (maxAttempts !== null && existing.broadcast_attempts >= maxAttempts)) throw failure();
       this.#database.prepare(`UPDATE transfers SET state = 'broadcast', broadcast_attempts = broadcast_attempts + 1,
         updated_at = ? WHERE transfer_id = ? AND state IN ('signed', 'broadcast')`).run(Math.floor(Date.now() / 1000), transferId);
       this.#event(transferId, "broadcast", "broadcast", lease.epoch);
@@ -525,14 +561,26 @@ export class BroadcastLedger {
     }, lease);
   }
 
-  // Counts of permanent non-blocking rows an operator must review.
-  attention() {
+  // Counts of permanent non-blocking rows an operator must review. With
+  // `stalledAfterSeconds`, also the unfinished rows whose bytes were signed
+  // longer ago than that (still waiting for inclusion, for example under a
+  // lasting fee rise): derived from persisted state, so it is reported in every
+  // cycle, across restarts, until the row concludes. It never changes a row.
+  attention({ nowMs, stalledAfterSeconds = null } = {}) {
     try {
+      if (stalledAfterSeconds !== null && (!Number.isSafeInteger(stalledAfterSeconds) || stalledAfterSeconds < 1
+          || !Number.isSafeInteger(nowMs) || nowMs < 0)) throw failure();
       this.#path.verify();
       const counts = Object.fromEntries(this.#database.prepare(`SELECT state, count(*) AS n FROM transfers
         WHERE state IN ('rejected', 'expired', 'release_unverified', 'reverted') GROUP BY state`).all().map((row) => [row.state, row.n]));
-      return Object.freeze({ rejected: counts.rejected ?? 0, expired: counts.expired ?? 0, releaseUnverified: counts.release_unverified ?? 0,
-        reverted: counts.reverted ?? 0 });
+      const report = { rejected: counts.rejected ?? 0, expired: counts.expired ?? 0, releaseUnverified: counts.release_unverified ?? 0,
+        reverted: counts.reverted ?? 0 };
+      if (stalledAfterSeconds !== null) {
+        report.stalled = this.#database.prepare(`SELECT count(*) AS n FROM transfers t WHERE t.state IN ('signed', 'broadcast')
+          AND (SELECT min(e.at) FROM transfer_events e WHERE e.transfer_id = t.transfer_id AND e.state = 'signed') <= ?`)
+          .get(Math.floor(nowMs / 1000) - stalledAfterSeconds).n;
+      }
+      return Object.freeze(report);
     } catch { throw failure(); }
   }
 

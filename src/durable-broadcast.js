@@ -53,8 +53,11 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
   leaseTtlMs = 60_000, maximumCandidates = 8, maximumScan = 100_000, boundary = async () => {} }) {
   if (!(store instanceof RelayStore) || !(ledger instanceof BroadcastLedger) || !adapter || typeof boundary !== "function"
       || adapter.destination !== ledger.destination || !Object.hasOwn(SOURCE, adapter.destination)
-      || !Number.isSafeInteger(adapter.maxBroadcastAttempts) || adapter.maxBroadcastAttempts < 1
-      || adapter.maxBroadcastAttempts > LEDGER_MAX_BROADCAST_ATTEMPTS
+      // A capped destination asks for at most LEDGER_MAX_BROADCAST_ATTEMPTS
+      // sends; null means the adapter paces resends of the identical bytes itself.
+      || (adapter.maxBroadcastAttempts !== null && (!Number.isSafeInteger(adapter.maxBroadcastAttempts)
+        || adapter.maxBroadcastAttempts < 1 || adapter.maxBroadcastAttempts > LEDGER_MAX_BROADCAST_ATTEMPTS))
+      || (adapter.stalledAlertSeconds !== undefined && (!Number.isSafeInteger(adapter.stalledAlertSeconds) || adapter.stalledAlertSeconds < 1))
       || !Number.isSafeInteger(maximumCandidates) || maximumCandidates < 1 || maximumCandidates > 64
       || !Number.isSafeInteger(maximumScan) || maximumScan < 1 || maximumScan > 1_000_000) {
     throw new SubmissionUnavailable("invalid_submission_dependencies");
@@ -64,7 +67,10 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
   const nowUnix = Math.floor(nowMs / 1000);
   // Every report carries the permanent non-blocking rows needing review, so an
   // alert persists in each cycle's log instead of disappearing into backoff.
-  const attention = ledger.attention();
+  // With a destination threshold it also counts unfinished rows signed longer
+  // ago than that (`stalled`), never a halt.
+  const attention = adapter.stalledAlertSeconds === undefined ? ledger.attention()
+    : ledger.attention({ nowMs, stalledAfterSeconds: adapter.stalledAlertSeconds });
   const report = (action, details = {}) => Object.freeze({ destination: adapter.destination, epoch: lease.epoch, action,
     ...details, attention });
   const identity = (stored, transferId) => ({ transferId, sourceRef: stored.transfer.source_ref,
