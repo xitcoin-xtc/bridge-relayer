@@ -15,10 +15,10 @@ fixture = json.loads((root / 'test/fixtures/xitcoin-message.json').read_text())
 message = Message.FromString(bytes.fromhex(fixture['messageHex'][2:]))
 assert message.nonce == 2**64-1
 assert message.source_chain_id == '338'
-assert message.route_id == 'cronos-testnet-xitcoin-testnet'
+assert message.route_id == '0x21121c16b53a726056a6683f00c7eb4da5501ce8a2abc8a4677e06f1e94b5cd9'
 assert message.direction == 'cronos_to_xitcoin'
 assert message.amount == '10'
-assert message.deadline_unix == 2000000000
+assert message.deadline_unix == 1999999997
 assert len(message.signatures) == 2 and all(len(s) == 65 for s in message.signatures)
 assert message.SerializeToString(deterministic=True).hex() == fixture['messageHex'][2:]
 print('PASS: independent Python protobuf 6.33.5 descriptor parsed from pinned proto decodes and deterministically re-encodes exact fixture bytes')

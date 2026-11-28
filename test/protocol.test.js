@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { evmAddressToBech32 } from "../src/address.js";
-import { attestationDigest, attestationId, cronosRouteId, depositId, releaseDigest } from "../src/protocol.js";
+import { XITCOIN_TESTNET_ROUTE_ID, attestationDigest, attestationId, cronosRouteId, depositId, releaseDigest, validateRouteId } from "../src/protocol.js";
 import { TESTNET_ROUTE_ID } from "../src/preflight.js";
 
 test("converts EVM account bytes to deterministic Xitcoin Bech32", () => {
@@ -44,10 +44,14 @@ test("builds stable route, deposit and attestation identifiers", () => {
   assert.match(attestationDigest(attestation), /^0x[0-9a-f]{64}$/);
 });
 
-test("pins the deployed Cronos testnet route independently from the Xitcoin route", () => {
-  const xitcoinRoute = "cronos-testnet-xitcoin-testnet";
+test("pins the deployed Cronos testnet route and the stored Xitcoin route independently", () => {
   assert.equal(TESTNET_ROUTE_ID, "0x21121c16b53a726056a6683f00c7eb4da5501ce8a2abc8a4677e06f1e94b5cd9");
-  assert.notEqual(cronosRouteId(xitcoinRoute), TESTNET_ROUTE_ID);
+  // The live Xitcoin route was initialised with the Cronos bytes32 route ID
+  // (0x-prefixed lower case); it is pinned as observed, not derived.
+  assert.equal(XITCOIN_TESTNET_ROUTE_ID, "0x21121c16b53a726056a6683f00c7eb4da5501ce8a2abc8a4677e06f1e94b5cd9");
+  assert.equal(validateRouteId(XITCOIN_TESTNET_ROUTE_ID), XITCOIN_TESTNET_ROUTE_ID);
+  assert.throws(() => validateRouteId(TESTNET_ROUTE_ID.toUpperCase()), /invalid route ID/);
+  assert.notEqual(cronosRouteId("cronos-testnet-xitcoin-testnet"), TESTNET_ROUTE_ID);
 });
 
 test("binds release approval to chain and vault", () => {

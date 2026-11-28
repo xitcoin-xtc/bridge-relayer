@@ -7,9 +7,10 @@ import { spawn } from "node:child_process";
 import { journalOptions } from "./journal-fixture.js";
 import { BroadcastIntentJournal } from "../src/broadcast-intent.js";
 import { inspectXitcoinReplayStatus } from "../src/destination-status.js";
+import { XITCOIN_TESTNET_ROUTE_ID } from "../src/protocol.js";
 
 const config = (destination = "xitcoin") => ({ version: 1, mode: "disabled", destination,
-  releaseCommit: "a".repeat(40), routeId: "cronos-testnet-xitcoin-testnet",
+  releaseCommit: "a".repeat(40), routeId: XITCOIN_TESTNET_ROUTE_ID,
   cronosChainId: 338, xitcoinChainId: "xitcoin-testnet-v2-1" });
 const hash = (letter) => `0x${letter.repeat(64)}`;
 const intent = { transferId: hash("a"), approvalDigest: hash("b"), transactionDigest: hash("c") };

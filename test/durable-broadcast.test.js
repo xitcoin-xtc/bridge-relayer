@@ -10,11 +10,12 @@ import { keccak256 } from "ethers";
 import { journalOptions } from "./journal-fixture.js";
 import { signers } from "./fixtures/destination.js";
 import { ModelChain, modelAdapter, approvedTransfer, openStore } from "./fixtures/durable-adapter.js";
+import { XITCOIN_TESTNET_ROUTE_ID } from "../src/protocol.js";
 
 const bindings = {
-  cronos: { destination: "cronos", chainId: "338", routeId: "cronos-testnet-xitcoin-testnet",
+  cronos: { destination: "cronos", chainId: "338", routeId: XITCOIN_TESTNET_ROUTE_ID,
     target: "0x1c94273C0b199b139D82da3786C9eCbE189D5919", targetIdentity: `0x${"c".repeat(64)}`, account: signers[2] },
-  xitcoin: { destination: "xitcoin", chainId: "xitcoin-testnet-v2-1", routeId: "cronos-testnet-xitcoin-testnet",
+  xitcoin: { destination: "xitcoin", chainId: "xitcoin-testnet-v2-1", routeId: XITCOIN_TESTNET_ROUTE_ID,
     target: "x/bridge", targetIdentity: "5ec8692e8fc1813d0892ee535af1a73953a1c4fb", account: evmAddressToBech32(signers[2]) },
 };
 const NOW = 1_900_000_000_000;

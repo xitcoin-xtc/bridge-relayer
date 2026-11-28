@@ -6,6 +6,7 @@ import { types } from "node:util";
 import { getAddress } from "ethers";
 import { bech32Encode } from "./address.js";
 import { PrivateJournalPath } from "./journal-path.js";
+import { XITCOIN_TESTNET_ROUTE_ID } from "./protocol.js";
 
 // Destination-generic durable broadcast ledger. One SQLite database per
 // destination submitter account. Every state change is one immediate
@@ -184,7 +185,7 @@ function bech32Account(value) {
 export function ledgerBinding(input) {
   try {
     const value = plain(input, ["destination", "chainId", "routeId", "target", "targetIdentity", "account"]);
-    if (value.routeId !== "cronos-testnet-xitcoin-testnet") throw failure();
+    if (value.routeId !== XITCOIN_TESTNET_ROUTE_ID) throw failure();
     if (value.destination === "cronos") {
       if (value.chainId !== "338" || !hash(value.targetIdentity) || value.targetIdentity === EMPTY_CODE_HASH
           || evmAccount(value.target) === evmAccount(value.account)) throw failure();

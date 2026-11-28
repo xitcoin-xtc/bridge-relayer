@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { buildSignerRuntime, loadSignerConfig, validateSignerConfig } from "../src/signer-bootstrap.js";
+import { XITCOIN_TESTNET_ROUTE_ID } from "../src/protocol.js";
 
 const CONFIG = Object.freeze({
   version: 1,
@@ -11,7 +12,7 @@ const CONFIG = Object.freeze({
   journalPath: "/var/lib/xitcoin-bridge/signer-1-journal/approvals.sqlite",
   listen: { host: "127.0.0.1", port: 43101 },
   policy: {
-    routeId: "cronos-testnet-xitcoin-testnet",
+    routeId: XITCOIN_TESTNET_ROUTE_ID,
     cronosRouteId: "0x21121c16b53a726056a6683f00c7eb4da5501ce8a2abc8a4677e06f1e94b5cd9",
     cronosChainId: 338,
     cronosVault: "0x1111111111111111111111111111111111111111",

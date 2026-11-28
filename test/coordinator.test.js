@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { approveFinalizedTransfer, buildTransferApprovalRequest, runApprovalOnlyCycle, scanFinalizedBatch } from "../src/coordinator.js";
 import { buildApprovalRequest } from "../src/approvals.js";
-import { DIRECTION_INBOUND } from "../src/protocol.js";
+import { XITCOIN_TESTNET_ROUTE_ID, DIRECTION_INBOUND } from "../src/protocol.js";
 import { SigningKey, computeAddress } from "ethers";
 import { randomBytes } from "node:crypto";
 import { RelayStore } from "../src/store.js";
@@ -48,10 +48,10 @@ test("maps an exact Cronos event to one canonical inbound approval request", () 
     blockHeight: 10, blockHash, transactionHash: txHash, logIndex: 2,
     payload: { depositId, nonce: "7", destination: "xtc1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg32rdvg9", amount: "10" } });
   const transfer = store.transition("cronos", depositId.slice(2), "finalized");
-  const request = buildTransferApprovalRequest({ transfer, routeId: "cronos-testnet-xitcoin-testnet",
+  const request = buildTransferApprovalRequest({ transfer, routeId: XITCOIN_TESTNET_ROUTE_ID,
     cronosRouteId: routeBytes, cronosChainId: 338, cronosVault: vault, xitcoinChainId: "xitcoin-testnet-v2-1", deadlineUnix: 2_000_000_000 });
   assert.equal(request.direction, "cronos_to_xitcoin");
-  assert.equal(request.payload.routeId, "cronos-testnet-xitcoin-testnet");
+  assert.equal(request.payload.routeId, XITCOIN_TESTNET_ROUTE_ID);
   assert.equal(request.payload.sourceRef, depositId);
   assert.deepEqual(request.payload.sourceEvidence, { blockHeight: 10, blockHash, transactionHash: txHash, eventIndex: 2 });
   store.close();
@@ -60,11 +60,11 @@ test("maps an exact Cronos event to one canonical inbound approval request", () 
 test("maps an exact Xitcoin event to one canonical outbound approval request", () => {
   const store = new RelayStore();
   const requestId = `0x${"55".repeat(32)}`;
-  store.observe({ sourceChain: "xitcoin", sourceRef: requestId, routeId: "cronos-testnet-xitcoin-testnet",
+  store.observe({ sourceChain: "xitcoin", sourceRef: requestId, routeId: XITCOIN_TESTNET_ROUTE_ID,
     blockHeight: 11, blockHash, transactionHash: txHash, messageIndex: 3,
     payload: { requestId, destination: "0x2222222222222222222222222222222222222222", amount: "20", nonce: "8" } });
   const transfer = store.transition("xitcoin", requestId, "finalized");
-  const request = buildTransferApprovalRequest({ transfer, routeId: "cronos-testnet-xitcoin-testnet",
+  const request = buildTransferApprovalRequest({ transfer, routeId: XITCOIN_TESTNET_ROUTE_ID,
     cronosRouteId: routeBytes, cronosChainId: 338, cronosVault: vault, xitcoinChainId: "xitcoin-testnet-v2-1", signerSetVersion: 1, deadlineUnix: 2_000_000_000 });
   assert.equal(request.direction, "xitcoin_to_cronos");
   assert.equal(request.payload.sourceBurnId, requestId);
@@ -79,7 +79,7 @@ test("refuses ambiguous or mismatched stored source evidence", () => {
   store.observe({ sourceChain: "cronos", sourceRef: depositId, routeId: routeBytes,
     blockHeight: 10, blockHash, payload: { depositId, nonce: "1", destination: "xtc1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg32rdvg9", amount: "1" } });
   const transfer = store.transition("cronos", depositId, "finalized");
-  assert.throws(() => buildTransferApprovalRequest({ transfer, routeId: "cronos-testnet-xitcoin-testnet",
+  assert.throws(() => buildTransferApprovalRequest({ transfer, routeId: XITCOIN_TESTNET_ROUTE_ID,
     cronosRouteId: routeBytes, cronosChainId: 338, cronosVault: vault, xitcoinChainId: "xitcoin-testnet-v2-1", deadlineUnix: 2_000_000_000 }), /bytes32/);
   store.close();
 });
@@ -177,7 +177,7 @@ test("approval-only cycle scans both chains and stops after a two-of-three quoru
     async events() { return []; },
   });
   const result = await runApprovalOnlyCycle({ store, cronosWatcher, xitcoinWatcher, clients,
-    authorizedSigners: addresses, routeId: "cronos-testnet-xitcoin-testnet", cronosRouteId: routeBytes,
+    authorizedSigners: addresses, routeId: XITCOIN_TESTNET_ROUTE_ID, cronosRouteId: routeBytes,
     cronosChainId: 338, cronosVault: vault, xitcoinChainId: "xitcoin-testnet-v2-1", nowUnix: 1_900_000_000, startHeights: { cronos: 10, xitcoin: 1 } });
   assert.equal(result.mode, "approval_only");
   assert.equal(result.approved, 1);
@@ -194,14 +194,14 @@ test("approval-only cycle persists the request and fails closed without quorum",
   const addresses = keys.map((key) => computeAddress(key.publicKey));
   const xitcoinWatcher = watcher({
     async latestFinalizedHeight() { return 11; },
-    async events() { return [{ sourceChain: "xitcoin", sourceRef: requestId, routeId: "cronos-testnet-xitcoin-testnet",
+    async events() { return [{ sourceChain: "xitcoin", sourceRef: requestId, routeId: XITCOIN_TESTNET_ROUTE_ID,
       blockHeight: 11, blockHash, transactionHash: txHash, messageIndex: 1,
       payload: { requestId, destination: "0x2222222222222222222222222222222222222222", amount: "20", nonce: "8" } }]; },
     async canonicalBlock(height) { return { height, hash: blockHash }; },
   });
   await assert.rejects(() => runApprovalOnlyCycle({ store,
     cronosWatcher: watcher({ async latestFinalizedHeight() { return 0; } }), xitcoinWatcher, clients: [],
-    authorizedSigners: addresses, routeId: "cronos-testnet-xitcoin-testnet", cronosRouteId: routeBytes,
+    authorizedSigners: addresses, routeId: XITCOIN_TESTNET_ROUTE_ID, cronosRouteId: routeBytes,
     cronosChainId: 338, cronosVault: vault, xitcoinChainId: "xitcoin-testnet-v2-1", nowUnix: 1_900_000_000, startHeights: { cronos: 1, xitcoin: 11 } }), /insufficient/);
   assert.equal(store.get("xitcoin", requestId).state, "finalized");
   assert.equal(store.approvalRequest("xitcoin", requestId).deadlineUnix, 1_900_000_300);
@@ -229,7 +229,7 @@ test("an expired persisted approval request is re-issued for the same source dep
   });
   const xitcoinWatcher = watcher({ async latestFinalizedHeight() { return 0; }, async events() { return []; } });
   const cycle = (nowUnix) => runApprovalOnlyCycle({ store, cronosWatcher, xitcoinWatcher, clients,
-    authorizedSigners: addresses, routeId: "cronos-testnet-xitcoin-testnet", cronosRouteId: routeBytes,
+    authorizedSigners: addresses, routeId: XITCOIN_TESTNET_ROUTE_ID, cronosRouteId: routeBytes,
     cronosChainId: 338, cronosVault: vault, xitcoinChainId: "xitcoin-testnet-v2-1", approvalWindowSeconds: 300,
     nowUnix, startHeights: { cronos: 10, xitcoin: 1 } });
 

@@ -1,8 +1,8 @@
 import { evmAddressToBech32 } from "./address.js";
-import { attestationDigest, attestationId, attestationPayloadHash, depositId, releaseDigest } from "./protocol.js";
+import { XITCOIN_TESTNET_ROUTE_ID, attestationDigest, attestationId, attestationPayloadHash, depositId, releaseDigest } from "./protocol.js";
 import { TESTNET_ROUTE_ID } from "./preflight.js";
 
-const route = "cronos-testnet-xitcoin-testnet";
+const route = XITCOIN_TESTNET_ROUTE_ID;
 const cronosChainId = 338;
 const cronosVault = "0x1c94273C0b199b139D82da3786C9eCbE189D5919";
 const vector = {

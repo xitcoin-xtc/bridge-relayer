@@ -5,9 +5,10 @@ import { spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { BroadcastIntentJournal } from "../src/broadcast-intent.js";
 import { journalOptions } from "./journal-fixture.js";
+import { XITCOIN_TESTNET_ROUTE_ID } from "../src/protocol.js";
 
 const config = { version: 1, mode: "disabled", destination: "xitcoin", releaseCommit: "a".repeat(40),
-  routeId: "cronos-testnet-xitcoin-testnet", cronosChainId: 338, xitcoinChainId: "xitcoin-testnet-v2-1" };
+  routeId: XITCOIN_TESTNET_ROUTE_ID, cronosChainId: 338, xitcoinChainId: "xitcoin-testnet-v2-1" };
 const intent = { transferId: `0x${"a".repeat(64)}`, approvalDigest: `0x${"b".repeat(64)}`, transactionDigest: `0x${"c".repeat(64)}` };
 const failure = { message: "broadcast intent unavailable or conflicting" };
 function fixture(run) {

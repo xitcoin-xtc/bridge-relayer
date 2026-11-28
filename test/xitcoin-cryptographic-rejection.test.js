@@ -108,5 +108,5 @@ test("valid fixture protobuf bytes and both digests remain unchanged", () => {
   const result = prepareXitcoinAttestation(inbound());
   assert.equal(result.messageHex, fixture.messageHex);
   assert.equal(result.messageDigest, `0x${createHash("sha256").update(Buffer.from(fixture.messageHex.slice(2), "hex")).digest("hex")}`);
-  assert.equal(result.approvalDigest, "0xbea4c2544bdafbefd5b51f7eb8836d4dc8d115011eda667fc08120caa5999ec5");
+  assert.equal(result.approvalDigest, "0x64c5f4139d78a6d4ddef215ff8f38324c4df1de8c240d2be37d6c55b32abd784");
 });

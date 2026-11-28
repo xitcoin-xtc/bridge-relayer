@@ -8,7 +8,7 @@ import { buildApprovalRequest, collectApprovalQuorum } from '../../src/approvals
 import { createCanonicalSourceVerifier } from '../../src/source-verification.js';
 import { IsolatedSignerService, createSignerPolicy } from '../../src/signer-service.js';
 import { SignerApprovalJournal } from '../../src/signer-journal.js';
-import { attestationDigest, attestationId, attestationPayloadHash, depositId, DIRECTION_INBOUND, DIRECTION_OUTBOUND } from '../../src/protocol.js';
+import { XITCOIN_TESTNET_ROUTE_ID, attestationDigest, attestationId, attestationPayloadHash, depositId, DIRECTION_INBOUND, DIRECTION_OUTBOUND } from '../../src/protocol.js';
 import { evmAddressToBech32 } from '../../src/address.js';
 import { TESTNET_ROUTE_ID } from '../../src/preflight.js';
 import http from 'node:http';
@@ -19,7 +19,7 @@ globalThis.fetch = forbidden;
 http.request = https.request = http.get = https.get = net.connect = net.createConnection = forbidden;
 const statePath = process.argv[2];
 const wallets = [1, 2, 3].map(n => new Wallet(`0x${n.toString(16).padStart(64, '0')}`));
-const route = 'cronos-testnet-xitcoin-testnet';
+const route = XITCOIN_TESTNET_ROUTE_ID;
 const cosmosChainId = 'xitcoin-testnet-v2-1';
 const vault = '0x2222222222222222222222222222222222222222';
 const recipient = '0x1111111111111111111111111111111111111111';
@@ -68,7 +68,8 @@ function inboundPayload(args, ref, deposit) {
 // Shared with pos-chain x/bridge/types/remediation_test.go.
 function crossCheckVector() {
   return [['xitcoin-testnet-v2-1', '338'], ['xitcoin', '25']].map(([chainId, sourceChainId]) => {
-    const attestation = { destinationChainId: chainId, routeId: route, direction: DIRECTION_INBOUND, sourceChainId, sourceRef: `0x${'aa'.repeat(32)}`, nonce: '7', destination: 'xtc1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg32rdvg9', amount: '1000000000000000000', deadlineUnix: '1800000000' };
+    // The shared pos-chain cross-check vector (remediation_test.go) fixes its own route string.
+    const attestation = { destinationChainId: chainId, routeId: 'cronos-testnet-xitcoin-testnet', direction: DIRECTION_INBOUND, sourceChainId, sourceRef: `0x${'aa'.repeat(32)}`, nonce: '7', destination: 'xtc1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg32rdvg9', amount: '1000000000000000000', deadlineUnix: '1800000000' };
     return { chainId, sourceChainId, id: attestationId(attestation), payloadHash: attestationPayloadHash(attestation), digest: attestationDigest(attestation) };
   });
 }

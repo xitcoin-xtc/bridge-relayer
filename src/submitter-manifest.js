@@ -5,6 +5,7 @@ import { types } from "node:util";
 import { getAddress } from "ethers";
 import { independentEndpoints } from "./bounded-transport.js";
 import { TESTNET_ROUTE_ID } from "./preflight.js";
+import { XITCOIN_TESTNET_ROUTE_ID } from "./protocol.js";
 
 const FIELDS = ["version", "mode", "destination", "releaseCommit", "routeId", "cronosChainId", "xitcoinChainId"];
 const TESTNET_FIELDS = [...FIELDS, "relayStorePath", "ledgerPath", "keystorePath", "cycleIntervalMs", "cronos", "xitcoin"];
@@ -29,7 +30,7 @@ export function validateSubmitterManifest(input) {
   if (input.version !== 1 || input.mode !== "disabled") throw new Error("only disabled phase-one submitters are supported");
   if (!["xitcoin", "cronos"].includes(input.destination)) throw new Error("destination is not canonical");
   if (typeof input.releaseCommit !== "string" || !/^[0-9a-f]{40}$/.test(input.releaseCommit)) throw new Error("release must be an immutable Git commit");
-  if (input.routeId !== "cronos-testnet-xitcoin-testnet" || input.cronosChainId !== 338
+  if (input.routeId !== XITCOIN_TESTNET_ROUTE_ID || input.cronosChainId !== 338
       || input.xitcoinChainId !== "xitcoin-testnet-v2-1") throw new Error("only the canonical testnet route is supported");
   return Object.freeze(Object.fromEntries(FIELDS.map((key) => [key, input[key]])));
 }
@@ -73,7 +74,7 @@ export function validateCronosTestnetManifest(input) {
   if (value.version !== 1 || value.mode !== "testnet") throw new Error("unsupported submitter manifest mode");
   if (value.destination !== "cronos") throw new Error("only the Cronos destination supports testnet submission");
   if (typeof value.releaseCommit !== "string" || !/^[0-9a-f]{40}$/.test(value.releaseCommit)) throw new Error("release must be an immutable Git commit");
-  if (value.routeId !== "cronos-testnet-xitcoin-testnet" || value.cronosChainId !== 338
+  if (value.routeId !== XITCOIN_TESTNET_ROUTE_ID || value.cronosChainId !== 338
       || value.xitcoinChainId !== "xitcoin-testnet-v2-1") throw new Error("only the canonical testnet route is supported");
   const paths = [value.relayStorePath, value.ledgerPath, value.keystorePath].map((path) => absolute(path));
   if (new Set(paths).size !== 3) throw new Error("submitter manifest paths must be distinct");

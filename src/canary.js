@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { XITCOIN_TESTNET_ROUTE_ID } from "./protocol.js";
 
 const HASH_RE = /^(?:0x)?[0-9a-f]{64}$/;
 const COMMIT_RE = /^[0-9a-f]{40}$/;
@@ -44,7 +45,7 @@ export function validateCanaryPlan(plan) {
   const decisionId = digest(plan.decisionId, "decision id");
   const preflightDigest = digest(plan.preflightDigest, "preflight digest");
   const routeId = text(plan.routeId, "route id");
-  if (routeId !== "cronos-testnet-xitcoin-testnet") throw new Error("testnet canary route is not canonical");
+  if (routeId !== XITCOIN_TESTNET_ROUTE_ID) throw new Error("testnet canary route is not canonical");
   const cronosChainId = text(plan.cronosChainId, "Cronos chain id");
   if (cronosChainId !== "338") throw new Error("Cronos Testnet chain id must be 338");
   const xitcoinChainId = text(plan.xitcoinChainId, "Xitcoin chain id");

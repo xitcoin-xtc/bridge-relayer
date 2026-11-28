@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { RelayStore } from "../src/store.js";
+import { XITCOIN_TESTNET_ROUTE_ID } from "../src/protocol.js";
 
 function observed() {
   return {
@@ -73,7 +74,7 @@ test("persists one immutable approval request before contacting signers", () => 
 test("release reference records the executing transaction once, only on completion", () => {
   const store = new RelayStore();
   const ref = `0x${"ab".repeat(32)}`;
-  store.observe({ sourceChain: "xitcoin", sourceRef: ref, routeId: "cronos-testnet-xitcoin-testnet", blockHeight: 1,
+  store.observe({ sourceChain: "xitcoin", sourceRef: ref, routeId: XITCOIN_TESTNET_ROUTE_ID, blockHeight: 1,
     blockHash: `0x${"11".repeat(32)}`, transactionHash: `0x${"22".repeat(32)}`, messageIndex: 0, payload: { amount: "1" } });
   for (const state of ["finalized", "approved"]) store.transition("xitcoin", ref, state);
   const ours = `0x${"33".repeat(32)}`, release = `0x${"44".repeat(32)}`;

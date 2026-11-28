@@ -2,16 +2,32 @@
 
 ## Route identity
 
-The human-readable route identifier is a lower-case string accepted by the
-Xitcoin bridge module. The Cronos vault stores a deployment-pinned `bytes32`
-route identifier. A deployment must publish and bind both values explicitly;
-the relayer must never assume that the deployed Cronos value can be derived
-from the Xitcoin display identifier.
+The Xitcoin bridge module stores one route ID: a string of 1 to 96 bytes from
+`[a-z0-9_-]`. The chain compares it byte for byte with the `route_id` of every
+`MsgSubmitAttestation` (otherwise `ErrAttestationRouteMismatch`), hashes it
+verbatim into every approval digest (below) and emits it as `route_id` in
+every `bridge_outbound_burned` event. The Cronos vault stores a
+deployment-pinned `bytes32` route ID. A deployment must publish and bind both
+values explicitly; the relayer never derives one from the other or from a
+display label.
 
-For the canonical testnet deployment, the Xitcoin route is
-`cronos-testnet-xitcoin-testnet`, while the Cronos route is
-`0x21121c16b53a726056a6683f00c7eb4da5501ce8a2abc8a4677e06f1e94b5cd9`
-on Cronos EVM chain ID `338`.
+On `xitcoin-testnet-v2-1` the route was initialised with the Cronos `bytes32`
+route ID in its stored form, `0x`-prefixed lower-case hex:
+
+| Value | Testnet |
+| --- | --- |
+| Xitcoin route ID (stored by the bridge module; signed, submitted and compared by the relayer) | `0x21121c16b53a726056a6683f00c7eb4da5501ce8a2abc8a4677e06f1e94b5cd9` |
+| Cronos vault route ID (`routeId()`, chain ID `338`) | `0x21121c16b53a726056a6683f00c7eb4da5501ce8a2abc8a4677e06f1e94b5cd9` |
+
+The two values are equal on testnet; the relayer still pins them separately
+(`XITCOIN_TESTNET_ROUTE_ID` in `src/protocol.js`, `TESTNET_ROUTE_ID` in
+`src/preflight.js`). The display label `cronos-testnet-xitcoin-testnet`, which
+earlier releases signed and submitted, is not a route the chain knows: every
+attestation carrying it would fail with `ErrAttestationRouteMismatch`, and
+every outbound event would mismatch the watcher's pinned route.
+`test/fixtures/xitcoin-chain-vectors.json` records the digests and the
+`MsgSubmitAttestation` bytes the chain's own Go code produces for the stored
+route ID; CI regenerates it from the pinned pos-chain commit.
 
 ## Cronos to Xitcoin
 
