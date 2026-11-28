@@ -5,7 +5,9 @@ import { types } from "node:util";
 import { getAddress } from "ethers";
 import { independentEndpoints } from "./bounded-transport.js";
 import { TESTNET_ROUTE_ID } from "./preflight.js";
+import { bech32Encode } from "./address.js";
 import { XITCOIN_TESTNET_ROUTE_ID } from "./protocol.js";
+import { XITCOIN_CHAIN_SCHEMA_COMMIT, XITCOIN_MAINNET_CHAIN_ID, XITCOIN_TESTNET_CHAIN_ID } from "./xitcoin-transaction.js";
 
 const FIELDS = ["version", "mode", "destination", "releaseCommit", "routeId", "cronosChainId", "xitcoinChainId"];
 const TESTNET_FIELDS = [...FIELDS, "relayStorePath", "ledgerPath", "keystorePath", "cycleIntervalMs", "cronos", "xitcoin"];
@@ -13,6 +15,11 @@ const CRONOS_FIELDS = ["rpcUrls", "allowLoopbackHttp", "vault", "vaultCodeHash",
   "authorizedSigners", "submitter", "confirmations", "maxAmount", "gasLimit", "maxGasPrice", "maxFee",
   "minDeadlineMarginSeconds", "maxBroadcastAttempts", "releaseLookbackBlocks", "logRangeBlocks"];
 const XITCOIN_FIELDS = ["rpcUrls", "allowLoopbackHttp", "safetyLag"];
+const XITCOIN_TESTNET_FIELDS = [...FIELDS, "relayStorePath", "ledgerPath", "keystorePath", "cycleIntervalMs", "xitcoin", "cronos"];
+const XITCOIN_DESTINATION_FIELDS = ["origins", "allowLoopbackHttp", "chainSchemaCommit", "signerSetVersion", "authorizedSigners",
+  "submitter", "confirmations", "historyBlocks", "maxAmount", "maxGas", "gasAdjustmentPercent", "gasHeadroom",
+  "feeMultiplierPercent", "maxGasPrice", "maxFee", "minDeadlineMarginSeconds", "maxBroadcastAttempts"];
+const CRONOS_SOURCE_FIELDS = ["rpcUrls", "allowLoopbackHttp", "vault", "cronosRouteId", "confirmations"];
 const EMPTY_CODE_HASH = "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470";
 const MAX_BYTES = 16_384;
 
@@ -115,12 +122,95 @@ export function validateCronosTestnetManifest(input) {
   });
 }
 
+function bech32Account(value) {
+  if (typeof value !== "string" || !/^xtc1[02-9ac-hj-np-z]{38}$/.test(value)) throw new Error("submitter account must be a canonical xtc address");
+  const charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+  let accumulator = 0, bits = 0;
+  const bytes = [];
+  for (const character of value.slice(4, -6)) {
+    accumulator = (accumulator << 5) | charset.indexOf(character);
+    bits += 5;
+    if (bits >= 8) { bits -= 8; bytes.push((accumulator >>> bits) & 0xff); }
+  }
+  if (bytes.length !== 20 || bech32Encode("xtc", bytes) !== value || bytes.every((byte) => byte === 0)) {
+    throw new Error("submitter account must be a canonical xtc address");
+  }
+  return value;
+}
+function xitcoinOrigins(value, allowLoopbackHttp) {
+  if (!Array.isArray(value) || value.length < 2 || value.length > 4 || typeof allowLoopbackHttp !== "boolean") {
+    throw new Error("submitter manifest endpoints are invalid");
+  }
+  const origins = value.map((origin) => exact(origin, ["rpcUrl", "restUrl"]));
+  try {
+    independentEndpoints(origins.map((origin) => origin.rpcUrl), { allowLoopbackHttp });
+    independentEndpoints(origins.map((origin) => origin.restUrl), { allowLoopbackHttp });
+  } catch { throw new Error("submitter manifest endpoints must be independent HTTPS origins"); }
+  return Object.freeze(origins.map((origin) => Object.freeze({ rpcUrl: origin.rpcUrl, restUrl: origin.restUrl })));
+}
+
+// Explicit Xitcoin testnet submission mode (chain ID xitcoin-testnet-v2-1;
+// mainnet `xitcoin` is rejected in this release). Every value that binds a
+// transaction is pinned here, in a root-owned file; nothing is discovered or
+// defaulted, and no key, password or credential is accepted.
+export function validateXitcoinTestnetManifest(input) {
+  const value = exact(input, XITCOIN_TESTNET_FIELDS);
+  if (value.version !== 1 || value.mode !== "testnet") throw new Error("unsupported submitter manifest mode");
+  if (value.destination !== "xitcoin") throw new Error("only the Xitcoin destination uses this schema");
+  if (typeof value.releaseCommit !== "string" || !/^[0-9a-f]{40}$/.test(value.releaseCommit)) throw new Error("release must be an immutable Git commit");
+  if (value.xitcoinChainId === XITCOIN_MAINNET_CHAIN_ID) throw new Error("Xitcoin mainnet is not supported in this release");
+  if (value.routeId !== XITCOIN_TESTNET_ROUTE_ID || value.cronosChainId !== 338
+      || value.xitcoinChainId !== XITCOIN_TESTNET_CHAIN_ID) throw new Error("only the canonical testnet route is supported");
+  const paths = [value.relayStorePath, value.ledgerPath, value.keystorePath].map((path) => absolute(path));
+  if (new Set(paths).size !== 3) throw new Error("submitter manifest paths must be distinct");
+  const xitcoin = exact(value.xitcoin, XITCOIN_DESTINATION_FIELDS);
+  const cronos = exact(value.cronos, CRONOS_SOURCE_FIELDS);
+  if (xitcoin.chainSchemaCommit !== XITCOIN_CHAIN_SCHEMA_COMMIT) throw new Error("chain schema commit is not the one this release was verified against");
+  if (!Array.isArray(xitcoin.authorizedSigners) || xitcoin.authorizedSigners.length !== 3) throw new Error("exactly three authorized signers are required");
+  const signers = xitcoin.authorizedSigners.map(checksummed);
+  if (new Set(signers.map((item) => item.toLowerCase())).size !== 3) throw new Error("authorized signers must be distinct");
+  if (cronos.cronosRouteId !== TESTNET_ROUTE_ID.toLowerCase()) throw new Error("Cronos vault route is not the deployed testnet route");
+  const maxGas = decimalString(xitcoin.maxGas, 100_000n, 5_000_000n);
+  const maxGasPrice = decimalString(xitcoin.maxGasPrice, 1n, 10n ** 15n);
+  const maxFee = decimalString(xitcoin.maxFee, 1n, 10n ** 24n);
+  return Object.freeze({
+    version: 1, mode: "testnet", destination: "xitcoin", releaseCommit: value.releaseCommit,
+    routeId: value.routeId, cronosChainId: 338, xitcoinChainId: value.xitcoinChainId,
+    relayStorePath: paths[0], ledgerPath: paths[1], keystorePath: paths[2],
+    cycleIntervalMs: integer(value.cycleIntervalMs, 1_000, 60_000),
+    xitcoin: Object.freeze({
+      origins: xitcoinOrigins(xitcoin.origins, xitcoin.allowLoopbackHttp), allowLoopbackHttp: xitcoin.allowLoopbackHttp,
+      chainSchemaCommit: xitcoin.chainSchemaCommit,
+      signerSetVersion: decimalString(xitcoin.signerSetVersion, 1n, (1n << 64n) - 1n),
+      authorizedSigners: Object.freeze(signers), submitter: bech32Account(xitcoin.submitter),
+      // CometBFT commits are final; confirmations add a safety margin on top.
+      confirmations: integer(xitcoin.confirmations, 1, 1_000),
+      // Every origin must serve state, blocks and the transaction index for
+      // at least this many recent blocks.
+      historyBlocks: integer(xitcoin.historyBlocks, 1_000, 10_000_000),
+      maxAmount: decimalString(xitcoin.maxAmount, 1n, (1n << 256n) - 1n),
+      maxGas,
+      // Gas limit = ceil(simulated gas * gasAdjustmentPercent / 100) + gasHeadroom.
+      gasAdjustmentPercent: integer(xitcoin.gasAdjustmentPercent, 110, 300),
+      gasHeadroom: integer(xitcoin.gasHeadroom, 10_000, 1_000_000),
+      // Price per gas = ceil(max(base fee, min gas price) * feeMultiplierPercent / 100), in axtc.
+      feeMultiplierPercent: integer(xitcoin.feeMultiplierPercent, 100, 1_000),
+      maxGasPrice, maxFee,
+      minDeadlineMarginSeconds: integer(xitcoin.minDeadlineMarginSeconds, 30, 3_600),
+      maxBroadcastAttempts: integer(xitcoin.maxBroadcastAttempts, 1, 32),
+    }),
+    cronos: Object.freeze({ rpcUrls: urls(cronos.rpcUrls, cronos.allowLoopbackHttp), allowLoopbackHttp: cronos.allowLoopbackHttp,
+      vault: checksummed(cronos.vault), cronosRouteId: cronos.cronosRouteId, confirmations: integer(cronos.confirmations, 2, 10_000) }),
+  });
+}
+
 // Disabled phase-one manifests keep their exact schema; only an explicit
-// `testnet` mode selects the transaction-capable Cronos schema.
+// `testnet` mode selects a transaction-capable schema, chosen by destination.
 export function parseSubmitterManifest(input) {
-  return input && typeof input === "object" && !Array.isArray(input) && Object.hasOwn(input, "mode")
-    && Object.getOwnPropertyDescriptor(input, "mode").value === "testnet"
-    ? validateCronosTestnetManifest(input) : validateSubmitterManifest(input);
+  if (!(input && typeof input === "object" && !Array.isArray(input) && Object.hasOwn(input, "mode")
+      && Object.getOwnPropertyDescriptor(input, "mode").value === "testnet")) return validateSubmitterManifest(input);
+  const destination = Object.hasOwn(input, "destination") ? Object.getOwnPropertyDescriptor(input, "destination").value : undefined;
+  return destination === "xitcoin" ? validateXitcoinTestnetManifest(input) : validateCronosTestnetManifest(input);
 }
 
 // Trust root, but never a service-writable ancestor or a symlink in the manifest path.

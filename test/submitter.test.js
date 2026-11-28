@@ -9,6 +9,7 @@ import { loadSubmitterManifest, validateSubmitterManifest, verifySubmitterReleas
 import { buildSubmitterRuntime, inspectSubmitter } from "../src/submitter-bootstrap.js";
 import { runSubmitterCli } from "../src/submitter-cli.js";
 import { XITCOIN_TESTNET_ROUTE_ID } from "../src/protocol.js";
+import { XITCOIN_CHAIN_SCHEMA_COMMIT } from "../src/xitcoin-transaction.js";
 
 const manifest = (destination = "xitcoin") => ({ version: 1, mode: "disabled", destination,
   releaseCommit: "a".repeat(40), routeId: XITCOIN_TESTNET_ROUTE_ID, cronosChainId: 338, xitcoinChainId: "xitcoin-testnet-v2-1" });
@@ -266,7 +267,7 @@ test("Cronos testnet mode requires every pinned value and rejects mainnet, Xitco
   assert.throws(() => validateSubmitterManifest(testnet()));
 });
 
-test("testnet inspection is offline and unready; only Cronos testnet builds a runtime", async () => {
+test("testnet inspection is offline and unready; a Cronos testnet manifest builds the Cronos runtime", async () => {
   const options = { destination: "cronos", manifestPath: "/etc/xitcoin-bridge/submitter-cronos.json", modulePath, credentialsDirectory: "/run/credentials/x" };
   const verifyRelease = (config, path) => verifySubmitterRelease(config, path, { resolve: async (x) => x, stat: trustedStat });
   const report = await inspectSubmitter(options, { loadManifest: async () => testnet(), verifyRelease });
@@ -285,6 +286,90 @@ test("testnet inspection is offline and unready; only Cronos testnet builds a ru
     buildCronos: () => assert.fail("release mismatch must not build") }), /does not match its pinned manifest/);
   const { calls, dependencies } = reader(JSON.stringify(testnet()));
   assert.equal((await loadSubmitterManifest("/etc/bridge/submitter.json", dependencies)).mode, "testnet");
+  assert.equal(calls.closed, 1);
+});
+
+// Xitcoin testnet submission mode.
+const xitcoinTestnet = (patch = {}, xitcoinPatch = {}, cronosPatch = {}) => ({ version: 1, mode: "testnet", destination: "xitcoin",
+  releaseCommit: "a".repeat(40), routeId: XITCOIN_TESTNET_ROUTE_ID, cronosChainId: 338, xitcoinChainId: "xitcoin-testnet-v2-1",
+  relayStorePath: "/var/lib/xitcoin-bridge/coordinator/relay.sqlite", ledgerPath: "/var/lib/xitcoin-bridge/submitter-xitcoin/ledger.sqlite",
+  keystorePath: "/var/lib/xitcoin-bridge/submitter-xitcoin-keystore/keystore.json", cycleIntervalMs: 5000,
+  xitcoin: { origins: [{ rpcUrl: "https://xitcoin-a.example/rpc", restUrl: "https://xitcoin-a-api.example" },
+    { rpcUrl: "https://xitcoin-b.example/rpc", restUrl: "https://xitcoin-b-api.example" }], allowLoopbackHttp: false,
+  chainSchemaCommit: XITCOIN_CHAIN_SCHEMA_COMMIT, signerSetVersion: "1", authorizedSigners: [...testnetSigners],
+  submitter: "xtc1pvxgdtncv9ttghcdrp89uzhyhacu5l6r42ahd9", confirmations: 2, historyBlocks: 100_000,
+  maxAmount: "100000000000000000000", maxGas: "600000", gasAdjustmentPercent: 130, gasHeadroom: 40_000, feeMultiplierPercent: 200,
+  maxGasPrice: "100000000000", maxFee: "60000000000000000", minDeadlineMarginSeconds: 120, maxBroadcastAttempts: 5, ...xitcoinPatch },
+  cronos: { rpcUrls: ["https://cronos-a.example/rpc", "https://cronos-b.example/rpc"], allowLoopbackHttp: false,
+    vault: "0x1c94273C0b199b139D82da3786C9eCbE189D5919", cronosRouteId: "0x21121c16b53a726056a6683f00c7eb4da5501ce8a2abc8a4677e06f1e94b5cd9",
+    confirmations: 12, ...cronosPatch },
+  ...patch });
+
+test("Xitcoin testnet mode requires every pinned value and rejects mainnet, the label route and coercion", async () => {
+  const { validateXitcoinTestnetManifest, parseSubmitterManifest } = await import("../src/submitter-manifest.js");
+  const accepted = validateXitcoinTestnetManifest(xitcoinTestnet());
+  assert.ok(Object.isFrozen(accepted) && Object.isFrozen(accepted.xitcoin) && Object.isFrozen(accepted.xitcoin.origins)
+    && Object.isFrozen(accepted.xitcoin.origins[0]) && Object.isFrozen(accepted.cronos));
+  assert.deepEqual(parseSubmitterManifest(xitcoinTestnet()), accepted);
+  assert.deepEqual(parseSubmitterManifest(manifest("xitcoin")), validateSubmitterManifest(manifest("xitcoin")));
+  assert.equal(validateXitcoinTestnetManifest(xitcoinTestnet({}, { allowLoopbackHttp: true, origins: [
+    { rpcUrl: "http://127.0.0.1:26657", restUrl: "http://127.0.0.1:1317" }, { rpcUrl: "http://127.0.0.1:26658", restUrl: "http://127.0.0.1:1318" }] }))
+    .xitcoin.allowLoopbackHttp, true);
+  assert.throws(() => validateXitcoinTestnetManifest(xitcoinTestnet({ xitcoinChainId: "xitcoin" })), /mainnet is not supported/);
+  const top = [{ destination: "cronos" }, { mode: "live" }, { mode: "disabled" }, { cronosChainId: 25 }, { version: 2 },
+    { routeId: "cronos-testnet-xitcoin-testnet" }, { routeId: "0x21121C16B53A726056A6683F00C7EB4DA5501CE8A2ABC8A4677E06F1E94B5CD9" },
+    { xitcoinChainId: "xitcoin-testnet-v2-2" }, { releaseCommit: "main" }, { cycleIntervalMs: 999 }, { relayStorePath: "relative.sqlite" },
+    { keystorePath: "/var/lib/xitcoin-bridge/coordinator/relay.sqlite" }, { extra: true }, { password: "x" }];
+  const xitcoin = [{ origins: [{ rpcUrl: "https://a.example", restUrl: "https://b.example" }] },
+    { origins: [{ rpcUrl: "https://a.example", restUrl: "https://b.example" }, { rpcUrl: "https://a.example/x", restUrl: "https://c.example" }] },
+    { origins: [{ rpcUrl: "https://a.example", restUrl: "https://b.example" }, { rpcUrl: "https://c.example", restUrl: "https://b.example/x" }] },
+    { origins: [{ rpcUrl: "https://k:s@a.example", restUrl: "https://b.example" }, { rpcUrl: "https://c.example", restUrl: "https://d.example" }] },
+    { origins: [{ rpcUrl: "https://a.example/?key=1", restUrl: "https://b.example" }, { rpcUrl: "https://c.example", restUrl: "https://d.example" }] },
+    { origins: [{ rpcUrl: "http://127.0.0.1:1", restUrl: "http://127.0.0.1:2" }, { rpcUrl: "http://127.0.0.1:3", restUrl: "http://127.0.0.1:4" }] },
+    { origins: [{ rpcUrl: "https://a.example", restUrl: "https://b.example", grpcUrl: "https://g.example" }, { rpcUrl: "https://c.example", restUrl: "https://d.example" }] },
+    { chainSchemaCommit: "b".repeat(40) }, { chainSchemaCommit: "main" }, { signerSetVersion: 1 }, { signerSetVersion: "0" },
+    { authorizedSigners: testnetSigners.slice(0, 2) }, { authorizedSigners: [testnetSigners[0], testnetSigners[0], testnetSigners[1]] },
+    { authorizedSigners: [testnetSigners[0].toLowerCase(), testnetSigners[1], testnetSigners[2]] },
+    { submitter: "xtc1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqca63ah" }, { submitter: "XTC1PVXGDTNCV9TTGHCDRP89UZHYHACU5L6R42AHD9" },
+    { submitter: "cosmos1pvxgdtncv9ttghcdrp89uzhyhacu5l6r42ahd9" }, { submitter: "xtc1pvxgdtncv9ttghcdrp89uzhyhacu5l6r42ahd8" },
+    { confirmations: 0 }, { confirmations: 1_001 }, { historyBlocks: 999 }, { maxAmount: "0" }, { maxGas: "99999" }, { maxGas: "5000001" },
+    { maxGas: 600000 }, { gasAdjustmentPercent: 109 }, { gasAdjustmentPercent: 301 }, { gasHeadroom: 9_999 }, { feeMultiplierPercent: 99 },
+    { feeMultiplierPercent: 1_001 }, { maxGasPrice: "0" }, { maxGasPrice: "1000000000000001" }, { maxFee: "0" },
+    { minDeadlineMarginSeconds: 29 }, { maxBroadcastAttempts: 33 }, { extra: 1 }, { privateKey: "0x1" }, { allowLoopbackHttp: "false" }];
+  const cronos = [{ rpcUrls: ["https://a.example"] }, { vault: "0x1c94273c0b199b139d82da3786c9ecbe189d5919" },
+    { cronosRouteId: "0xb9ae829d654d824b9046d969c96822a479b9eac3488642b4092928d65e07df5b" }, { confirmations: 1 }, { extra: 1 }];
+  for (const patch of top) assert.throws(() => validateXitcoinTestnetManifest(xitcoinTestnet(patch)), undefined, JSON.stringify(patch));
+  for (const patch of xitcoin) assert.throws(() => validateXitcoinTestnetManifest(xitcoinTestnet({}, patch)), undefined, JSON.stringify(patch));
+  for (const patch of cronos) assert.throws(() => validateXitcoinTestnetManifest(xitcoinTestnet({}, {}, patch)), undefined, JSON.stringify(patch));
+  for (const field of Object.keys(xitcoinTestnet())) {
+    const value = xitcoinTestnet(); delete value[field];
+    assert.throws(() => validateXitcoinTestnetManifest(value));
+  }
+  for (const field of Object.keys(xitcoinTestnet().xitcoin)) {
+    const value = xitcoinTestnet(); delete value.xitcoin[field];
+    assert.throws(() => validateXitcoinTestnetManifest(value), undefined, field);
+  }
+  assert.throws(() => validateSubmitterManifest(xitcoinTestnet()));
+});
+
+test("Xitcoin testnet inspection is offline and unready; start builds only the Xitcoin runtime", async () => {
+  const options = { destination: "xitcoin", manifestPath: "/etc/xitcoin-bridge/submitter-xitcoin.json", modulePath, credentialsDirectory: "/run/credentials/x" };
+  const verifyRelease = (config, path) => verifySubmitterRelease(config, path, { resolve: async (x) => x, stat: trustedStat });
+  assert.deepEqual(await inspectSubmitter(options, { loadManifest: async () => xitcoinTestnet(), verifyRelease }),
+    { version: 1, destination: "xitcoin", releaseCommit: "a".repeat(40), mode: "testnet", ready: false, submissions: 0,
+      blocker: "xitcoin_live_checks_run_only_at_start" });
+  let built;
+  const runtime = await buildSubmitterRuntime(options, { loadManifest: async () => xitcoinTestnet(), verifyRelease,
+    buildCronos: () => assert.fail("the Xitcoin manifest must not build the Cronos runtime"),
+    buildXitcoin: async (config, dependencies) => { built = { config, dependencies }; return { run: async () => {} }; } });
+  assert.equal(typeof runtime.run, "function");
+  assert.equal(built.config.destination, "xitcoin"); assert.equal(built.dependencies.credentialsDirectory, "/run/credentials/x");
+  await assert.rejects(buildSubmitterRuntime(options, { loadManifest: async () => manifest("xitcoin"), verifyRelease,
+    buildXitcoin: () => assert.fail("disabled manifest must not build") }), { code: "SUBMITTER_UNAVAILABLE" });
+  await assert.rejects(buildSubmitterRuntime({ ...options, destination: "cronos" }, { loadManifest: async () => xitcoinTestnet(), verifyRelease,
+    buildXitcoin: () => assert.fail("destination mismatch must not build") }), /does not match/);
+  const { calls, dependencies } = reader(JSON.stringify(xitcoinTestnet()));
+  assert.equal((await loadSubmitterManifest("/etc/bridge/submitter.json", dependencies)).destination, "xitcoin");
   assert.equal(calls.closed, 1);
 });
 
