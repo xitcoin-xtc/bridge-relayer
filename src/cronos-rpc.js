@@ -171,6 +171,14 @@ export class CronosRpcQuorum {
 
   receipts(transactionHash) { return this.each("eth_getTransactionReceipt", [transactionHash], normalizeReceipt); }
 
+  // Bounded log query (one vault event topic pair); every origin must agree.
+  logs(filter) {
+    return this.agree("eth_getLogs", [filter], (value) => {
+      if (!Array.isArray(value) || value.length > 16) throw invalid();
+      return Object.freeze(value.map(normalizeLog));
+    });
+  }
+
   transactions(transactionHash) { return this.each("eth_getTransactionByHash", [transactionHash], normalizeTransaction); }
 
   // Identical bytes to every origin. Results are not decision inputs.

@@ -218,7 +218,8 @@ const testnet = (patch = {}, cronosPatch = {}, xitcoinPatch = {}) => ({ version:
     cronosRouteId: "0x21121c16b53a726056a6683f00c7eb4da5501ce8a2abc8a4677e06f1e94b5cd9", signerSetVersion: "1",
     authorizedSigners: [...testnetSigners], submitter: "0xe1AB8145F7E55DC933d51a18c793F901A3A0b276", confirmations: 12,
     maxAmount: "100000000000000000000", gasLimit: "400000", maxGasPrice: "5000000000000", maxFee: "2000000000000000000",
-    minDeadlineMarginSeconds: 120, maxBroadcastAttempts: 5, ...cronosPatch },
+    minDeadlineMarginSeconds: 120, maxBroadcastAttempts: 5,
+    releaseLookbackBlocks: 50_000, logRangeBlocks: 2_000, ...cronosPatch },
   xitcoin: { rpcUrls: ["https://xitcoin-a.example", "https://xitcoin-b.example"], allowLoopbackHttp: false, safetyLag: 2, ...xitcoinPatch },
   ...patch });
 
@@ -244,7 +245,9 @@ test("Cronos testnet mode requires every pinned value and rejects mainnet, Xitco
     { submitter: testnetSigners[0] }, { submitter: "0x1c94273C0b199b139D82da3786C9eCbE189D5919" }, { confirmations: 1 },
     { confirmations: 10_001 }, { maxAmount: "0" }, { maxAmount: 1 }, { gasLimit: "20999" }, { gasLimit: "10000001" },
     { maxGasPrice: "0" }, { maxGasPrice: "10000000000001" }, { maxFee: "1" }, { minDeadlineMarginSeconds: 29 },
-    { minDeadlineMarginSeconds: 3_601 }, { maxBroadcastAttempts: 0 }, { maxBroadcastAttempts: 33 }, { extra: 1 }, { privateKey: "0x1" }];
+    { minDeadlineMarginSeconds: 3_601 }, { maxBroadcastAttempts: 0 }, { maxBroadcastAttempts: 33 }, { extra: 1 }, { privateKey: "0x1" },
+    { releaseLookbackBlocks: 999 }, { releaseLookbackBlocks: 1_000_001 }, { logRangeBlocks: 99 }, { logRangeBlocks: 10_001 },
+    { logRangeBlocks: "2000" }];
   const xitcoin = [{ rpcUrls: ["https://x.example"] }, { safetyLag: -1 }, { safetyLag: 1_001 }, { allowLoopbackHttp: 1 }, { extra: 1 }];
   for (const patch of top) assert.throws(() => validateCronosTestnetManifest(testnet(patch)), undefined, JSON.stringify(patch));
   for (const patch of cronos) assert.throws(() => validateCronosTestnetManifest(testnet({}, patch)), undefined, JSON.stringify(patch));
@@ -303,4 +306,22 @@ test("CLI start runs until SIGTERM, closes state and reports only stable error c
   const unsafe = new Error("x"); unsafe.code = "Contains Spaces https://x";
   assert.equal(await runSubmitterCli(["start", "cronos", "/etc/config"], { ...common, build: async () => { throw unsafe; } }), 1);
   assert.doesNotMatch(errors, /Contains|https/);
+});
+
+test("only conditions that persist nothing are temporary stops; halts and identity errors still stop", async () => {
+  const { isTemporaryStop } = await import("../src/cronos-submitter.js");
+  const { SubmissionHalt, SubmissionUnavailable } = await import("../src/durable-broadcast.js");
+  const { TransportError } = await import("../src/bounded-transport.js");
+  const { RpcDisagreement, RpcInvalid } = await import("../src/cronos-rpc.js");
+  const busy = Object.assign(new Error("database is locked"), { errcode: 5 });
+  for (const error of [new TransportError("timeout"), new RpcDisagreement(), new RpcInvalid(), busy,
+    new SubmissionUnavailable("deadline_evidence_disagreement"), new SubmissionUnavailable("release_evidence_unavailable")]) {
+    assert.equal(isTemporaryStop(error), true);
+  }
+  for (const error of [new SubmissionHalt("approval_expired_before_broadcast"), new SubmissionHalt("ledger_requires_review"),
+    new SubmissionUnavailable("vault_code_mismatch"), new SubmissionUnavailable("signer_set_mismatch"),
+    Object.assign(new Error("x"), { code: "cronos_mainnet_rejected" }), Object.assign(new Error("x"), { errcode: 19 }),
+    new Error("broadcast ledger unavailable or conflicting"), null, "busy"]) {
+    assert.equal(isTemporaryStop(error), false);
+  }
 });

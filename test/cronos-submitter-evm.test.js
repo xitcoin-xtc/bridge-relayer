@@ -14,7 +14,7 @@ import { SignerApprovalJournal } from "../src/signer-journal.js";
 import { IsolatedSignerService, createSignerPolicy } from "../src/signer-service.js";
 import { createCanonicalSourceVerifier } from "../src/source-verification.js";
 import { CronosFinalizedWatcher, XitcoinFinalizedWatcher } from "../src/watchers.js";
-import { buildCronosSubmitterRuntime, cronosLedgerBinding } from "../src/cronos-submitter.js";
+import { buildCronosSubmitterRuntime, cronosLedgerBinding, isTemporaryStop, openExistingRelayStore } from "../src/cronos-submitter.js";
 import { SubmissionHalt } from "../src/durable-broadcast.js";
 import { TESTNET_ROUTE_ID } from "../src/preflight.js";
 import { createEncryptedKeystoreDigestSigner } from "../src/secure-keystore.js";
@@ -30,6 +30,7 @@ const evm = evmAvailability();
 const options = { skip: evm.skip, timeout: 240_000 };
 const VAULT = new Interface(["function processedBurns(bytes32) view returns (bool)", "function pause()",
   "function resume(uint256 nonce,uint256 deadline,bytes[] signatures)", "function balanceOf(address) view returns (uint256)"]);
+const RELEASE = new Interface(["function release(bytes32,address,uint256,uint64,uint256,bytes[])"]);
 const AMOUNT = 10n ** 18n;
 const recipient = signers[0];
 const SUBMITTER = localAddress(localKeys.submitter);
@@ -77,7 +78,7 @@ function isolatedSigners({ vault, proxies, comets }) {
 }
 
 async function scenario(run, { version = "testnet", chainId = 338, burns = 1, approved = burns, deadlineOffset = 3_600,
-  patch = {}, cronosPatch = {}, cometBurns = (items) => [items, items], approvals = "signers" } = {}) {
+  patch = {}, cronosPatch = {}, cometBurns = (items) => [items, items], approvals = "signers", recipientFor = () => recipient } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "cronos-submitter-"));
   const cleanup = [];
   try {
@@ -87,7 +88,8 @@ async function scenario(run, { version = "testnet", chainId = 338, burns = 1, ap
     cleanup.push(...proxies.map((proxy) => proxy.stop));
     const bridge = await deployBridge(chain, artifacts(version), { routeId: TESTNET_ROUTE_ID, signers, version });
     await chain.rpc("anvil_mine", ["0xa"]); // vault identity is read at a finalized height
-    const allBurns = Array.from({ length: burns }, (_, index) => xitcoinBurn({ index: index + 1, recipient, amount: AMOUNT.toString() }));
+    const allBurns = Array.from({ length: burns }, (_, index) => xitcoinBurn({ index: index + 1,
+      recipient: recipientFor(index + 1, bridge), amount: AMOUNT.toString() }));
     const [firstComet, secondComet] = cometBurns(allBurns);
     const comets = [await startCometBft(firstComet), await startCometBft(secondComet)];
     cleanup.push(...comets.map((comet) => comet.stop));
@@ -111,7 +113,8 @@ async function scenario(run, { version = "testnet", chainId = 338, burns = 1, ap
         vaultCodeHash: keccak256(await chain.rpc("eth_getCode", [bridge.vault, "latest"])), cronosRouteId: TESTNET_ROUTE_ID,
         signerSetVersion: "1", authorizedSigners: [...signers], submitter: SUBMITTER, confirmations: 3,
         maxAmount: (10n ** 21n).toString(), gasLimit: "400000", maxGasPrice: "100000000000", maxFee: "40000000000000000",
-        minDeadlineMarginSeconds: 60, maxBroadcastAttempts: 5, ...cronosPatch },
+        minDeadlineMarginSeconds: 60, maxBroadcastAttempts: 5,
+        releaseLookbackBlocks: 1_000, logRangeBlocks: 100, ...cronosPatch },
       xitcoin: { rpcUrls: comets.map((comet) => comet.url), allowLoopbackHttp: true, safetyLag: 2 }, ...patch });
     const runtimes = [];
     cleanup.push(() => { for (const runtime of runtimes) runtime.close(); });
@@ -213,10 +216,12 @@ test("duplicate attempts: concurrent workers, a later worker and an independent 
   const takeover = await runtime({ offsetMs: 10 * 60_000 });
   assert.equal((await takeover.runOnce()).action, "finalized");
   await assertSingleRelease(facts, burns[0]);
-  // An independent ledger and RelayStore copy see the vault replay flag and halt.
+  // An independent ledger and RelayStore copy find the finalized release by
+  // our transaction, record it as released elsewhere and never send.
   mkdirSync(join(directory, "second"), { mode: 0o700 });
   const independent = await runtime({ manifestOverride: { ...manifest, relayStorePath: copy, ledgerPath: join(directory, "second", "ledger.sqlite") } });
-  await assert.rejects(independent.runOnce(), (error) => error instanceof SubmissionHalt && error.code === "processed_without_local_transaction");
+  const outcome = await independent.runOnce();
+  assert.equal(outcome.action, "released_elsewhere"); assert.equal(outcome.releaseHash, facts.relay().destination_ref);
   assert.equal(await facts.nonce(), 1);
 }));
 
@@ -443,4 +448,174 @@ test("a stored request that no longer matches its finalized source transfer halt
   await assert.rejects((await runtime()).runOnce(), (error) => error instanceof SubmissionHalt && error.code === "stored_request_mismatch");
   assert.equal(await facts.nonce(), 0);
   assert.equal(facts.relay(burns[0]).state, "approved");
+}));
+
+// Anyone may call release() with valid approvals, e.g. by copying our pending
+// calldata or reading the public approvals. Such releases must not block us.
+function thirdPartyRelease(chain, bridge, store, burn, options = {}) {
+  const request = store.approvalRequest("xitcoin", burn.requestId);
+  const signatures = store.approvals("xitcoin", burn.requestId).map((approval) => approval.signature);
+  const p = request.payload;
+  const data = RELEASE.encodeFunctionData("release", [p.sourceBurnId, p.recipient, p.amount, p.signerSetVersion, p.deadline, signatures]);
+  return signedCall(chain, localKeys.guardian, { to: bridge.vault, data, gasLimit: 400_000n, ...options })
+    .then((raw) => chain.rpc("eth_sendRawTransaction", [raw]))
+    .then(async (hash) => {
+      for (let i = 0; i < 100 && !(await chain.rpc("eth_getTransactionReceipt", [hash])); i++) await new Promise((resolve) => setTimeout(resolve, 20));
+      return hash;
+    });
+}
+
+test("a front-run copying our pending calldata is recorded as released elsewhere and the queue moves on", options, () => scenario(async ({ chain, bridge, runtime, facts, burns, approve }) => {
+  await chain.rpc("evm_setAutomine", [false]);
+  const rt = await runtime();
+  const sent = await rt.runOnce();
+  assert.equal(sent.action, "submitted");
+  const ours = await chain.rpc("eth_getTransactionByHash", [sent.transactionHash]);
+  const attacker = await chain.rpc("eth_sendRawTransaction", [await signedCall(chain, localKeys.guardian, { to: bridge.vault,
+    data: ours.input, gasPrice: 50_000_000_000n, gasLimit: 400_000n })]);
+  await chain.rpc("evm_mine", []);
+  assert.equal((await chain.rpc("eth_getTransactionReceipt", [sent.transactionHash])).status, "0x0");
+  assert.equal(await facts.processed(burns[0]), true);
+  await chain.rpc("evm_setAutomine", [true]);
+  await facts.mine(3);
+  const outcome = await rt.runOnce();
+  assert.equal(outcome.action, "released_elsewhere"); assert.equal(outcome.releaseHash, attacker);
+  assert.equal(facts.relay(burns[0]).state, "completed");
+  assert.equal(facts.relay(burns[0]).destination_ref, sent.transactionHash);
+  const ledger = facts.ledger();
+  try {
+    const row = ledger.inspect(burns[0].requestId);
+    assert.equal(row.state, "released_elsewhere"); assert.equal(row.releaseHash, attacker); assert.equal(row.nonce, 0);
+    assert.equal(ledger.blocking().length, 0);
+  } finally { ledger.close(); }
+  await approve(burns[1]);
+  await completes(rt, facts, burns[1]);
+  await assertSingleRelease(facts, burns[1]);
+  assert.equal(await facts.nonce(), 2);
+}, { burns: 2, approved: 1 }));
+
+test("a third-party release before any claim completes the transfer without any submitter transaction", options, () => scenario(async ({ chain, bridge, store, runtime, facts, burns, approve }) => {
+  const release = await thirdPartyRelease(chain, bridge, store, burns[0]);
+  await facts.mine(3);
+  const rt = await runtime();
+  const outcome = await rt.runOnce();
+  assert.equal(outcome.action, "released_elsewhere"); assert.equal(outcome.releaseHash, release);
+  assert.equal(facts.relay(burns[0]).state, "completed"); assert.equal(facts.relay(burns[0]).destination_ref, null);
+  assert.equal(await facts.nonce(), 0);
+  await approve(burns[1]);
+  await completes(rt, facts, burns[1]);
+  assert.equal(await facts.nonce(), 1);
+}, { burns: 2, approved: 1 }));
+
+test("a third-party release after we signed still consumes our nonce once, then the queue moves on", options, () => scenario(async ({ chain, bridge, store, runtime, facts, burns, approve }) => {
+  await assert.rejects((await runtime({ boundary: async (name) => { if (name === "signed") throw new Error("stop"); } })).runOnce(), /stop/);
+  const release = await thirdPartyRelease(chain, bridge, store, burns[0]);
+  await facts.mine(3);
+  const recovered = await runtime({ offsetMs: 10 * 60_000 });
+  const sent = await recovered.runOnce();
+  assert.equal(sent.action, "submitted"); // identical bytes; they revert but consume nonce 0
+  await facts.mine(3);
+  assert.equal((await chain.rpc("eth_getTransactionReceipt", [sent.transactionHash])).status, "0x0");
+  const outcome = await recovered.runOnce();
+  assert.equal(outcome.action, "released_elsewhere"); assert.equal(outcome.releaseHash, release);
+  await approve(burns[1]);
+  await completes(recovered, facts, burns[1]);
+  assert.equal(await facts.nonce(), 2);
+}, { burns: 2, approved: 1 }));
+
+test("an invalid recipient is rejected for that transfer only and never blocks the next", options, () => scenario(async ({ runtime, facts, burns, bridge }) => {
+  const rt = await runtime();
+  await completes(rt, facts, burns[1]);
+  await rt.runOnce();
+  const ledger = facts.ledger();
+  try {
+    const row = ledger.inspect(burns[0].requestId);
+    assert.equal(row.state, "rejected"); assert.equal(row.reasonCode, "invalid_recipient");
+    assert.equal(ledger.blocking().length, 0);
+  } finally { ledger.close(); }
+  assert.equal(facts.relay(burns[0]).state, "approved"); // kept for the operator
+  assert.equal(burns[0].recipient, bridge.vault);
+  assert.equal(await facts.nonce(), 1);
+  assert.equal((await rt.runOnce()).action, "idle");
+}, { burns: 2, approvals: "direct", recipientFor: (index, bridge) => (index === 1 ? bridge.vault : recipient) }));
+
+test("one origin with a far-future timestamp stops temporarily and never persists a halt", options, () => scenario(async ({ proxies, runtime, facts, burns }) => {
+  await assert.rejects((await runtime({ boundary: async (name) => { if (name === "signed") throw new Error("stop"); } })).runOnce(), /stop/);
+  proxies[1].hook = async ({ message, forward }) => (message.method === "eth_getBlockByNumber" && message.params[0] === "latest"
+    ? rewriteResult(await forward(), (block) => ({ ...block, timestamp: `0x${(Math.floor(Date.now() / 1000) + 365 * 86400).toString(16)}` }))
+    : forward());
+  const rt = await runtime({ offsetMs: 10 * 60_000 });
+  await assert.rejects(rt.runOnce(), (error) => error.code === "deadline_evidence_disagreement" && isTemporaryStop(error));
+  const ledger = facts.ledger();
+  try { assert.equal(ledger.blocking().length, 0); assert.equal(ledger.inspect(burns[0].requestId).state, "signed"); } finally { ledger.close(); }
+  proxies[1].hook = null;
+  await completes(rt, facts, burns[0]);
+  await assertSingleRelease(facts, burns[0]);
+}));
+
+test("one origin returning a different included transaction stops temporarily and never persists a halt", options, () => scenario(async ({ proxies, runtime, facts, burns }) => {
+  const rt = await runtime();
+  await rt.runOnce();
+  await facts.mine(3);
+  proxies[1].hook = async ({ message, forward }) => (message.method === "eth_getTransactionByHash"
+    ? rewriteResult(await forward(), (tx) => ({ ...tx, gasPrice: "0x1" })) : forward());
+  await assert.rejects(rt.runOnce(), (error) => error.code === "rpc_disagreement" && isTemporaryStop(error));
+  const ledger = facts.ledger();
+  try { assert.equal(ledger.blocking().length, 0); } finally { ledger.close(); }
+  proxies[1].hook = null;
+  assert.equal((await rt.runOnce()).action, "finalized");
+  await assertSingleRelease(facts, burns[0]);
+}));
+
+test("two submitter processes contest the lease: exactly one sends", options, () => scenario(async ({ chain, runtime, facts, burns, manifest, paths }) => {
+  const base = new URL("../", import.meta.url).href;
+  const code = `import { buildCronosSubmitterRuntime } from '${base}src/cronos-submitter.js';
+    import { BroadcastLedger } from '${base}src/broadcast-ledger.js';
+    import { createEncryptedKeystoreDigestSigner } from '${base}src/secure-keystore.js';
+    import { journalOptions } from '${base}test/journal-fixture.js';
+    const context = JSON.parse(process.env.SUBMITTER_TEST_CONTEXT);
+    const runtime = await buildCronosSubmitterRuntime(context.manifest, { credentialsDirectory: context.credentials,
+      makeLedger: (path, binding) => new BroadcastLedger(path, binding, journalOptions("cronos")),
+      loadSigner: (input) => createEncryptedKeystoreDigestSigner({ ...input, expectedCredentialOwnerUid: process.geteuid() }), log: () => {} });
+    const startAt = context.startAt; while (Date.now() < startAt) await new Promise((resolve) => setTimeout(resolve, 5));
+    let result;
+    try { result = (await runtime.runOnce()).action; } catch { result = "refused"; }
+    process.stdout.write(result);`;
+  const context = { manifest, credentials: paths.credentials, startAt: Date.now() + 1_500 };
+  const run = () => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", code],
+      { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, SUBMITTER_TEST_CONTEXT: JSON.stringify(context) } });
+    let output = "", errors = "";
+    child.stdout.on("data", (data) => { output += data; }); child.stderr.on("data", (data) => { errors += data; });
+    child.on("close", (status) => (status === 0 ? resolve(output) : reject(new Error(errors))));
+  });
+  const results = await Promise.all([run(), run()]);
+  assert.deepEqual(results.sort(), ["refused", "submitted"]);
+  await facts.settle();
+  assert.equal(await facts.nonce(), 1);
+  const recovered = await runtime({ offsetMs: 10 * 60_000 });
+  await completes(recovered, facts, burns[0]);
+  assert.equal(await facts.nonce(), 1);
+  assert.equal(chain.url.startsWith("http://127.0.0.1"), true);
+}));
+
+test("a RelayStore locked by the coordinator pauses run() temporarily instead of ending it", options, () => scenario(async ({ runtime, facts, burns, paths }) => {
+  const holder = spawn(process.execPath, ["--input-type=module", "-e", `import { DatabaseSync } from "node:sqlite";
+    const db = new DatabaseSync(${JSON.stringify(paths.store)}); db.exec("BEGIN IMMEDIATE"); process.stdout.write("locked");
+    setTimeout(() => { db.exec("COMMIT"); db.close(); }, 1_500);`], { stdio: ["ignore", "pipe", "inherit"] });
+  await new Promise((resolve) => holder.stdout.once("data", resolve));
+  const logs = [];
+  const controller = new AbortController();
+  const rt = await buildCronosSubmitterRuntime((await runtime()).manifest, { credentialsDirectory: paths.credentials,
+    makeLedger: (path, binding) => new BroadcastLedger(path, binding, journalOptions("cronos")),
+    makeStore: (path) => openExistingRelayStore(path, { busyTimeoutMs: 100 }),
+    loadSigner: (input) => createEncryptedKeystoreDigestSigner({ ...input, expectedCredentialOwnerUid: process.geteuid() }),
+    now: () => Date.now() + 10 * 60_000,
+    log: (report) => { logs.push(report); if (report.action === "submitted") controller.abort(); } });
+  try { await rt.run({ signal: controller.signal }); } finally { rt.close(); }
+  assert.ok(logs.some((report) => report.action === "temporarily_stopped" && report.code === "relay_store_busy"));
+  assert.equal(logs.at(-1).action, "submitted");
+  assert.equal(facts.relay(burns[0]).state, "submitted");
+  await facts.settle();
+  assert.equal(await facts.nonce(), 1);
 }));
