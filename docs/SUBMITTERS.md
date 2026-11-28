@@ -803,11 +803,12 @@ rejected, never coerced. Upstream log text is never kept or logged.
 Two origins are the minimum and are accepted for testnet. Production needs
 three or more independent operators: with two, a strict majority is both, so
 one faulty origin can hold a signed row until its approval deadline margin is
-lost (the identical bytes are then sent and typically end `expired`), and one
-origin returning a mismatching attestation record forces the halt described
-below. Origins must run the `kv` transaction indexer and serve state, blocks
-and the transaction index for at least `historyBlocks` recent blocks plus the
-maximum expected downtime.
+lost (the identical bytes are then sent and typically end `expired`). With any
+number of origins, one origin returning a mismatching attestation record forces
+the halt described below, and one origin failing every read stops completion
+temporarily. Origins must run the `kv` transaction indexer and serve state,
+blocks and the transaction index for at least `historyBlocks` recent blocks
+plus the maximum expected downtime.
 
 ### Checks before signing (nothing is claimed if any fails)
 
