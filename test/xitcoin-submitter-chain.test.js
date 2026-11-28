@@ -439,7 +439,9 @@ test("an approval too close to its deadline is handed back, re-issued only after
   await assertSingleMint(facts);
   assert.equal(facts.row().approvalDigest, request.digest);
   assert.equal((await facts.attestation()).record.deadline_unix, String(request.deadlineUnix));
-}, { deadlineOffset: 20 }));
+  // Inside the 30-second deadline margin from the start, with as much time as
+  // possible before the chain's block time passes the deadline.
+}, { deadlineOffset: 28 }));
 
 test("signed bytes first sent after the deadline end expired and the next transfer proceeds", options, () => scenario(async ({ runtime, facts, manifest, paths, records, approve, requests }) => {
   // Kill after the bytes are committed, before the first send, then let the
