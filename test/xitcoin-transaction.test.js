@@ -6,8 +6,8 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 import { SigningKey, keccak256 } from "ethers";
 import { accountOfPublicKey, assembleSimulationTx, assembleTxRaw, buildXitcoinSignDoc, cosmosSignature, decodeSimulateGasUsed,
-  decodeSubmitAttestation, decodeXitcoinTransaction, encodeSimulateRequest, encodeSubmitAttestation, verifyXitcoinSignature,
-  XITCOIN_CHAIN_SCHEMA_COMMIT } from "../src/xitcoin-transaction.js";
+  decodeSubmitAttestation, decodeXitcoinTransaction, encodeSimulateRequest, encodeSubmitAttestation, sameSignedContent, signedContent,
+  verifyXitcoinSignature, XITCOIN_CHAIN_SCHEMA_COMMIT } from "../src/xitcoin-transaction.js";
 
 const vectors = JSON.parse(readFileSync(new URL("./fixtures/xitcoin-chain-vectors.json", import.meta.url), "utf8"));
 const key = (n) => new SigningKey(`0x${n.toString(16).padStart(64, "0")}`);
@@ -131,4 +131,30 @@ test("simulation uses an empty signature and its gas is read from GasInfo.gas_us
   assert.equal(decodeSimulateGasUsed(response), 1529n);
   assert.throws(() => decodeSimulateGasUsed(Buffer.from([0x0a, 0x02, 0x08, 0x01])), failure); // no gas used
   assert.throws(() => decodeSimulateGasUsed(Buffer.from([0x0a, 0x03, 0x18, 0x01, 0x00])), failure);
+});
+
+test("re-encodings of the same signed content are recognised; any other signed content is not", () => {
+  const t = vectors.transactions[1];
+  const { doc, signature } = build(t);
+  const ours = signedContent(t.txRaw);
+  assert.deepEqual(ours, { bodyHex: hex(doc.bodyBytes), authInfoHex: hex(doc.authInfoBytes), signatureRs: hex(signature.subarray(0, 64)) });
+  const tagged = (tag, bytes) => Buffer.concat([tag, varint(bytes.length), bytes]);
+  const raw = (sig, { prefix = Buffer.alloc(0), bodyTag = Buffer.from([0x0a]) } = {}) => hex(Buffer.concat([prefix,
+    tagged(bodyTag, doc.bodyBytes), tagged(Buffer.from([0x12]), doc.authInfoBytes), tagged(Buffer.from([0x1a]), sig)]));
+  const rs = signature.subarray(0, 64);
+  // What pos-chain's verifier and the SDK decoder accept for the same content:
+  // any 65th byte, a 64-byte R || S, a repeated body field (the last wins) and
+  // an overlong field tag. Each is another TxRaw with another hash.
+  for (const variant of [raw(Buffer.concat([rs, Buffer.from([27])])), raw(Buffer.concat([rs, Buffer.from([255])])), raw(rs),
+    raw(signature, { prefix: tagged(Buffer.from([0x0a]), Buffer.from("other body")) }), raw(signature, { bodyTag: Buffer.from([0x8a, 0x00]) })]) {
+    assert.notEqual(variant, t.txRaw);
+    assert.equal(sameSignedContent(signedContent(variant), ours), true, variant.slice(0, 20));
+  }
+  const otherS = Buffer.from(signature); otherS[40] ^= 1;
+  for (const other of [raw(otherS), raw(Buffer.concat([signature, signature])), raw(signature.subarray(0, 63)),
+    hex(Buffer.concat([tagged(Buffer.from([0x0a]), Buffer.from("x")), tagged(Buffer.from([0x12]), doc.authInfoBytes), tagged(Buffer.from([0x1a]), signature)])),
+    hex(Buffer.concat([Buffer.from(t.txRaw.slice(2), "hex"), tagged(Buffer.from([0x1a]), signature)])), // two signatures
+    hex(Buffer.concat([Buffer.from(t.txRaw.slice(2), "hex"), Buffer.from([0x20, 0x01])])), "0x", "0x00"]) {
+    assert.equal(sameSignedContent(signedContent(other), ours), false, other.slice(0, 20));
+  }
 });

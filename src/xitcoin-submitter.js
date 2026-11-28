@@ -20,7 +20,7 @@ import { validateXitcoinTestnetManifest } from "./submitter-manifest.js";
 import { CronosFinalizedWatcher } from "./watchers.js";
 import { XitcoinRpcDisagreement, XitcoinRpcInvalid, XitcoinRpcQuorum } from "./xitcoin-rpc.js";
 import { XITCOIN_TESTNET_CHAIN_ID, accountOfPublicKey, assembleSimulationTx, assembleTxRaw, buildXitcoinSignDoc, cosmosSignature,
-  decodeXitcoinTransaction, encodeSubmitAttestation, verifyXitcoinSignature } from "./xitcoin-transaction.js";
+  decodeXitcoinTransaction, encodeSubmitAttestation, sameSignedContent, signedContent, verifyXitcoinSignature } from "./xitcoin-transaction.js";
 
 // Xitcoin testnet (xitcoin-testnet-v2-1) destination adapter for the durable
 // engine: one signed Cosmos transaction carrying MsgSubmitAttestation per
@@ -36,6 +36,10 @@ const wait = (code) => ({ action: "wait", code });
 const defer = (code) => ({ action: "wait", code, defer: true });
 const unavailable = (code) => new SubmissionUnavailable(code);
 const UNREACHABLE = Symbol("unreachable");
+// A transaction whose block is this many blocks deep and that a strict
+// majority of origins still does not return from its transaction index is no
+// longer indexing lag: its result is settled from consensus state only.
+const INDEX_LAG_BLOCKS = 100;
 const max = (values) => values.reduce((a, b) => (b > a ? b : a));
 const min = (values) => values.reduce((a, b) => (b < a ? b : a));
 const sorted = (values) => values.map((value) => value.toLowerCase()).sort();
@@ -171,6 +175,32 @@ export function createXitcoinAdapter({ manifest, rpc, signer, verifySource }) {
     return decoded;
   }
 
+  // The value a strict majority of origins returns identically for a
+  // transaction lookup (absent and failing answers never count). With two
+  // origins that is both; with three, two. Null without such a majority.
+  function majorityValue(answers) {
+    const counts = new Map();
+    for (const answer of answers) {
+      if (!answer.ok || answer.value === null) continue;
+      const key = stable(answer.value);
+      counts.set(key, { value: answer.value, count: (counts.get(key)?.count ?? 0) + 1 });
+    }
+    const best = [...counts.values()].sort((a, b) => b.count - a.count)[0];
+    return best && best.count >= rpc.majoritySize ? best.value : null;
+  }
+
+  // Whether the stored transaction's fee would be admitted now: its price per
+  // gas covers the base fee and the minimum gas price that a strict majority of
+  // origins report (the highest of them). Only decides send or wait.
+  async function admissibleFee(decoded) {
+    const gas = BigInt(decoded.gasLimit), fee = BigInt(decoded.feeAmount) * 10n ** 18n;
+    for (const market of await rpc.feeMarketsMajority()) {
+      const base = market.noBaseFee ? 0n : market.baseFee;
+      if (fee < base * gas || fee < market.minGasPrice * gas) return false;
+    }
+    return true;
+  }
+
   // The attestation on every origin. Returns { absent }, { processed: record },
   // { withoutRecord } or { unsettled } (origins differ, for example a lagging
   // node), or { mismatch } when ANY origin returns a record whose approved
@@ -273,6 +303,131 @@ export function createXitcoinAdapter({ manifest, rpc, signer, verifySource }) {
     return causes.find(([, holds]) => holds(states[0]) && holds(states[1]))?.[0] ?? null;
   }
 
+  // Our sequence is unused: our signed content is pending, was dropped or
+  // evicted, or failed in the ante handler (for example a fee below a risen
+  // base fee). The signed bytes stay valid for anyone, so this is never a
+  // persisted halt: the identical bytes are resent only when nothing carrying
+  // them is in flight and they would be admitted now, and otherwise it waits.
+  async function notConsumed(row, request, approvals, ours, decoded) {
+    const mempools = await rpc.mempools();
+    if (mempools.some((mempool) => mempool.txs.some((tx) => sameSignedContent(signedContent(tx), ours)))) return { action: "pending" };
+    // A mempool listing that is not complete cannot prove the transaction gone.
+    if (mempools.some((mempool) => !mempool.complete)) return { action: "pending" };
+    const route = await routeState();
+    if (!route.usable) return wait("route_paused");
+    const state = await attestationState(request, approvals);
+    if (state.mismatch) return halt("processed_with_mismatching_record");
+    if (state.unsettled) return { action: "pending" };
+    // Resend also when another transaction already processed the attestation or
+    // the deadline passed, so the reserved sequence is consumed (the observation
+    // then records released_elsewhere or expired).
+    if (!await admissibleFee(decoded)) return wait("fee_below_required");
+    if (row.broadcastAttempts >= x.maxBroadcastAttempts) return wait("broadcast_attempts_exhausted");
+    return { action: "rebroadcast" };
+  }
+
+  // Our sequence is consumed. Find the transaction that consumed it and decide
+  // from evidence a strict majority of origins returns identically (every
+  // origin for state and blocks), never from one origin's transaction result.
+  async function consumed(row, request, approvals, ours, tip) {
+    const nonceEvent = `${submitter}/${row.nonce}`;
+    let inclusion = null;
+    const exact = majorityValue(await rpc.txSettled(row.transactionHash));
+    if (exact && exact.accountSequences.includes(nonceEvent)) {
+      inclusion = { hash: row.transactionHash, result: exact, block: await rpc.block(exact.height) };
+    } else {
+      // The block whose committed state first shows our sequence consumed
+      // (height-pinned reads on every origin), and in it a transaction
+      // carrying our signed content: our bytes or a re-encoding of them.
+      const consumedAt = await sequenceConsumedAt(row.nonce, tip);
+      if (consumedAt === undefined) return { action: "pending" }; // not yet at every origin's height
+      if (consumedAt === null) return consumedBeforeWindow(row, request, approvals);
+      const block = await rpc.block(consumedAt);
+      const candidates = block.txs.flatMap((tx, index) => (sameSignedContent(signedContent(tx), ours) ? [block.txHashes[index]] : []));
+      if (!candidates.length) return halt("nonce_consumed_without_inclusion");
+      for (const hash of candidates) {
+        const result = majorityValue(await rpc.txSettled(hash));
+        if (result && result.height === consumedAt && result.accountSequences.includes(nonceEvent)) {
+          inclusion = { hash, result, block };
+          break;
+        }
+      }
+      if (!inclusion) {
+        // Recent: the transaction index lags behind commits.
+        if (consumedAt > tip - INDEX_LAG_BLOCKS) return { action: "pending" };
+        // Older history whose results no strict majority serves: settle from
+        // consensus state only (a record naming our signed content and
+        // approval), otherwise a persistent non-blocking alert.
+        if (consumedAt + x.confirmations > tip) return { action: "pending" };
+        const state = await attestationState(request, approvals);
+        if (state.mismatch) return halt("processed_with_mismatching_record");
+        if (state.unsettled) return { action: "pending" };
+        const record = state.processed;
+        if (record && candidates.includes(lower(record.txHash)) && record.height === consumedAt
+            && recordMatches(record, request, approvals, { exact: true })) {
+          return ownInclusion(row, lower(record.txHash), { blockNumber: consumedAt, blockHash: block.hash });
+        }
+        if (record && !candidates.includes(lower(record.txHash))) {
+          const evidence = await releasedElsewhere(record);
+          if (evidence.final) return released(evidence);
+        }
+        return { action: "release_unverified", code: "inclusion_history_unserved", blockNumber: consumedAt, blockHash: block.hash };
+      }
+    }
+    const { hash, result, block } = inclusion;
+    if (!block.txHashes.includes(hash)) throw new XitcoinRpcDisagreement();
+    if (result.height + x.confirmations > tip) return { action: "pending" };
+    const position = { blockNumber: result.height, blockHash: block.hash };
+    const state = await attestationState(request, approvals);
+    if (state.mismatch) return halt("processed_with_mismatching_record");
+    if (state.unsettled) return { action: "pending" };
+    if (result.code === 0) {
+      // Our signed content executed: the record must name that transaction and
+      // our exact approval.
+      if (!state.processed || lower(state.processed.txHash) !== hash || state.processed.height !== result.height
+          || !recordMatches(state.processed, request, approvals, { exact: true })) return halt("record_mismatch_after_success");
+      return ownInclusion(row, hash, position);
+    }
+    // Our signed content failed in its message after consuming our sequence.
+    if (state.processed) {
+      if (lower(state.processed.txHash) === hash) return halt("record_names_failed_transaction");
+      // Another transaction processed the attestation first (for example a
+      // copy of our pending message): not a failure.
+      const evidence = await releasedElsewhere(state.processed);
+      return evidence.final ? released(evidence) : { action: "pending" };
+    }
+    if (state.withoutRecord) return { action: "release_unverified", code: "processed_without_record", ...position };
+    // Committed after the approval deadline (agreed block time): expired; our
+    // sequence is consumed and the queue moves on.
+    if (block.time > request.deadlineUnix) return { action: "expired", ...position };
+    const cause = await lastingFailureCause(request, approvals, { height: result.height, gasUsed: result.gasUsed,
+      gasWanted: result.gasWanted }, block.time, tip);
+    if (cause === UNREACHABLE) return { action: "release_unverified", code: "failure_history_unserved", ...position };
+    return cause ? { action: "reverted", code: cause, ...position } : { action: "failed", ...position };
+  }
+
+  // Our own bytes are finalized; a re-encoding of our signed content (another
+  // hash) is recorded as a release by that transaction, so RelayStore names
+  // the transaction that actually executed.
+  function ownInclusion(row, hash, position) {
+    return hash === row.transactionHash ? { action: "finalized", ...position }
+      : { action: "released_elsewhere", releaseHash: hash, ...position };
+  }
+
+  // Consumed before the searched window: complete only on a record naming our
+  // own transaction and approval in a block every origin still serves.
+  async function consumedBeforeWindow(row, request, approvals) {
+    const state = await attestationState(request, approvals);
+    if (state.mismatch) return halt("processed_with_mismatching_record");
+    const record = state.processed;
+    if (record && lower(record.txHash) === row.transactionHash && recordMatches(record, request, approvals, { exact: true })) {
+      const block = await rpc.block(record.height);
+      if (!block.txHashes.includes(row.transactionHash)) throw new XitcoinRpcDisagreement();
+      return { action: "finalized", blockNumber: record.height, blockHash: block.hash };
+    }
+    return halt("nonce_consumed_without_inclusion");
+  }
+
   return Object.freeze({
     destination: "xitcoin",
     maxBroadcastAttempts: x.maxBroadcastAttempts,
@@ -364,16 +519,20 @@ export function createXitcoinAdapter({ manifest, rpc, signer, verifySource }) {
     },
 
     async beforeFirstSend({ row, request, approvals, nowUnix }) {
-      await parseStored(row, request, approvals);
+      const decoded = await parseStored(row, request, approvals);
       // Once the local clock says the approval margin is lost, the stored bytes
       // are sent even if origins fail: sending our own committed bytes is never
       // unsafe, and no origin fault can keep their reserved sequence unused. A
-      // pause that a strict majority reports is still honoured.
+      // pause or a fee below the base fee that a strict majority reports is
+      // still honoured (a send that would not be admitted spends an attempt).
       if (request.deadlineUnix < nowUnix + margin) {
-        let paused = false;
-        try { const route = (await rpc.routeMajority(routeId)).value; paused = route.paused || !route.enabled; }
-        catch { paused = false; } // reads failed: send blind
-        return paused ? wait("route_paused") : { action: "send" };
+        let hold = null;
+        try {
+          const route = (await rpc.routeMajority(routeId)).value;
+          if (route.paused || !route.enabled) hold = "route_paused";
+          else if (!await admissibleFee(decoded)) hold = "fee_below_required";
+        } catch { hold = null; } // reads failed: send blind
+        return hold ? wait(hold) : { action: "send" };
       }
       // Strict-majority reads only decide whether to send or wait; a persisted
       // halt still needs every origin to agree.
@@ -385,6 +544,7 @@ export function createXitcoinAdapter({ manifest, rpc, signer, verifySource }) {
       } else if (account.value.sequence !== row.nonce) return wait("account_sequence_unsettled");
       const route = (await rpc.routeMajority(routeId)).value;
       if (route.paused || !route.enabled) return wait("route_paused");
+      if (!await admissibleFee(decoded)) return wait("fee_below_required");
       // Processed by another transaction after our bytes were committed: send
       // them once anyway so their reserved sequence is consumed; the
       // observation then records the release or a mismatch halt.
@@ -400,108 +560,17 @@ export function createXitcoinAdapter({ manifest, rpc, signer, verifySource }) {
 
     async observe({ row, request, approvals }) {
       await rpc.chainId();
-      await parseStored(row, request, approvals);
+      const decoded = await parseStored(row, request, approvals);
+      const ours = signedContent(row.signedHex);
       const tip = await rpc.tip();
-      const lookups = await rpc.txSettled(row.transactionHash);
-      const present = lookups.filter((answer) => answer.ok && answer.value !== null).map((answer) => answer.value);
-      if (!present.length) {
-        const failure = lookups.find((answer) => !answer.ok);
-        if (failure) throw failure.error;
-        const mempools = await rpc.mempools();
-        if (mempools.some((mempool) => mempool.hashes.includes(row.transactionHash))) return { action: "pending" };
-        // Re-observe before every halt: the transaction may have been committed
-        // and indexed between the reads above and below.
-        const visible = async () => {
-          const [again, pools] = await Promise.all([rpc.txSettled(row.transactionHash), rpc.mempools()]);
-          return again.some((answer) => answer.ok && answer.value !== null)
-            || pools.some((mempool) => mempool.hashes.includes(row.transactionHash));
-        };
-        const sequence = await sequences();
-        if (sequence === null) return { action: "pending" };
-        if (sequence > row.nonce) {
-          if (await visible()) return { action: "pending" };
-          // The transaction index lags behind commits. Find the block in which
-          // our sequence was consumed, from height-pinned state, and look for
-          // our transaction in that block's consensus data instead.
-          const consumedAt = await sequenceConsumedAt(row.nonce, tip);
-          if (consumedAt === undefined) return { action: "pending" }; // not yet at every origin's height
-          if (consumedAt === null) return halt("nonce_consumed_without_inclusion");
-          return (await rpc.block(consumedAt)).txHashes.includes(row.transactionHash)
-            ? { action: "pending" } : halt("nonce_consumed_without_inclusion");
-        }
-        if (sequence < row.nonce) return halt("account_sequence_regressed");
-        // A mempool listing that is not complete cannot prove the transaction gone.
-        if (mempools.some((mempool) => !mempool.complete)) return { action: "pending" };
-        const route = await routeState();
-        if (!route.usable) return wait("route_paused");
-        const state = await attestationState(request, approvals);
-        if (state.mismatch) return halt("processed_with_mismatching_record");
-        if (state.unsettled) return { action: "pending" };
-        // Unknown everywhere with our sequence unused: resend the identical
-        // bytes, also when another transaction already processed the
-        // attestation or the deadline passed, so the reserved sequence is
-        // consumed (the observation then records released_elsewhere or expired).
-        if (row.broadcastAttempts >= x.maxBroadcastAttempts) return halt("broadcast_attempts_exhausted");
-        return { action: "rebroadcast" };
-      }
-      if (present.some((tx) => stable(tx) !== stable(present[0]))) throw new XitcoinRpcDisagreement();
-      const included = present[0];
-      if (included.txHex !== row.signedHex) throw new XitcoinRpcDisagreement();
-      if (present.length !== lookups.length) {
-        // Missing on some origins: indexing lag for recent blocks; older history
-        // an origin explicitly no longer serves is settled from consensus state
-        // (the attestation record) below, or becomes a non-blocking alert.
-        const failure = lookups.find((answer) => !answer.ok && !answer.explicit);
-        if (failure) throw failure.error;
-        if (included.height >= tip - x.historyBlocks) return { action: "pending" };
-      }
-      if (included.height + x.confirmations > tip) return { action: "pending" };
-      // The block itself must be served identically by every origin (retention
-      // requirement); otherwise the observation is retried.
-      const block = await rpc.block(included.height);
-      if (!block.txHashes.includes(row.transactionHash)) throw new XitcoinRpcDisagreement();
-      const inclusion = { blockNumber: included.height, blockHash: block.hash };
-      const state = await attestationState(request, approvals);
-      if (state.mismatch) return halt("processed_with_mismatching_record");
-      if (state.unsettled) return { action: "pending" };
-      if (included.code === 0) {
-        // Our transaction executed: the record must name it and our exact approval.
-        if (!state.processed || lower(state.processed.txHash) !== row.transactionHash || state.processed.height !== included.height
-            || !recordMatches(state.processed, request, approvals, { exact: true })) return halt("record_mismatch_after_success");
-        return { action: "finalized", ...inclusion };
-      }
-      // Our transaction failed. A failure in the message (the usual case) ran
-      // the ante handler, which consumed our sequence and reported it as the
-      // `acc_seq` event identically on every origin. A failure in the ante
-      // handler itself (for example a fee below a risen base fee) leaves the
-      // sequence unused: then the identical bytes may be sent again.
       const sequence = await sequences();
-      if (sequence === null) return { action: "pending" };
+      if (sequence === null) return { action: "pending" }; // propagation lag
       if (sequence < row.nonce) return halt("account_sequence_regressed");
-      const consumed = included.accountSequences.includes(`${submitter}/${row.nonce}`);
-      if (!consumed) {
-        if (sequence > row.nonce) return halt("nonce_consumed_without_inclusion");
-        if (row.broadcastAttempts >= x.maxBroadcastAttempts) return halt("broadcast_attempts_exhausted");
-        return { action: "rebroadcast" };
-      }
-      if (sequence === row.nonce) return { action: "pending" }; // state behind the indexer
-      if (state.processed) {
-        if (lower(state.processed.txHash) === row.transactionHash) return halt("record_names_failed_transaction");
-        // Another transaction processed the attestation first (for example a
-        // copy of our pending message): not a failure.
-        const evidence = await releasedElsewhere(state.processed);
-        return evidence.final ? released(evidence) : { action: "pending" };
-      }
-      if (state.withoutRecord) return { action: "release_unverified", code: "processed_without_record", ...inclusion };
-      // Committed after the approval deadline (agreed block time): expired; our
-      // sequence is consumed and the queue moves on.
-      if (block.time > request.deadlineUnix) return { action: "expired", ...inclusion };
-      const cause = await lastingFailureCause(request, approvals, { height: included.height, gasUsed: included.gasUsed,
-        gasWanted: included.gasWanted }, block.time, tip);
-      if (cause === UNREACHABLE) return { action: "release_unverified", code: "failure_history_unserved", ...inclusion };
-      return cause ? { action: "reverted", code: cause, ...inclusion } : { action: "failed", ...inclusion };
+      if (sequence === row.nonce) return notConsumed(row, request, approvals, ours, decoded);
+      return consumed(row, request, approvals, ours, tip);
     },
   });
+
 }
 
 export function xitcoinLedgerBinding(manifest) {

@@ -316,6 +316,9 @@ test("Xitcoin testnet mode requires every pinned value and rejects mainnet, the 
     { rpcUrl: "http://127.0.0.1:26657", restUrl: "http://127.0.0.1:1317" }, { rpcUrl: "http://127.0.0.1:26658", restUrl: "http://127.0.0.1:1318" }] }))
     .xitcoin.allowLoopbackHttp, true);
   assert.throws(() => validateXitcoinTestnetManifest(xitcoinTestnet({ xitcoinChainId: "xitcoin" })), /mainnet is not supported/);
+  // Fee headroom is mandatory: without it the first base-fee rise evicts our transaction.
+  assert.equal(validateXitcoinTestnetManifest(xitcoinTestnet({}, { feeMultiplierPercent: 150 })).xitcoin.feeMultiplierPercent, 150);
+  assert.throws(() => validateXitcoinTestnetManifest(xitcoinTestnet({}, { feeMultiplierPercent: 100 })));
   const top = [{ destination: "cronos" }, { mode: "live" }, { mode: "disabled" }, { cronosChainId: 25 }, { version: 2 },
     { routeId: "cronos-testnet-xitcoin-testnet" }, { routeId: "0x21121C16B53A726056A6683F00C7EB4DA5501CE8A2ABC8A4677E06F1E94B5CD9" },
     { xitcoinChainId: "xitcoin-testnet-v2-2" }, { releaseCommit: "main" }, { cycleIntervalMs: 999 }, { relayStorePath: "relative.sqlite" },
@@ -333,7 +336,7 @@ test("Xitcoin testnet mode requires every pinned value and rejects mainnet, the 
     { submitter: "xtc1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqca63ah" }, { submitter: "XTC1PVXGDTNCV9TTGHCDRP89UZHYHACU5L6R42AHD9" },
     { submitter: "cosmos1pvxgdtncv9ttghcdrp89uzhyhacu5l6r42ahd9" }, { submitter: "xtc1pvxgdtncv9ttghcdrp89uzhyhacu5l6r42ahd8" },
     { confirmations: 0 }, { confirmations: 1_001 }, { historyBlocks: 999 }, { maxAmount: "0" }, { maxGas: "99999" }, { maxGas: "5000001" },
-    { maxGas: 600000 }, { gasAdjustmentPercent: 109 }, { gasAdjustmentPercent: 301 }, { gasHeadroom: 9_999 }, { feeMultiplierPercent: 99 },
+    { maxGas: 600000 }, { gasAdjustmentPercent: 109 }, { gasAdjustmentPercent: 301 }, { gasHeadroom: 9_999 }, { feeMultiplierPercent: 99 }, { feeMultiplierPercent: 100 }, { feeMultiplierPercent: 149 },
     { feeMultiplierPercent: 1_001 }, { maxGasPrice: "0" }, { maxGasPrice: "1000000000000001" }, { maxFee: "0" },
     { minDeadlineMarginSeconds: 29 }, { maxBroadcastAttempts: 33 }, { extra: 1 }, { privateKey: "0x1" }, { allowLoopbackHttp: "false" }];
   const cronos = [{ rpcUrls: ["https://a.example"] }, { vault: "0x1c94273c0b199b139d82da3786c9ecbe189d5919" },

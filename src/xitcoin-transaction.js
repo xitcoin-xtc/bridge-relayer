@@ -260,6 +260,54 @@ export function decodeXitcoinTransaction(signedHex) {
   } catch { throw failure(); }
 }
 
+// The signed content of a transaction as the chain reads it: the last
+// body_bytes and auth_info_bytes fields and R || S of a single 64- or 65-byte
+// signature. pos-chain's eth_secp256k1 verifier (crypto/ethsecp256k1,
+// verifySignatureECDSA) drops a 65th byte without checking it and also accepts
+// 64-byte R || S, and the SDK's TxRaw decoder accepts a repeated body_bytes or
+// auth_info_bytes field (the last wins) and overlong field tags. So anyone who
+// sees our broadcast bytes can re-wrap the same signed content into another
+// TxRaw with another hash, which spends our sequence and fee exactly as ours
+// would. Our inclusion is therefore recognised by signed content, never only
+// by hash. Returns null for anything that cannot carry exactly one signature.
+export function signedContent(tx) {
+  try {
+    const raw = typeof tx === "string" ? unhex(tx) : tx;
+    if (!Buffer.isBuffer(raw) || !raw.length || raw.length > 1_048_576) return null;
+    let offset = 0, body = null, auth = null;
+    const signatures = [];
+    const readVarint = () => {
+      let value = 0n, shift = 0n;
+      for (;;) {
+        if (offset >= raw.length || shift > 63n) throw failure();
+        const byte = raw[offset++];
+        value |= BigInt(byte & 127) << shift;
+        if (!(byte & 128)) return value;
+        shift += 7n;
+      }
+    };
+    while (offset < raw.length) {
+      const key = readVarint();
+      if ((key & 7n) !== 2n) return null;
+      const length = Number(readVarint());
+      if (offset + length > raw.length) return null;
+      const value = raw.subarray(offset, offset + length);
+      offset += length;
+      const field = key >> 3n;
+      if (field === 1n) body = value;
+      else if (field === 2n) auth = value;
+      else if (field === 3n) signatures.push(value);
+      else return null;
+    }
+    if (!body || !auth || signatures.length !== 1 || ![64, 65].includes(signatures[0].length)) return null;
+    return Object.freeze({ bodyHex: hex(body), authInfoHex: hex(auth), signatureRs: hex(signatures[0].subarray(0, 64)) });
+  } catch { return null; }
+}
+
+export function sameSignedContent(a, b) {
+  return a !== null && b !== null && a.bodyHex === b.bodyHex && a.authInfoHex === b.authInfoHex && a.signatureRs === b.signatureRs;
+}
+
 // The compressed key's EVM address in Xitcoin bech32 form.
 export function accountOfPublicKey(publicKey) {
   return evmAddressToBech32(computeAddress(hex(compressedPublicKey(publicKey))));

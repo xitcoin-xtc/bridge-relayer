@@ -26,6 +26,7 @@ test("CometBFT status, block time and blocks are read only in their canonical fo
   const block = { block_id: { hash: "CD".repeat(32) }, block: { header: { chain_id: "xitcoin-testnet-v2-1", height: "7",
     time: "2026-11-28T09:28:41Z" }, data: { txs: [tx.toString("base64")] } } };
   assert.deepEqual(normalizeBlock(block, 7).txHashes, [`0x${createHash("sha256").update(tx).digest("hex")}`]);
+  assert.deepEqual(normalizeBlock(block, 7).txs, [`0x${tx.toString("hex")}`]);
   assert.throws(() => normalizeBlock(block, 8), invalid);
   assert.throws(() => normalizeBlock({ ...block, block: { ...block.block, data: { txs: ["not base64!"] } } }, 7), invalid);
 });
@@ -47,7 +48,11 @@ test("transaction lookups are explicit about absence and bind the bytes to the h
     { txs: [{ ...found.txs[0], tx_result: { ...found.txs[0].tx_result, code: -1 } }], total_count: "1" }]) {
     assert.throws(() => normalizeTxSearch(bad, hash), invalid);
   }
-  assert.deepEqual(normalizeMempool({ n_txs: "0", total: "0", total_bytes: "0", txs: null }), { complete: true, hashes: [] });
+  assert.deepEqual(normalizeMempool({ n_txs: "0", total: "0", total_bytes: "0", txs: null }), { complete: true, hashes: [], txs: [] });
+  // Mempool and block transactions keep their bytes so that our signed content
+  // can be recognised in any re-encoding.
+  assert.deepEqual(normalizeMempool({ n_txs: "1", total: "1", total_bytes: "0", txs: [bytes.toString("base64")] }).txs,
+    [`0x${bytes.toString("hex")}`]);
   assert.equal(normalizeMempool({ n_txs: "1", total: "5", total_bytes: "0", txs: [bytes.toString("base64")] }).complete, false);
   assert.throws(() => normalizeMempool({ n_txs: "2", total: "2", txs: [bytes.toString("base64")] }), invalid);
   assert.deepEqual(normalizeSimulation({ response: { code: 6, log: "failed" } }), { failed: true });

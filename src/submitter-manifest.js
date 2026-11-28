@@ -194,7 +194,10 @@ export function validateXitcoinTestnetManifest(input) {
       gasAdjustmentPercent: integer(xitcoin.gasAdjustmentPercent, 110, 300),
       gasHeadroom: integer(xitcoin.gasHeadroom, 10_000, 1_000_000),
       // Price per gas = ceil(max(base fee, min gas price) * feeMultiplierPercent / 100), in axtc.
-      feeMultiplierPercent: integer(xitcoin.feeMultiplierPercent, 100, 1_000),
+      // At least 150: the base fee may rise 12.5% per full block between
+      // signing and execution, and a fee without headroom is evicted or
+      // rejected by the ante handler at the first rise.
+      feeMultiplierPercent: integer(xitcoin.feeMultiplierPercent, 150, 1_000),
       maxGasPrice, maxFee,
       minDeadlineMarginSeconds: integer(xitcoin.minDeadlineMarginSeconds, 30, 3_600),
       maxBroadcastAttempts: integer(xitcoin.maxBroadcastAttempts, 1, 32),
