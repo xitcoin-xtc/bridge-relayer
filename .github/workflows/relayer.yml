@@ -27,6 +27,11 @@ jobs:
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
+      # anvil and forge for the mandatory local-EVM Cronos submitter tests.
+      - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
+        with:
+          version: v1.8.5
+          cache: false
       - run: npm ci
       - run: npm run check
       - run: npm test

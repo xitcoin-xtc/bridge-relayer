@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/xitcoin-xtc/contracts",
+  "compiler": { "solc": "0.8.30", "optimizerRuns": 200, "evmVersion": "paris", "openzeppelin": "5.4.0" },
+  "files": [
+    { "path": "vault-testnet/CronosBridgeVault.sol", "commit": "d3ae7058d4c6697a9ec079864e1891b661de5b3e",
+      "source": "contracts/cronos/bridge/CronosBridgeVault.sol", "blob": "5d564594c613adc03d7bf91ddd5cba80798ef86a",
+      "note": "source recorded for the deployed, paused Cronos testnet vault (deployments/cronos-testnet.json)" },
+    { "path": "vault-main/CronosBridgeVault.sol", "commit": "96ee420b210b0cfe174a6d3c89dab327c274667e",
+      "source": "contracts/cronos/bridge/CronosBridgeVault.sol", "blob": "651873c34c4a3f37bdefd2fe53fd26f3529999f9",
+      "note": "current contracts main: exact release accounting and deposit limits, not deployed on testnet" },
+    { "path": "token/MockERC20.sol", "commit": "96ee420b210b0cfe174a6d3c89dab327c274667e",
+      "source": "contracts/test/MockERC20.sol", "blob": "32e7402c7b930eb8cdc1ecda31e5425396166635",
+      "note": "test-only mintable asset" }
+  ]
+}
