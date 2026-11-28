@@ -75,7 +75,11 @@ CI additionally scans the Git history for secrets (gitleaks, image pinned by
 digest), reviews dependency changes for high and critical advisories, audits
 production dependencies and requires every action to be pinned to a full commit
 SHA and every container image to an `@sha256` digest. Dependabot proposes npm
-and GitHub Actions updates weekly.
+and GitHub Actions updates weekly. A CI job checks out pos-chain at the commit
+pinned in `test/fixtures/xitcoin-chain-vectors.json`, checks the proto fixtures
+and the chain-generated vectors against it (`scripts/check-chain-fixtures.sh`)
+and builds the `xitcoind` binary (cached) that the Xitcoin integration tests
+run against (`XITCOIND_BIN`; locally they are skipped without it).
 
 See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) and
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
@@ -87,10 +91,19 @@ default for both. An explicit `testnet` manifest enables the
 Cronos EVM Testnet chain ID `338` only (mainnet `25` is rejected): pinned vault
 code, route, signer set, account and fee caps; bounded independent RPC reads;
 Xitcoin source finality; and receipt, `Released` event and transaction-input
-verification with finality depth. It is built on a destination-generic
+verification with finality depth. Another explicit `testnet` manifest enables
+the [Xitcoin testnet submitter](docs/SUBMITTERS.md#xitcoin-testnet-submitter)
+for chain ID `xitcoin-testnet-v2-1` only (mainnet `xitcoin` is rejected): one
+signed SIGN_MODE_DIRECT eth_secp256k1 transaction carrying
+`MsgSubmitAttestation` per Cronos deposit, encoded exactly as the chain's own
+Go code encodes it, with the stored route ID, sequence ownership, gas from
+simulation with headroom and bounded fees; bounded independent CometBFT and
+REST reads; Cronos source finality; and completion only on the typed
+attestation record naming our transaction and approval (pos-chain
+`xitcoin-security-hardening-v2`, not yet deployed on testnet). Both are built
+on a destination-generic
 [durable broadcast ledger](docs/SUBMITTERS.md#durable-broadcast-ledger) that
 commits an exclusive claim and the exact signed transaction before any send and
-recovers without ever creating a second transaction. The Xitcoin startup path
-still fails closed until the chain exposes a canonical attestation-status
-query. Nothing here deploys or starts a service; see
+recovers without ever creating a second transaction. Nothing here deploys or
+starts a service; see
 [remaining work](docs/SUBMITTERS.md#remaining-before-the-bridge-can-run-end-to-end).
