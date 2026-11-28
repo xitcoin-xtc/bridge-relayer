@@ -1,5 +1,13 @@
 # Offline Xitcoin ordered direct envelope
 
+Update: the runtime transaction of the
+[Xitcoin testnet submitter](SUBMITTERS.md#xitcoin-testnet-submitter) is built by
+`src/xitcoin-transaction.js`, whose bytes are checked against vectors generated
+by the chain's own Go code (`test/fixtures/xitcoin-chain-vectors.json`) and
+accepted by a real xitcoind node. The offline envelope below is unchanged and
+still not used at runtime; the blockers it lists are closed by that submitter,
+not by this module.
+
 This module is not connected to startup, a signer, a chain endpoint or a
 broadcaster. Every result keeps `mayBroadcast: false` and `finalized: false`.
 It accepts supplied offline account observations and already supplied signatures;

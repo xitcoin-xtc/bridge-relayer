@@ -172,3 +172,19 @@ collection does not submit a transaction to either destination chain.
 ## Destination submission
 
 An approved transfer is checked against the destination replay key before broadcast. Cronos uses `sourceBurnId`; Xitcoin uses `attestationId` (the source-deposit key). A recovered processed record must include a canonical transaction reference. A submission becomes completed only after the finalized receipt/event matches every bound field. RPC disagreement or a mismatched event stops processing.
+
+On Xitcoin the replay state is read with the typed query
+`GET /xitcoin/bridge/v1/attestations/{attestation_id}` (pos-chain
+`xitcoin-security-hardening-v2`). `ATTESTATION_STATE_ABSENT` only means that no
+committed transaction consumed the key at the answering `height`; it never
+proves that no submission is pending, so the submitter decides pending sends
+from its broadcast ledger, CometBFT `tx_search` and mempool lookups and the
+account sequence. `ATTESTATION_STATE_PROCESSED` carries the record of the
+processing transaction (every approved field, the destination chain ID, the
+payload hash, the signing digest, the recovered approvers, the signer set
+version, the block height and the CometBFT transaction hash); the submitter
+completes its own transfer only when that record names its transaction and
+approval, and records a release by another transaction when the approved
+fields match. `ATTESTATION_STATE_PROCESSED_WITHOUT_RECORD` (processed before
+records were kept) is treated as minted but unverified. See
+[SUBMITTERS.md](SUBMITTERS.md#xitcoin-testnet-submitter).

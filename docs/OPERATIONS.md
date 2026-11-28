@@ -181,9 +181,10 @@ activation.
 ## Runtime composition
 
 - Keep the coordinator, three signers and two destination submitters under six
-  distinct operating-system identities. The Cronos submitter additionally needs
+  distinct operating-system identities. Each submitter additionally needs
   reviewed write access to the coordinator RelayStore for the `approved ->
-  submitted -> completed` transitions of outbound transfers.
+  submitted -> completed` transitions of its direction (outbound transfers for
+  the Cronos submitter, inbound transfers for the Xitcoin submitter).
 - Require at least two independent HTTPS RPC origins for each chain and reject
   credentials embedded in URLs.
 - A critical watcher, approval or submission worker failure halts the runtime;
@@ -212,8 +213,8 @@ Never manually retry an approved or submitted transfer. The submission helper
 can resume a persisted transaction reference or a canonically processed record.
 The [durable broadcast ledger](SUBMITTERS.md#durable-broadcast-ledger) persists
 exact signed bytes before any send and recovers ambiguous broadcasts by
-observation or by resending only those identical bytes. The Cronos testnet
-submitter uses it; the Xitcoin startup path still fails closed. Never delete,
+observation or by resending only those identical bytes. Both testnet
+submitters use it. Never delete,
 copy between hosts or restore an old copy of a broadcast ledger: like a signer
 journal, it is what prevents a second transaction. Back it up like a key. A
 `failed` or `halted` ledger row stops the submitter until an offline review; no
@@ -333,6 +334,53 @@ Resolve, by owner decision and without touching the broadcast ledger:
   then refuses it) and that no signer will approve the old burn ID again, so
   the burn can never be released twice. Neither path is automated in this
   release; both need owner approval.
+
+## Xitcoin testnet submitter
+
+- Run it only from a root-owned `testnet` manifest pinned to chain ID
+  `xitcoin-testnet-v2-1`, the stored route ID, the signer set and version, the
+  chain schema commit of this release and a dedicated submitter account used by
+  no other program, Cosmos or EVM (an EVM transaction from the same key uses
+  the same sequence and halts the submitter).
+- It needs pos-chain `xitcoin-security-hardening-v2` on the chain: without the
+  typed attestation query it never passes a cycle (temporary stop).
+- Keep the submitter key in an encrypted keystore owned by the submitter
+  identity; pass its password only as the encrypted systemd credential
+  `keystore-password` (`ops/systemd/xitcoin-bridge-submitter-xitcoin-testnet.service`).
+- Give each Xitcoin origin a CometBFT RPC and a REST endpoint of the same
+  independent operator, through reviewed loopback tunnels; three or more
+  operators in production. Every origin must run the `kv` transaction indexer
+  and serve state, blocks and the index for at least `historyBlocks` recent
+  blocks plus the maximum expected downtime. A lagging or catching-up origin,
+  a disagreement or a transport failure is a temporary stop (`temporarily_stopped`).
+- Set `maxGasPrice`, `feeMultiplierPercent` and `maxFee` from the testnet fee
+  market. The fee multiplier keeps the fee above base-fee rises between mempool
+  admission and execution: a transaction whose fee falls below the base fee at
+  execution fails in the ante handler without consuming its sequence and
+  usually ends `broadcast_attempts_exhausted` (blocking), because nodes refuse
+  to readmit identical bytes they have already seen committed.
+- A paused or disabled route, a fee above the cap or an insufficient balance
+  makes it wait without claiming anything. An approval too close to its
+  deadline, an amount above the limits, an exhausted daily limit, a reached
+  outstanding cap or a failing simulation defers that transfer while the next
+  ones proceed.
+- A deposit processed by another account (for example a copy of our pending
+  message) is recorded as `released_elsewhere`; RelayStore `release_ref` names
+  that transaction. A processing record whose approved fields differ halts
+  (`processed_with_mismatching_record`): pause the route and start incident
+  response.
+- `expired`, `reverted` and `release_unverified` rows are reviewed as in
+  [Reviewing non-blocking rows](#reviewing-non-blocking-rows) (as the
+  `xitcoin-bridge-submitter-xitcoin` user),
+  with the Xitcoin reads: the attestation query (status and record), CometBFT
+  `tx_search` for the row's `transaction_hash`, the block at `block_number`,
+  and route, daily usage and outstanding state at `block_number - 1` and
+  `block_number` (header `x-cosmos-block-height`). Reason codes:
+  `route_paused`, `signer_set_rotated`, `transfer_limit_exceeded`,
+  `daily_limit_exhausted`, `outstanding_limit_reached` (`reverted`);
+  `processed_without_record`, `failure_history_unserved` (`release_unverified`).
+- Logs contain only stable codes, transfer IDs (attestation IDs) and
+  transaction hashes.
 
 ## Testnet preflight
 
