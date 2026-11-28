@@ -359,10 +359,17 @@ Resolve, by owner decision and without touching the broadcast ledger:
   evicted or rejected for its fee leaves the sequence unused: the submitter
   waits (`fee_below_required`) and resends the identical bytes once they would
   be admitted. Keep CometBFT's default `keep-invalid-txs-in-cache = false` on
-  every origin so that rejected bytes can be readmitted. With every attempt
-  spent the row waits (`broadcast_attempts_exhausted` in the cycle log) and
-  holds the queue without a persisted halt: review it; the bytes remain valid
-  and the ledger must not be edited.
+  every origin so that rejected bytes can be readmitted. Resends back off from
+  one minute, doubling, up to `maxResendIntervalSeconds`, and are never capped.
+  A row that stays unfinished longer than `stalledAlertSeconds` after signing
+  is reported as `stalled` in every cycle's `attention` (also after restarts)
+  while it holds the queue: investigate the fee market and the origins'
+  mempools; the bytes remain valid, nothing new is ever signed for the
+  transfer, and the ledger must not be edited.
+- The broadcast ledger is schema version 2. A version 1 ledger (created by an
+  earlier release) is migrated forward automatically on the first open, only
+  when its schema and binding are exact; back it up before upgrading, like any
+  ledger, and never restore a version 1 copy over a migrated one.
 - Anyone who has seen our bytes can re-wrap the same signed content with
   another signature encoding (the chain's eth_secp256k1 verifier ignores the
   65th byte and accepts 64-byte signatures). Such a copy that lands first is
