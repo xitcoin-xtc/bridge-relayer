@@ -22,7 +22,7 @@ const bindings = {
 const owner = (n) => n.toString(16).padStart(32, "0");
 const bytes = (seed) => `0x${Buffer.from(`synthetic signed transaction ${seed}`).toString("hex")}`;
 const signed = (transferId, nonce, seed = transferId) => ({ transferId, nonce, signedHex: bytes(seed), transactionHash: keccak256(bytes(seed)) });
-const claimOf = (transferId, approval = "b") => ({ transferId, approvalDigest: hash(approval), requestHash: hash("d") });
+const claimOf = (transferId, approval = "b") => ({ transferId, sourceRef: transferId, approvalDigest: hash(approval), requestHash: hash("d") });
 
 function fixture(run) {
   const directory = mkdtempSync(join(tmpdir(), "ledger-test-"));
@@ -123,6 +123,78 @@ for (const destination of ["cronos", "xitcoin"]) {
     assert.equal(halted.signedHex, null);
     assert.throws(() => ledger.recordSigned(lease, signed(hash("1"), 0)), failure);
     assert.throws(() => ledger.markBroadcast(lease, hash("1"), { maxAttempts: 1 }), failure);
+    ledger.close();
+  }));
+
+  test(`${destination}: released elsewhere and rejected rows are permanent but never block the queue`, () => fixture((path) => {
+    let ledger = open(path, destination);
+    const lease = ledger.acquireLease(owner(1));
+    const release = { releaseHash: hash("e"), blockNumber: 40, blockHash: hash("f") };
+    // Without bytes (released before any claim) and from a claimed row.
+    const early = ledger.releasedElsewhere(lease, { ...claimOf(hash("1")), ...release });
+    assert.equal(early.state, "released_elsewhere"); assert.equal(early.signedHex, null); assert.equal(early.releaseHash, hash("e"));
+    assert.deepEqual(ledger.releasedElsewhere(lease, { ...claimOf(hash("1")), ...release }), early);
+    assert.throws(() => ledger.releasedElsewhere(lease, { ...claimOf(hash("1")), ...release, blockNumber: 41 }), failure);
+    ledger.claim(lease, claimOf(hash("2")));
+    assert.equal(ledger.releasedElsewhere(lease, { ...claimOf(hash("2")), ...release }).state, "released_elsewhere");
+    // Never from `signed`: those bytes were never sent and their nonce is unused.
+    ledger.claim(lease, claimOf(hash("3")));
+    ledger.recordSigned(lease, signed(hash("3"), 0));
+    assert.throws(() => ledger.releasedElsewhere(lease, { ...claimOf(hash("3")), ...release }), failure);
+    assert.throws(() => ledger.reject(lease, { ...claimOf(hash("3")), code: "invalid_recipient" }), failure);
+    // After the identical bytes were sent (nonce consumed by their revert).
+    ledger.markBroadcast(lease, hash("3"), { maxAttempts: 2 });
+    assert.throws(() => ledger.releasedElsewhere(lease, { ...claimOf(hash("3")), ...release, releaseHash: signed(hash("3"), 0).transactionHash }), failure);
+    const front = ledger.releasedElsewhere(lease, { ...claimOf(hash("3")), ...release });
+    assert.equal(front.transactionHash, signed(hash("3"), 0).transactionHash); assert.equal(front.nonce, 0);
+    assert.throws(() => ledger.markBroadcast(lease, hash("3"), { maxAttempts: 5 }), failure);
+    const rejected = ledger.reject(lease, { ...claimOf(hash("4")), code: "invalid_recipient" });
+    assert.equal(rejected.state, "rejected"); assert.equal(rejected.reasonCode, "invalid_recipient");
+    assert.deepEqual(ledger.reject(lease, { ...claimOf(hash("4")), code: "invalid_recipient" }), rejected);
+    assert.throws(() => ledger.claim(lease, claimOf(hash("4"), "c")), failure);
+    assert.throws(() => ledger.halt(lease, { ...claimOf(hash("4")), code: "late" }), failure);
+    assert.equal(ledger.blocking().length, 0);
+    ledger.close();
+    ledger = open(path, destination);
+    const next = ledger.acquireLease(owner(1));
+    assert.equal(ledger.claim(next, claimOf(hash("5"))).state, "claimed");
+    assert.equal(ledger.recordSigned(next, signed(hash("5"), 1)).nonce, 1);
+    ledger.close();
+  }));
+
+  test(`${destination}: a source reference belongs to exactly one transfer`, () => fixture((path) => {
+    const ledger = open(path, destination);
+    const lease = ledger.acquireLease(owner(1));
+    ledger.claim(lease, claimOf(hash("1")));
+    assert.throws(() => ledger.claim(lease, { ...claimOf(hash("2")), sourceRef: hash("1") }), failure);
+    assert.throws(() => ledger.halt(lease, { ...claimOf(hash("1")), sourceRef: hash("2"), code: "x" }), failure);
+    assert.throws(() => ledger.reject(lease, { ...claimOf(hash("9")), sourceRef: hash("1"), code: "x" }), failure);
+    for (const sourceRef of ["0x01", hash("A"), "a".repeat(63), 1]) {
+      assert.throws(() => ledger.claim(lease, { ...claimOf(hash("3")), sourceRef }), failure);
+    }
+    assert.equal(ledger.scheduling(hash("1")).state, "claimed");
+    assert.equal(ledger.scheduling("a".repeat(64)).state, null);
+    ledger.close();
+  }));
+
+  test(`${destination}: deferrals are durable scheduling hints with bounded backoff`, () => fixture((path) => {
+    let ledger = open(path, destination);
+    const lease = ledger.acquireLease(owner(1));
+    const item = { transferId: hash("1"), sourceRef: hash("1"), code: "approval_expired_awaiting_reissue" };
+    assert.equal(ledger.defer(lease, item, { nowMs: 0 }).untilMs, 60_000);
+    assert.equal(ledger.defer(lease, item, { nowMs: 0 }).untilMs, 120_000);
+    for (let i = 0; i < 10; i++) ledger.defer(lease, item, { nowMs: 0 });
+    assert.equal(ledger.defer(lease, item, { nowMs: 0 }).untilMs, 3_600_000);
+    assert.throws(() => ledger.defer(lease, { ...item, transferId: hash("2") }), failure);
+    for (const patch of [{ code: "Bad" }, { sourceRef: "x" }, { extra: 1 }]) assert.throws(() => ledger.defer(lease, { ...item, ...patch }), failure);
+    ledger.close();
+    ledger = open(path, destination);
+    assert.deepEqual({ ...ledger.scheduling(hash("1")) }, { transferId: hash("1"), state: null,
+      deferredUntilMs: 3_600_000, deferralCode: "approval_expired_awaiting_reissue" });
+    assert.equal(ledger.deferrals()[0].count, 13);
+    // A deferral is never permission to send and never changes transfer rows.
+    assert.equal(ledger.inspect(hash("1")).found, false);
+    assert.throws(() => ledger.defer({ owner: owner(2), epoch: 1, expiresAt: 0 }, item), failure);
     ledger.close();
   }));
 
@@ -295,13 +367,18 @@ test("schema triggers reject raw deletion, regression, replacement and nonce reu
       "UPDATE transfers SET broadcast_attempts = 0", "UPDATE transfers SET broadcast_attempts = 3",
       "UPDATE transfers SET claim_epoch = 2", "DELETE FROM worker_lease", "UPDATE worker_lease SET epoch = 3",
       `UPDATE worker_lease SET owner = '${owner(9)}'`, "UPDATE ledger_binding SET binding = '{}'", "DELETE FROM ledger_binding",
+      `UPDATE transfers SET source_ref = '${hash("9")}'`, "UPDATE transfers SET state = 'rejected', reason_code = 'x'",
       `INSERT INTO transfers (transfer_id, approval_digest, request_hash, state, claim_epoch, nonce, signed_hex, transaction_digest,
         transaction_hash, broadcast_attempts, created_at, updated_at) VALUES ('${hash("2")}', '${hash("b")}', '${hash("d")}',
         'signed', 1, 6, '0x00', '${hash("3")}', '${hash("4")}', 0, 0, 0)`]) {
       assert.throws(() => raw.exec(sql), Error, sql);
     }
+    assert.throws(() => raw.exec(`INSERT INTO transfers (transfer_id, source_ref, approval_digest, request_hash, state, claim_epoch,
+      nonce, signed_hex, transaction_digest, transaction_hash, broadcast_attempts, release_hash, block_number, block_hash, created_at, updated_at)
+      VALUES ('${hash("6")}', '${hash("6")}', '${hash("b")}', '${hash("d")}', 'released_elsewhere', 1, 9, '0x00', '${hash("7")}',
+      '${hash("8")}', 0, '${hash("9")}', 1, '${hash("f")}', 0, 0)`), Error);
     raw.exec(`UPDATE transfers SET state = 'finalized', block_number = 1, block_hash = '${hash("f")}'`);
-    for (const sql of ["UPDATE transfers SET state = 'halted', halt_code = 'x', block_number = NULL, block_hash = NULL",
+    for (const sql of ["UPDATE transfers SET state = 'halted', reason_code = 'x', block_number = NULL, block_hash = NULL",
       `UPDATE transfers SET block_hash = '${hash("e")}'`]) assert.throws(() => raw.exec(sql), Error, sql);
   } finally { raw.close(); }
 }));

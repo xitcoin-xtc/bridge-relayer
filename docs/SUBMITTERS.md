@@ -151,8 +151,9 @@ The ledger enforces, in one fenced immediate transaction per change:
 - a worker lease with a fencing epoch. Another worker may take over only after
   expiry, which increments the epoch; every later write by the previous holder
   fails;
-- one row per transfer (`claimed`), created only by the lease holder, and at
-  most one unfinished transfer per account;
+- one row per transfer (`claimed`), created only by the lease holder, bound to
+  its immutable RelayStore source reference, and at most one unfinished
+  transfer per account;
 - exact signed bytes, their SHA-256 digest, the destination transaction hash
   and the account nonce committed (`signed`) before any send. Nonces are
   strictly sequential; a transaction hash, digest or nonce can never be reused
@@ -164,11 +165,22 @@ The ledger enforces, in one fenced immediate transaction per change:
   plus `halted` from any unfinished state. `finalized`, `failed` and `halted`
   are permanent, and any `failed` or `halted` row blocks every new claim until
   an offline review;
+- two permanent states that never block the queue: `released_elsewhere` (the
+  destination released this transfer in another finalized transaction, which
+  the adapter verified; it records that transaction and its block) and
+  `rejected` (this transfer alone can never be sent, for example an invalid
+  recipient). `released_elsewhere` is allowed without bytes or after our
+  identical bytes were sent, never from `signed`, so a reserved nonce is never
+  left unused. `rejected` is allowed only without bytes;
+- durable deferrals: a transfer that cannot proceed yet (for example an expired
+  approval awaiting re-issue) is skipped until a backoff expires (1 minute,
+  doubling, at most 1 hour). A deferral is a scheduling hint only: it never
+  changes a transfer row and is never permission to send;
 - a claimed row has no bytes and was never sent, so it may be rebound to a
   re-issued approval. Once bytes exist the approval digest is permanent.
 
 SQLite triggers repeat these rules (no delete, no regression, no replacement,
-sequential nonce, monotonic lease epoch) as defense in depth against
+immutable source reference, sequential nonce, monotonic lease epoch) as defense in depth against
 accidental raw writes. Every read rehashes stored bytes. The bytes are opaque
 to the ledger; the destination adapter validates them against the approved
 request on every use. As with the offline journals, a malicious local owner,
@@ -180,21 +192,35 @@ destination adapter (chain reads, signing and byte validation). It owns the
 ordering:
 
 1. reject any blocking ledger row; reconcile RelayStore `submitted` rows,
-   which must reference a transaction the ledger holds;
-2. read the persisted approval request and approvals under size bounds and
+   which must reference a transaction the ledger holds; find an unfinished
+   transfer by the source reference stored in its ledger row (never by a
+   bounded window over RelayStore rows);
+2. otherwise walk all `approved` transfers in order with keyset pagination,
+   skipping rejected and still-deferred ones, and assess at most 8 per cycle;
+3. read the persisted approval request and approvals under size bounds and
    bind their exact stored text by SHA-256 (`requestHash`). The adapter
    revalidates the request against the transfer, route and authorized quorum
-   and decides `sign`, `wait` (for example a paused route or an expired
-   approval awaiting re-issue; nothing is claimed) or `halt`;
-3. claim, sign, and commit the bytes before anything else;
-4. bind RelayStore to that single transaction hash (`approved -> submitted`);
-5. commit the broadcast marker, then send the identical bytes. Send errors are
+   and decides `sign`; `wait` scoped to the route (for example a paused vault:
+   the cycle stops) or to the transfer (it is deferred and the walk moves on);
+   `reject`; `released_elsewhere`; or `halt`. Nothing is claimed unless it
+   decides `sign`;
+4. claim, sign, and commit the bytes before anything else;
+5. bind RelayStore to that single transaction hash (`approved -> submitted`);
+6. commit the broadcast marker, then send the identical bytes. Send errors are
    never decision inputs, and the first observation happens in a later cycle;
-6. observe: `pending`, `wait`, `rebroadcast` (identical bytes only, when the
-   adapter proves the transaction is unknown and its nonce unused), `failed`
-   (finalized failed execution; permanent and blocking), `finalized`, or a
-   persisted `halt`;
-7. complete RelayStore only after the ledger records finality.
+7. observe: `pending`, `wait`, `rebroadcast` (identical bytes only, when the
+   adapter proves the transaction is unknown and its nonce unused),
+   `released_elsewhere` (our bytes reverted because another finalized
+   transaction released the transfer first, for example by copying our
+   pending calldata), `failed` (any other finalized failed execution;
+   permanent and blocking), `finalized`, or a persisted `halt`;
+8. complete RelayStore only after the ledger records finality or a verified
+   release elsewhere. RelayStore keeps referencing only our own transaction
+   (or none if we never signed); the ledger records the releasing transaction.
+
+RelayStore opens with a bounded 5-second busy timeout because the coordinator
+and the Cronos submitter both write it; a longer lock fails with `SQLITE_BUSY`,
+which callers treat as a temporary condition (`isRelayStoreBusy`).
 
 A changed stored request or approval, a RelayStore reference to any other
 transaction, a RelayStore `submitted` row without ledger custody, or a
@@ -208,8 +234,11 @@ attacks, and engine crash points at every boundary (claim, signed, RelayStore
 submitted, broadcast marker, sent, ledger finalized, RelayStore completed) for
 both destinations. Engine tests use a deterministic in-memory destination model
 for reorganization, lost and ambiguous sends, bounded attempts, failed
-execution, nonce conflicts, replay processed elsewhere, pauses, expired
-approvals, RPC failures and tampering. That model is not a chain adapter. These
+execution, nonce conflicts, releases by another transaction (before any claim,
+after signing, after a drop, and a front-run of our pending transaction),
+rejected transfers, pauses, durable deferrals that do not starve later
+transfers, a backlog of 300 approved transfers, RPC failures and tampering;
+a child process holding a RelayStore lock covers the busy timeout. That model is not a chain adapter. These
 are process-crash tests, not power-loss or storage-rollback proofs.
 
 This change does not connect the engine to startup. Both `submitter:start`

@@ -4,14 +4,17 @@ import { RelayStore } from "./store.js";
 
 // Destination-generic durable submission engine. The adapter is trusted,
 // reviewed destination code (chain reads, signing, byte validation); this
-// engine owns ordering, persistence and recovery:
+// engine owns ordering, persistence, scheduling and recovery:
 //   1. revalidate the persisted approval request and claim the transfer;
 //   2. sign and commit exact bytes, hash and nonce to the ledger;
 //   3. bind RelayStore to that one transaction hash (`submitted`);
 //   4. commit a write-ahead broadcast marker, then send identical bytes;
-//   5. complete RelayStore only after the ledger records destination finality.
+//   5. complete RelayStore only after the ledger records destination finality,
+//      or after the adapter proves a finalized release by another transaction.
 // Ambiguity never authorizes new bytes: recovery can only observe, resend the
 // identical persisted transaction under adapter-verified conditions, or halt.
+// A transfer that cannot proceed yet is deferred durably, and a transfer that
+// can never be sent is rejected; neither blocks the transfers behind it.
 export class SubmissionHalt extends Error {
   constructor(code) { super("destination submission halted; offline review required"); this.code = code; }
 }
@@ -21,6 +24,7 @@ export class SubmissionUnavailable extends Error {
 const CODE = /^[a-z][a-z0-9_]{0,63}$/;
 const HASH = /^0x[0-9a-f]{64}$/;
 const MAX_ROW_TEXT = 32_768;
+const PAGE = 256;
 const SOURCE = Object.freeze({ cronos: "xitcoin", xitcoin: "cronos" });
 
 function code(value) { return typeof value === "string" && CODE.test(value) ? value : "invalid_adapter_result"; }
@@ -46,21 +50,24 @@ function storedRequest(store, sourceChain, sourceRef) {
 }
 
 export async function runDurableSubmissionCycle({ store, ledger, adapter, owner, nowMs = Date.now(),
-  leaseTtlMs = 60_000, maximumCandidates = 8, boundary = async () => {} }) {
+  leaseTtlMs = 60_000, maximumCandidates = 8, maximumScan = 100_000, boundary = async () => {} }) {
   if (!(store instanceof RelayStore) || !(ledger instanceof BroadcastLedger) || !adapter || typeof boundary !== "function"
       || adapter.destination !== ledger.destination || !Object.hasOwn(SOURCE, adapter.destination)
       || !Number.isSafeInteger(adapter.maxBroadcastAttempts) || adapter.maxBroadcastAttempts < 1
       || adapter.maxBroadcastAttempts > LEDGER_MAX_BROADCAST_ATTEMPTS
-      || !Number.isSafeInteger(maximumCandidates) || maximumCandidates < 1 || maximumCandidates > 64) {
+      || !Number.isSafeInteger(maximumCandidates) || maximumCandidates < 1 || maximumCandidates > 64
+      || !Number.isSafeInteger(maximumScan) || maximumScan < 1 || maximumScan > 1_000_000) {
     throw new SubmissionUnavailable("invalid_submission_dependencies");
   }
   const sourceChain = SOURCE[adapter.destination];
   const lease = ledger.acquireLease(owner, { nowMs, ttlMs: leaseTtlMs });
   const nowUnix = Math.floor(nowMs / 1000);
   const report = (action, details = {}) => Object.freeze({ destination: adapter.destination, epoch: lease.epoch, action, ...details });
+  const identity = (stored, transferId) => ({ transferId, sourceRef: stored.transfer.source_ref,
+    approvalDigest: stored.request.digest, requestHash: stored.requestHash });
 
   async function halt(transferId, stored, haltCode) {
-    ledger.halt(lease, { transferId, approvalDigest: stored.request.digest, requestHash: stored.requestHash, code: code(haltCode) });
+    ledger.halt(lease, { ...identity(stored, transferId), code: code(haltCode) });
     await boundary("halted");
     throw new SubmissionHalt(code(haltCode));
   }
@@ -81,6 +88,26 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
     return true;
   }
 
+  // RelayStore follows the ledger and never references any other transaction
+  // than our persisted bytes (or none, when we never signed for this transfer).
+  function completeRelay(stored, transactionHash) {
+    let current = store.get(sourceChain, stored.transfer.source_ref);
+    if (current.state === "approved") {
+      current = store.transition(sourceChain, current.source_ref, "submitted", transactionHash ? { destinationRef: transactionHash } : {});
+    }
+    if (current.state === "submitted") store.transition(sourceChain, current.source_ref, "completed");
+  }
+
+  async function relayReference(stored, transferId, row) {
+    const before = store.get(sourceChain, stored.transfer.source_ref);
+    const expected = row?.transactionHash ?? null;
+    if (before.destination_ref !== null && before.destination_ref !== expected) {
+      if (!row || ["claimed", "signed", "broadcast"].includes(row.state)) await halt(transferId, stored, "relay_store_reference_mismatch");
+      throw new SubmissionHalt("relay_store_reference_mismatch");
+    }
+    return expected;
+  }
+
   async function send(row) {
     const marked = ledger.markBroadcast(lease, row.transferId, { maxAttempts: adapter.maxBroadcastAttempts });
     await boundary("broadcast-recorded");
@@ -92,18 +119,31 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
   }
 
   async function complete(stored, row, inclusion) {
-    const before = store.get(sourceChain, stored.transfer.source_ref);
-    if (before.destination_ref !== null && before.destination_ref !== row.transactionHash) {
-      if (row.state === "finalized") throw new SubmissionHalt("relay_store_reference_mismatch");
-      await halt(row.transferId, stored, "relay_store_reference_mismatch");
-    }
+    await relayReference(stored, row.transferId, row);
     const final = ledger.finalize(lease, row.transferId, inclusion);
     await boundary("ledger-finalized");
-    let current = store.get(sourceChain, stored.transfer.source_ref);
-    if (current.state === "approved") current = store.transition(sourceChain, current.source_ref, "submitted", { destinationRef: final.transactionHash });
-    if (current.state === "submitted") store.transition(sourceChain, current.source_ref, "completed");
+    completeRelay(stored, final.transactionHash);
     await boundary("relay-completed");
     return report("finalized", { transferId: row.transferId, transactionHash: final.transactionHash });
+  }
+
+  // Another finalized transaction released this transfer with every approved
+  // field (verified by the adapter on every origin). Our bytes, if any, were
+  // sent and their nonce consumed, so the queue may move on.
+  async function releasedElsewhere(stored, transferId, row, observed) {
+    const expected = await relayReference(stored, transferId, row);
+    const released = ledger.releasedElsewhere(lease, { ...identity(stored, transferId),
+      releaseHash: observed.releaseHash, blockNumber: observed.blockNumber, blockHash: observed.blockHash });
+    await boundary("ledger-released-elsewhere");
+    completeRelay(stored, expected);
+    await boundary("relay-completed");
+    return report("released_elsewhere", { transferId, releaseHash: released.releaseHash });
+  }
+
+  async function reject(stored, transferId, rejectCode) {
+    ledger.reject(lease, { ...identity(stored, transferId), code: code(rejectCode) });
+    await boundary("rejected");
+    return report("rejected", { transferId, code: code(rejectCode) });
   }
 
   async function advance(row, stored) {
@@ -123,7 +163,7 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
       return report("submitted", { transferId: row.transferId, transactionHash: row.transactionHash });
     }
     const observed = decision(await adapter.observe({ row, ...stored, nowUnix }),
-      ["pending", "wait", "rebroadcast", "finalized", "failed", "halt"]);
+      ["pending", "wait", "rebroadcast", "finalized", "failed", "released_elsewhere", "halt"]);
     switch (observed.action) {
       case "pending": return report("pending", { transferId: row.transferId, transactionHash: row.transactionHash });
       case "wait": return report("waiting", { transferId: row.transferId, code: code(observed.code) });
@@ -131,6 +171,7 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
         row = await send(row);
         return report("rebroadcast", { transferId: row.transferId, transactionHash: row.transactionHash, attempts: row.broadcastAttempts });
       case "finalized": return complete(stored, row, { blockNumber: observed.blockNumber, blockHash: observed.blockHash });
+      case "released_elsewhere": return releasedElsewhere(stored, row.transferId, row, observed);
       case "failed":
         ledger.markFailed(lease, row.transferId, { blockNumber: observed.blockNumber, blockHash: observed.blockHash });
         await boundary("ledger-failed");
@@ -139,16 +180,20 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
     }
   }
 
-  async function start(stored, transferId) {
-    const assessed = decision(await adapter.assess({ ...stored, transferId, nowUnix }), ["sign", "wait", "halt"]);
+  async function start(stored, transferId, claimedRow = null) {
+    const assessed = decision(await adapter.assess({ ...stored, transferId, nowUnix }),
+      ["sign", "wait", "halt", "reject", "released_elsewhere"]);
     if (assessed.action === "halt") await halt(transferId, stored, assessed.code);
-    if (assessed.action === "wait") return report("waiting", { transferId, code: code(assessed.code) });
-    const claimed = ledger.claim(lease, { transferId, approvalDigest: stored.request.digest, requestHash: stored.requestHash });
+    if (assessed.action === "reject") return reject(stored, transferId, assessed.code);
+    if (assessed.action === "released_elsewhere") return releasedElsewhere(stored, transferId, claimedRow, assessed);
+    if (assessed.action === "wait") return report("waiting", { transferId, code: code(assessed.code), defer: assessed.defer === true });
+    const claimed = ledger.claim(lease, identity(stored, transferId));
     await boundary("claimed");
     if (claimed.state !== "claimed") throw new SubmissionUnavailable("ledger_state_changed");
     const signed = decision(await adapter.sign({ ...stored, transferId, nowUnix, context: assessed.context,
-      expectedNonce: ledger.nextNonce() }), ["signed", "wait", "halt"]);
+      expectedNonce: ledger.nextNonce() }), ["signed", "wait", "halt", "reject"]);
     if (signed.action === "halt") await halt(transferId, stored, signed.code);
+    if (signed.action === "reject") return reject(stored, transferId, signed.code);
     if (signed.action === "wait") return report("waiting", { transferId, code: code(signed.code) });
     const row = ledger.recordSigned(lease, { transferId, nonce: signed.nonce, signedHex: signed.signedHex,
       transactionHash: signed.transactionHash });
@@ -167,36 +212,64 @@ export async function runDurableSubmissionCycle({ store, ledger, adapter, owner,
     const stored = storedRequest(store, sourceChain, sourceRef);
     const transferId = transferIdOf(stored);
     const row = ledger.inspect(transferId);
-    if (!row.found || row.transactionHash !== stored.transfer.destination_ref) await halt(transferId, stored, "submitted_without_ledger_custody");
+    if (!row.found || row.sourceRef !== sourceRef || row.transactionHash !== stored.transfer.destination_ref) {
+      if (!row.found || ["claimed", "signed", "broadcast"].includes(row.state)) await halt(transferId, stored, "submitted_without_ledger_custody");
+      throw new SubmissionHalt("submitted_without_ledger_custody");
+    }
     if (row.state === "finalized") return complete(stored, row, { blockNumber: row.blockNumber, blockHash: row.blockHash });
+    if (row.state === "released_elsewhere") return releasedElsewhere(stored, transferId, row, row);
   }
 
+  // The unfinished transfer is found by the source reference the ledger stores,
+  // never by a bounded window over RelayStore rows.
   if (active.length === 1) {
     const row = active[0];
-    const candidates = store.database.prepare(`SELECT source_ref FROM transfers WHERE source_chain = ?
-      AND state IN ('approved', 'submitted') ORDER BY updated_at, source_ref LIMIT 256`).all(sourceChain);
-    for (const { source_ref: sourceRef } of candidates) {
-      const stored = storedRequest(store, sourceChain, sourceRef);
-      if (transferIdOf(stored) !== row.transferId) continue;
-      return row.state === "claimed" ? start(stored, row.transferId) : advance(row, stored);
-    }
-    throw new SubmissionHalt("ledger_transfer_missing_from_relay_store");
+    const relay = store.get(sourceChain, row.sourceRef);
+    if (!relay || !["approved", "submitted"].includes(relay.state)) throw new SubmissionHalt("ledger_transfer_missing_from_relay_store");
+    const stored = storedRequest(store, sourceChain, row.sourceRef);
+    if (transferIdOf(stored) !== row.transferId) throw new SubmissionHalt("ledger_transfer_missing_from_relay_store");
+    return row.state === "claimed" ? start(stored, row.transferId, row) : advance(row, stored);
   }
 
-  const approved = store.database.prepare(`SELECT source_ref FROM transfers WHERE source_chain = ? AND state = 'approved'
-    ORDER BY updated_at, source_ref LIMIT ?`).all(sourceChain, maximumCandidates);
-  const waiting = [];
-  for (const { source_ref: sourceRef } of approved) {
-    const stored = storedRequest(store, sourceChain, sourceRef);
-    const transferId = transferIdOf(stored);
-    const existing = ledger.inspect(transferId);
-    if (existing.found) {
-      if (existing.state === "finalized") return complete(stored, existing, { blockNumber: existing.blockNumber, blockHash: existing.blockHash });
-      throw new SubmissionHalt("ledger_invariant_violation");
+  // Approved transfers in order, by keyset pages. Rejected and still-deferred
+  // transfers are skipped cheaply; a transfer-scoped wait defers it durably and
+  // the scan moves on. A route-scoped wait (for example a paused vault) stops.
+  const waiting = [], rejected = [];
+  let assessed = 0, scanned = 0, cursor = null;
+  const first = store.database.prepare(`SELECT source_ref, updated_at FROM transfers WHERE source_chain = ? AND state = 'approved'
+    ORDER BY updated_at, source_ref LIMIT ${PAGE}`);
+  const next = store.database.prepare(`SELECT source_ref, updated_at FROM transfers WHERE source_chain = ? AND state = 'approved'
+    AND (updated_at > ? OR (updated_at = ? AND source_ref > ?)) ORDER BY updated_at, source_ref LIMIT ${PAGE}`);
+  scan: while (scanned < maximumScan) {
+    const page = cursor ? next.all(sourceChain, cursor.updated_at, cursor.updated_at, cursor.source_ref) : first.all(sourceChain);
+    if (!page.length) break;
+    for (const candidate of page) {
+      cursor = candidate;
+      if (++scanned > maximumScan) break scan;
+      const scheduled = ledger.scheduling(candidate.source_ref);
+      if (scheduled.state === "rejected") continue;
+      if (scheduled.state === "finalized" || scheduled.state === "released_elsewhere") {
+        const stored = storedRequest(store, sourceChain, candidate.source_ref);
+        const row = ledger.inspect(transferIdOf(stored));
+        if (row.transferId !== scheduled.transferId) throw new SubmissionHalt("ledger_invariant_violation");
+        return row.state === "finalized" ? complete(stored, row, { blockNumber: row.blockNumber, blockHash: row.blockHash })
+          : releasedElsewhere(stored, row.transferId, row, row);
+      }
+      if (scheduled.state !== null) throw new SubmissionHalt("ledger_invariant_violation");
+      if (scheduled.deferredUntilMs !== null && scheduled.deferredUntilMs > nowMs) continue;
+      if (assessed >= maximumCandidates) break scan;
+      const stored = storedRequest(store, sourceChain, candidate.source_ref);
+      const transferId = transferIdOf(stored);
+      if (scheduled.transferId !== null && scheduled.transferId !== transferId) throw new SubmissionHalt("ledger_invariant_violation");
+      assessed += 1;
+      const result = await start(stored, transferId);
+      if (result.action === "rejected") { rejected.push(result.code); continue; }
+      if (result.action !== "waiting") return result;
+      waiting.push(result.code);
+      if (!result.defer) break scan;
+      ledger.defer(lease, { transferId, sourceRef: candidate.source_ref, code: result.code }, { nowMs });
     }
-    const result = await start(stored, transferId);
-    if (result.action !== "waiting") return result;
-    waiting.push(result.code);
   }
-  return report(waiting.length ? "waiting" : "idle", { waiting: Object.freeze(waiting) });
+  return report(waiting.length || rejected.length ? "waiting" : "idle",
+    { waiting: Object.freeze(waiting), rejected: Object.freeze(rejected) });
 }
