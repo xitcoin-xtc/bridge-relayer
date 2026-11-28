@@ -4,8 +4,9 @@ import { prepareCronosRelease, inspectCronosSignedTransaction } from "../../src/
 import { TESTNET_ROUTE_ID } from "../../src/preflight.js";
 import { outbound, signedBytes } from "./cronos.js";
 import { sign } from "./destination.js";
+import { XITCOIN_TESTNET_ROUTE_ID } from "../../src/protocol.js";
 export const manifest = { version: 1, mode: "disabled", destination: "cronos", releaseCommit: "a".repeat(40),
-  routeId: "cronos-testnet-xitcoin-testnet", cronosChainId: 338, xitcoinChainId: "xitcoin-testnet-v2-1" };
+  routeId: XITCOIN_TESTNET_ROUTE_ID, cronosChainId: 338, xitcoinChainId: "xitcoin-testnet-v2-1" };
 export function storedCandidate(path = ":memory:", patch = {}) {
   const base = outbound();
   const { request: unused, approvals: ignored, ...evidence } = base;

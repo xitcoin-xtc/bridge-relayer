@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { CanarySession, validateCanaryPlan } from "../src/canary.js";
+import { XITCOIN_TESTNET_ROUTE_ID } from "../src/protocol.js";
 
 const HASHES = ["11", "22", "33", "44"].map((byte) => byte.repeat(32));
 
@@ -10,7 +11,7 @@ function plan(overrides = {}) {
     releaseCommit: "4e72eda2b64b448bff07e90fc12cda51513d5064",
     decisionId: "aa".repeat(32),
     preflightDigest: "bb".repeat(32),
-    routeId: "cronos-testnet-xitcoin-testnet",
+    routeId: XITCOIN_TESTNET_ROUTE_ID,
     cronosChainId: "338",
     xitcoinChainId: "xitcoin-testnet-v2-1",
     startsAtUnix: 1000,

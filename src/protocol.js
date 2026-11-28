@@ -21,6 +21,17 @@ export const SOURCE_DEPOSIT_DOMAIN = "xitcoin-bridge-source-deposit-v1";
 export const DIRECTION_INBOUND = "cronos_to_xitcoin";
 export const DIRECTION_OUTBOUND = "xitcoin_to_cronos";
 
+// Route ID stored by the Xitcoin bridge module on xitcoin-testnet-v2-1, as
+// observed on the live chain: the route was initialised with the Cronos vault
+// bytes32 route ID in 0x-prefixed lower-case hex (it satisfies the chain's
+// route-ID rule, 1 to 96 bytes of [a-z0-9_-]). The chain compares it byte for
+// byte with the route ID of every MsgSubmitAttestation, hashes it into every
+// approval digest and emits it in every outbound burn event, so it is the
+// only Xitcoin route ID the relayer signs, submits or compares. It happens to
+// equal the Cronos route (TESTNET_ROUTE_ID); both are pinned independently,
+// never derived from each other or from a display label.
+export const XITCOIN_TESTNET_ROUTE_ID = "0x21121c16b53a726056a6683f00c7eb4da5501ce8a2abc8a4677e06f1e94b5cd9";
+
 function positiveDecimal(value, label) {
   const text = String(value);
   if (!/^[1-9][0-9]*$/.test(text)) throw new Error(`${label} must be a positive decimal integer`);

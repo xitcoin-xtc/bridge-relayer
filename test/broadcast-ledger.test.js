@@ -10,13 +10,14 @@ import { BroadcastLedger, ledgerBinding, LEDGER_MAX_BROADCAST_ATTEMPTS } from ".
 import { evmAddressToBech32 } from "../src/address.js";
 import { journalOptions } from "./journal-fixture.js";
 import { signers } from "./fixtures/destination.js";
+import { XITCOIN_TESTNET_ROUTE_ID } from "../src/protocol.js";
 
 const failure = { message: "broadcast ledger unavailable or conflicting" };
 const hash = (letter) => `0x${letter.repeat(64)}`;
 const bindings = {
-  cronos: { destination: "cronos", chainId: "338", routeId: "cronos-testnet-xitcoin-testnet",
+  cronos: { destination: "cronos", chainId: "338", routeId: XITCOIN_TESTNET_ROUTE_ID,
     target: "0x1c94273C0b199b139D82da3786C9eCbE189D5919", targetIdentity: hash("c"), account: signers[2] },
-  xitcoin: { destination: "xitcoin", chainId: "xitcoin-testnet-v2-1", routeId: "cronos-testnet-xitcoin-testnet",
+  xitcoin: { destination: "xitcoin", chainId: "xitcoin-testnet-v2-1", routeId: XITCOIN_TESTNET_ROUTE_ID,
     target: "x/bridge", targetIdentity: "5ec8692e8fc1813d0892ee535af1a73953a1c4fb", account: evmAddressToBech32(signers[2]) },
 };
 const owner = (n) => n.toString(16).padStart(32, "0");

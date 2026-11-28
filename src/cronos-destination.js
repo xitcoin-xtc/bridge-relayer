@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { Interface, Transaction, getAddress, keccak256 } from "ethers";
-import { DIRECTION_OUTBOUND } from "./protocol.js";
+import { DIRECTION_OUTBOUND, XITCOIN_TESTNET_ROUTE_ID } from "./protocol.js";
 import { TESTNET_ROUTE_ID } from "./preflight.js";
 import { destinationSnapshot, exactFields, decimal, decimalOrSafeInteger, validateSourceEvidence, verifiedDestinationQuorum } from "./destination-validation.js";
 
@@ -40,7 +40,7 @@ export function prepareCronosRelease(input) {
     const p = request.payload;
     exactFields(p, ["chainId", "vault", "sourceBurnId", "recipient", "amount", "signerSetVersion", "deadline",
       ...(Object.hasOwn(p, "routeId") ? ["routeId"] : []), ...(Object.hasOwn(p, "sourceEvidence") ? ["sourceEvidence"] : [])]);
-    if (Object.hasOwn(p, "routeId") && p.routeId !== "cronos-testnet-xitcoin-testnet") throw error();
+    if (Object.hasOwn(p, "routeId") && p.routeId !== XITCOIN_TESTNET_ROUTE_ID) throw error();
     if (Object.hasOwn(p, "sourceEvidence")) validateSourceEvidence(p.sourceEvidence);
     if (request.direction !== DIRECTION_OUTBOUND || p.chainId !== 338 || account(p.vault) !== account(identity.vault)
         || decimalOrSafeInteger(p.signerSetVersion, 64) !== decimal(state.signerSetVersion, 64)) throw error();

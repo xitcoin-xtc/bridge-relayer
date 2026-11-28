@@ -3,7 +3,7 @@
 // bounded canonical observations. The model lives outside the "process" so
 // a restarted engine sees the same simulated chain.
 import { keccak256 } from "ethers";
-import { attestationId, DIRECTION_OUTBOUND } from "../../src/protocol.js";
+import { XITCOIN_TESTNET_ROUTE_ID, attestationId, DIRECTION_OUTBOUND } from "../../src/protocol.js";
 import { RelayStore } from "../../src/store.js";
 import { buildTransferApprovalRequest } from "../../src/coordinator.js";
 import { evmAddressToBech32 } from "../../src/address.js";
@@ -147,7 +147,7 @@ export function approvedTransfer(store, destination, index = 1, { deadlineUnix =
   const vault = "0x1c94273C0b199b139D82da3786C9eCbE189D5919";
   const common = { blockHeight: 10 + index, blockHash: `0x${"aa".repeat(32)}`, transactionHash: `0x${"bb".repeat(32)}` };
   if (destination === "cronos") {
-    store.observe({ sourceChain: "xitcoin", sourceRef: ref, routeId: "cronos-testnet-xitcoin-testnet", ...common, messageIndex: 0,
+    store.observe({ sourceChain: "xitcoin", sourceRef: ref, routeId: XITCOIN_TESTNET_ROUTE_ID, ...common, messageIndex: 0,
       payload: { requestId: ref, sender: "xtc1sender", destination: signers[0], amount: "10", nonce: String(index) } });
   } else {
     store.observe({ sourceChain: "cronos", sourceRef: ref.slice(2), routeId: TESTNET_ROUTE_ID, ...common, logIndex: 0,
@@ -157,7 +157,7 @@ export function approvedTransfer(store, destination, index = 1, { deadlineUnix =
   const sourceChain = destination === "cronos" ? "xitcoin" : "cronos";
   const sourceRef = destination === "cronos" ? ref : ref.slice(2);
   const transfer = store.transition(sourceChain, sourceRef, "finalized");
-  const request = buildTransferApprovalRequest({ transfer, routeId: "cronos-testnet-xitcoin-testnet",
+  const request = buildTransferApprovalRequest({ transfer, routeId: XITCOIN_TESTNET_ROUTE_ID,
     cronosRouteId: TESTNET_ROUTE_ID, cronosChainId: 338, cronosVault: vault,
     xitcoinChainId: "xitcoin-testnet-v2-1", signerSetVersion: 1, deadlineUnix });
   store.persistApprovalRequest(sourceChain, sourceRef, request);

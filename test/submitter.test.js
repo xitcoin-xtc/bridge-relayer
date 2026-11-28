@@ -8,9 +8,10 @@ import test from "node:test";
 import { loadSubmitterManifest, validateSubmitterManifest, verifySubmitterRelease } from "../src/submitter-manifest.js";
 import { buildSubmitterRuntime, inspectSubmitter } from "../src/submitter-bootstrap.js";
 import { runSubmitterCli } from "../src/submitter-cli.js";
+import { XITCOIN_TESTNET_ROUTE_ID } from "../src/protocol.js";
 
 const manifest = (destination = "xitcoin") => ({ version: 1, mode: "disabled", destination,
-  releaseCommit: "a".repeat(40), routeId: "cronos-testnet-xitcoin-testnet", cronosChainId: 338, xitcoinChainId: "xitcoin-testnet-v2-1" });
+  releaseCommit: "a".repeat(40), routeId: XITCOIN_TESTNET_ROUTE_ID, cronosChainId: 338, xitcoinChainId: "xitcoin-testnet-v2-1" });
 const modulePath = `/opt/xitcoin-bridge-relayer/${"a".repeat(40)}/src/submitter-cli.js`;
 const metadata = (overrides = {}) => ({ uid: 0, mode: 0o100644, size: 300, isFile: () => true, isDirectory: () => true, ...overrides });
 const trustedStat = async () => metadata();
@@ -210,7 +211,7 @@ test("release traversal rejects every higher unsafe ancestor after a trusted src
 const testnetSigners = ["0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf", "0x2B5AD5c4795c026514f8317c7a215E218DcCD6cF",
   "0x6813Eb9362372EEF6200f3b1dbC3f819671cBA69"];
 const testnet = (patch = {}, cronosPatch = {}, xitcoinPatch = {}) => ({ version: 1, mode: "testnet", destination: "cronos",
-  releaseCommit: "a".repeat(40), routeId: "cronos-testnet-xitcoin-testnet", cronosChainId: 338, xitcoinChainId: "xitcoin-testnet-v2-1",
+  releaseCommit: "a".repeat(40), routeId: XITCOIN_TESTNET_ROUTE_ID, cronosChainId: 338, xitcoinChainId: "xitcoin-testnet-v2-1",
   relayStorePath: "/var/lib/xitcoin-bridge/coordinator/relay.sqlite", ledgerPath: "/var/lib/xitcoin-bridge/submitter-cronos/ledger.sqlite",
   keystorePath: "/var/lib/xitcoin-bridge/submitter-cronos-keystore/keystore.json", cycleIntervalMs: 5000,
   cronos: { rpcUrls: ["https://cronos-a.example/rpc", "https://cronos-b.example/rpc"], allowLoopbackHttp: false,

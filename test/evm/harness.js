@@ -9,6 +9,7 @@ import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ContractFactory, JsonRpcProvider, SigningKey, Transaction, Wallet, computeAddress, id, TypedDataEncoder } from "ethers";
+import { XITCOIN_TESTNET_ROUTE_ID } from "../../src/protocol.js";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const root = fileURLToPath(new URL("../../", import.meta.url));
@@ -117,7 +118,7 @@ export function rewriteResult(text, transform) {
 export async function startCometBft(burns, { chainId = "xitcoin-testnet-v2-1", latest = 100 } = {}) {
   const block = (height) => burns.filter((burn) => burn.height === height);
   const event = (burn) => ({ type: "bridge_outbound_burned", attributes: [
-    ["request_id", burn.requestId], ["route_id", "cronos-testnet-xitcoin-testnet"], ["sender", "xtc1sender"],
+    ["request_id", burn.requestId], ["route_id", XITCOIN_TESTNET_ROUTE_ID], ["sender", "xtc1sender"],
     ["destination", burn.recipient], ["amount", burn.amount], ["nonce", burn.nonce], ["msg_index", "0"],
   ].map(([key, value]) => ({ key, value })) });
   const server = createServer((request, response) => {

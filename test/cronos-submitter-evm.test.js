@@ -25,6 +25,7 @@ import { keys, sign, signers } from "./fixtures/destination.js";
 import { blockHash, compile, controlSignatures, deployBridge, evmAvailability, gitBlob, localAddress, localKeys,
   rewriteResult, rpcCall, signedCall, startAnvil, startCometBft, startProxy, xitcoinBurn } from "./evm/harness.js";
 import provenance from "./evm/provenance.json" with { type: "json" };
+import { XITCOIN_TESTNET_ROUTE_ID } from "../src/protocol.js";
 
 const evm = evmAvailability();
 const options = { skip: evm.skip, timeout: 240_000 };
@@ -47,11 +48,11 @@ function artifacts(version, token = "mock") {
 // the burn on the Xitcoin origins and keep their own durable journal, unless a
 // scenario deliberately bypasses them to test the submitter's own checks.
 async function approve(store, burn, vault, deadlineUnix, signerServices) {
-  store.observe({ sourceChain: "xitcoin", sourceRef: burn.requestId, routeId: "cronos-testnet-xitcoin-testnet",
+  store.observe({ sourceChain: "xitcoin", sourceRef: burn.requestId, routeId: XITCOIN_TESTNET_ROUTE_ID,
     blockHeight: burn.height, blockHash: blockHash(burn.height), transactionHash: burn.transactionHash, messageIndex: 0,
     payload: { requestId: burn.requestId, sender: "xtc1sender", destination: burn.recipient, amount: burn.amount, nonce: burn.nonce } });
   const transfer = store.transition("xitcoin", burn.requestId, "finalized");
-  const request = buildTransferApprovalRequest({ transfer, routeId: "cronos-testnet-xitcoin-testnet", cronosRouteId: TESTNET_ROUTE_ID,
+  const request = buildTransferApprovalRequest({ transfer, routeId: XITCOIN_TESTNET_ROUTE_ID, cronosRouteId: TESTNET_ROUTE_ID,
     cronosChainId: 338, cronosVault: vault, signerSetVersion: 1, deadlineUnix });
   if (signerServices) {
     const clients = signerServices.map((service) => ({ identity: service.identity, approve: (value) => service.approve(value) }));
@@ -70,8 +71,8 @@ function isolatedSigners({ vault, proxies, comets }) {
     decodeBlock: decodeXitcoinOutboundBlock, decodeTransaction: decodeXitcoinOutboundTransaction }));
   const verifySource = createCanonicalSourceVerifier({ cronosRouteId: TESTNET_ROUTE_ID,
     cronosWatcher: new CronosFinalizedWatcher({ providers, vault, routeId: TESTNET_ROUTE_ID, confirmations: 3 }),
-    xitcoinWatcher: new XitcoinFinalizedWatcher({ clients, chainId: "xitcoin-testnet-v2-1", routeId: "cronos-testnet-xitcoin-testnet", safetyLag: 2 }) });
-  const policy = createSignerPolicy({ routeIds: ["cronos-testnet-xitcoin-testnet"], cronosChainIds: [338],
+    xitcoinWatcher: new XitcoinFinalizedWatcher({ clients, chainId: "xitcoin-testnet-v2-1", routeId: XITCOIN_TESTNET_ROUTE_ID, safetyLag: 2 }) });
+  const policy = createSignerPolicy({ routeIds: [XITCOIN_TESTNET_ROUTE_ID], cronosChainIds: [338],
     xitcoinChainIds: ["xitcoin-testnet-v2-1"], cronosVaults: [vault], maximumAmount: (10n ** 21n).toString(), maximumDeadlineSeconds: 7_200 });
   const journals = [0, 1, 2].map(() => new SignerApprovalJournal());
   const services = [0, 1, 2].map((index) => new IsolatedSignerService({ identity: `signer-${index + 1}`, signerAddress: signers[index],
@@ -112,7 +113,7 @@ async function scenario(run, { version = "testnet", chainId = 338, burns = 1, ap
     writeFileSync(join(paths.credentials, "keystore-password"), "synthetic-local-test-password\n", { mode: 0o600 });
     chmodSync(paths.keystore, 0o600);
     const manifest = validateCronosTestnetManifest({ version: 1, mode: "testnet", destination: "cronos", releaseCommit: "a".repeat(40),
-      routeId: "cronos-testnet-xitcoin-testnet", cronosChainId: 338, xitcoinChainId: "xitcoin-testnet-v2-1",
+      routeId: XITCOIN_TESTNET_ROUTE_ID, cronosChainId: 338, xitcoinChainId: "xitcoin-testnet-v2-1",
       relayStorePath: paths.store, ledgerPath: paths.ledger, keystorePath: paths.keystore, cycleIntervalMs: 1_000,
       cronos: { rpcUrls: proxies.map((proxy) => proxy.url), allowLoopbackHttp: true, vault: bridge.vault,
         vaultCodeHash: keccak256(await chain.rpc("eth_getCode", [bridge.vault, "latest"])), cronosRouteId: TESTNET_ROUTE_ID,

@@ -7,7 +7,7 @@ import { runApprovalOnlyCycle } from "./coordinator.js";
 import { createCredentialedSignerClients } from "./coordinator-transport.js";
 import { connectCronosProviders, connectXitcoinClients, decodeXitcoinOutboundBlock, decodeXitcoinOutboundTransaction } from "./network.js";
 import { TESTNET_ROUTE_ID } from "./preflight.js";
-import { normalizeBytes32, validateRouteId } from "./protocol.js";
+import { XITCOIN_TESTNET_ROUTE_ID, normalizeBytes32, validateRouteId } from "./protocol.js";
 import { RelayStore } from "./store.js";
 import { CronosFinalizedWatcher, XitcoinFinalizedWatcher } from "./watchers.js";
 
@@ -54,7 +54,7 @@ export function validateCoordinatorConfig(input) {
   if (!RELEASE.test(releaseCommit)) throw new Error("release commit is invalid");
   const policy = keys(object(config.policy, "policy"), ["routeId", "cronosRouteId", "cronosChainId", "cronosVault", "signerSetVersion"], "policy");
   const routeId = validateRouteId(policy.routeId);
-  if (routeId !== "cronos-testnet-xitcoin-testnet") throw new Error("testnet route is not canonical");
+  if (routeId !== XITCOIN_TESTNET_ROUTE_ID) throw new Error("testnet route is not canonical");
   const cronosRouteId = normalizeBytes32(policy.cronosRouteId);
   if (cronosRouteId !== TESTNET_ROUTE_ID.toLowerCase()) throw new Error("Cronos route is not canonical");
   const cronosChainId = integer(policy.cronosChainId, "Cronos chain ID");

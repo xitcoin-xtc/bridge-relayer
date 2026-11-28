@@ -37,7 +37,7 @@ test("uint64 varint boundaries and deterministic pseudo-random nonces round-trip
   for (const nonce of values) {
     const input = inbound({ nonce: nonce.toString() }), encoded = prepareXitcoinAttestation(input), decoded = fields(encoded.messageHex);
     assert.equal(decoded.get(6)[0], nonce);
-    assert.equal(decoded.get(9)[0], 1999999999n);
+    assert.equal(decoded.get(9)[0], 1999999997n);
     assert.equal(decoded.get(8)[0].toString(), "10");
     assert.deepEqual([...decoded.keys()], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     assert.equal(decoded.get(10).length, 2);

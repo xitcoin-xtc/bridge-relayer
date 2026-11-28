@@ -77,8 +77,10 @@ Operators must never delete a pending database merely to clear an error.
   and preferably on independent infrastructure and RPC providers.
 - Inject `verifySource` and `signDigest` from private runtime adapters. The
   public service neither loads nor stores private keys.
-- Pin the canonical Xitcoin route and the deployed Cronos `bytes32` route ID
-  independently; never derive the deployed route from a display label. Also pin
+- Pin the Xitcoin route ID exactly as the bridge module stores it (on testnet
+  `0x21121c16...5cd9`, see [PROTOCOL.md](PROTOCOL.md#route-identity)) and the
+  deployed Cronos `bytes32` route ID independently; never derive either from a
+  display label. Also pin
   the Cronos chain ID, the destination Xitcoin chain ID, vault, maximum amount
   and maximum deadline window on every signer. Set the maximum amount no higher
   than the chain route's `max_transfer_amount` and the vault's release limit.

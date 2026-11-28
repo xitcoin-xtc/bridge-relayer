@@ -39,7 +39,7 @@ to `cronos` for the second instance.
   "mode": "disabled",
   "destination": "xitcoin",
   "releaseCommit": "RELEASE_COMMIT",
-  "routeId": "cronos-testnet-xitcoin-testnet",
+  "routeId": "0x21121c16b53a726056a6683f00c7eb4da5501ce8a2abc8a4677e06f1e94b5cd9",
   "cronosChainId": 338,
   "xitcoinChainId": "xitcoin-testnet-v2-1"
 }
@@ -312,7 +312,7 @@ reviewed local tunnels. The manifest never contains a key or password.
   "mode": "testnet",
   "destination": "cronos",
   "releaseCommit": "RELEASE_COMMIT",
-  "routeId": "cronos-testnet-xitcoin-testnet",
+  "routeId": "0x21121c16b53a726056a6683f00c7eb4da5501ce8a2abc8a4677e06f1e94b5cd9",
   "cronosChainId": 338,
   "xitcoinChainId": "xitcoin-testnet-v2-1",
   "relayStorePath": "/var/lib/xitcoin-bridge/coordinator/relay.sqlite",

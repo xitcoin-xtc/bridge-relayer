@@ -9,8 +9,9 @@ does not load keys, start services or broadcast transactions.
 - Pin a complete release commit and the successful preflight report digest.
 - Use a SHA-256 decision identifier without personal or secret information.
 - Limit authorization to one hour or less.
-- Pin the isolated route to `cronos-testnet-xitcoin-testnet`, Cronos EVM
-  Testnet chain ID `338` and Xitcoin chain ID `xitcoin-testnet-v2-1`. The
+- Pin the isolated route to the stored Xitcoin route ID
+  `0x21121c16b53a726056a6683f00c7eb4da5501ce8a2abc8a4677e06f1e94b5cd9`, Cronos
+  EVM Testnet chain ID `338` and Xitcoin chain ID `xitcoin-testnet-v2-1`. The
   production route and Cronos chain ID `25` are invalid in this testnet plan.
 - Permit exactly two very small transfers using test-only assets: Cronos
   Testnet to Xitcoin Testnet, then Xitcoin Testnet to Cronos Testnet. The

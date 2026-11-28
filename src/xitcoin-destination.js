@@ -1,10 +1,9 @@
 import { createHash } from "node:crypto";
 import { bech32Encode } from "./address.js";
-import { attestationId, DIRECTION_INBOUND } from "./protocol.js";
+import { XITCOIN_TESTNET_ROUTE_ID, attestationId, DIRECTION_INBOUND } from "./protocol.js";
 import { destinationSnapshot, exactFields, decimal, decimalOrSafeInteger, validateSourceEvidence, verifiedDestinationQuorum } from "./destination-validation.js";
 
 export const XITCOIN_MESSAGE_TYPE = "/cosmos.evm.bridge.v1.MsgSubmitAttestation";
-const ROUTE = "cronos-testnet-xitcoin-testnet";
 
 function address(value) {
   const alphabet = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
@@ -40,7 +39,7 @@ export function prepareXitcoinAttestation(input) {
     // The destination chain ID is signed (network-specific digest) but not sent:
     // the chain verifies against its own chain ID.
     if (p.destinationChainId !== value.chainId) throw new Error();
-    if (p.routeId !== ROUTE || p.sourceChainId !== "338" || !/^0x[0-9a-f]{64}$/.test(p.sourceRef)) throw new Error();
+    if (p.routeId !== XITCOIN_TESTNET_ROUTE_ID || p.sourceChainId !== "338" || !/^0x[0-9a-f]{64}$/.test(p.sourceRef)) throw new Error();
     const nonce = decimal(p.nonce, 64);
     decimal(p.amount, 256);
     const deadline = decimalOrSafeInteger(p.deadlineUnix, 63);

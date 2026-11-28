@@ -2,7 +2,7 @@ import { constants as fsConstants } from "node:fs";
 import { open as openDefault } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 
-import { normalizeBytes32 } from "./protocol.js";
+import { XITCOIN_TESTNET_ROUTE_ID, normalizeBytes32 } from "./protocol.js";
 import { TESTNET_ROUTE_ID } from "./preflight.js";
 import {
   connectCronosProviders,
@@ -62,7 +62,7 @@ export function validateSignerConfig(input) {
   const identity = text(config.identity, "signer identity");
   if (!/^signer-[123]$/.test(identity)) throw new Error("signer identity is not canonical");
   const routeId = text(policy.routeId, "route ID");
-  if (routeId !== "cronos-testnet-xitcoin-testnet") throw new Error("testnet route ID is not canonical");
+  if (routeId !== XITCOIN_TESTNET_ROUTE_ID) throw new Error("testnet route ID is not canonical");
   const pinnedCronosRouteId = normalizeBytes32(policy.cronosRouteId);
   if (pinnedCronosRouteId !== TESTNET_ROUTE_ID.toLowerCase()) throw new Error("Cronos testnet route ID is not canonical");
   const cronosChainId = integer(policy.cronosChainId, "Cronos chain ID");
