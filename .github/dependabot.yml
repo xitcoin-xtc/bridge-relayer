@@ -4,6 +4,14 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # The Cronos EVM tests compile the vendored vault against this package
+      # (test/evm/harness.js, test/evm/provenance.json). It must stay on the
+      # exact version the deployed vault was built with (5.4.0, solc 0.8.30,
+      # evmVersion paris); later releases change the compiled code, and 5.6
+      # needs the Cancun mcopy instruction. Change it only together with a
+      # reviewed vault deployment.
+      - dependency-name: "@openzeppelin/contracts"
     groups:
       npm-minor-and-patch:
         update-types:
