@@ -353,12 +353,21 @@ Resolve, by owner decision and without touching the broadcast ledger:
   and serve state, blocks and the index for at least `historyBlocks` recent
   blocks plus the maximum expected downtime. A lagging or catching-up origin,
   a disagreement or a transport failure is a temporary stop (`temporarily_stopped`).
-- Set `maxGasPrice`, `feeMultiplierPercent` and `maxFee` from the testnet fee
-  market. The fee multiplier keeps the fee above base-fee rises between mempool
-  admission and execution: a transaction whose fee falls below the base fee at
-  execution fails in the ante handler without consuming its sequence and
-  usually ends `broadcast_attempts_exhausted` (blocking), because nodes refuse
-  to readmit identical bytes they have already seen committed.
+- Set `maxGasPrice`, `feeMultiplierPercent` (at least 150) and `maxFee` from
+  the testnet fee market. The fee multiplier keeps the fee above base-fee rises
+  (up to 12.5% per full block) between signing and execution. A transaction
+  evicted or rejected for its fee leaves the sequence unused: the submitter
+  waits (`fee_below_required`) and resends the identical bytes once they would
+  be admitted. Keep CometBFT's default `keep-invalid-txs-in-cache = false` on
+  every origin so that rejected bytes can be readmitted. With every attempt
+  spent the row waits (`broadcast_attempts_exhausted` in the cycle log) and
+  holds the queue without a persisted halt: review it; the bytes remain valid
+  and the ledger must not be edited.
+- Anyone who has seen our bytes can re-wrap the same signed content with
+  another signature encoding (the chain's eth_secp256k1 verifier ignores the
+  65th byte and accepts 64-byte signatures). Such a copy that lands first is
+  recognised by signed content and recorded as `released_elsewhere` with its
+  hash.
 - A paused or disabled route, a fee above the cap or an insufficient balance
   makes it wait without claiming anything. An approval too close to its
   deadline, an amount above the limits, an exhausted daily limit, a reached
@@ -378,7 +387,8 @@ Resolve, by owner decision and without touching the broadcast ledger:
   `block_number` (header `x-cosmos-block-height`). Reason codes:
   `route_paused`, `signer_set_rotated`, `transfer_limit_exceeded`,
   `daily_limit_exhausted`, `outstanding_limit_reached` (`reverted`);
-  `processed_without_record`, `failure_history_unserved` (`release_unverified`).
+  `processed_without_record`, `failure_history_unserved`,
+  `inclusion_history_unserved` (`release_unverified`).
 - Logs contain only stable codes, transfer IDs (attestation IDs) and
   transaction hashes.
 
