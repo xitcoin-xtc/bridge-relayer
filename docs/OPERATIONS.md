@@ -241,10 +241,12 @@ transaction is recorded as `released_elsewhere` with that transaction.
   one of its three origins. When the submitter was down for longer than an
   origin's retention, history about its own last transaction that some
   origins no longer serve ends in a non-blocking `release_unverified` alert
-  (below) instead of a stop; if every origin has lost the transaction itself,
-  or an origin's copy of the block a receipt claims does not contain it, the
-  row halts `nonce_consumed_without_receipt` for review (possible key
-  compromise: our nonce was used without our transaction).
+  (below) instead of a stop. If every origin has lost the transaction itself,
+  or a receipt only some origins return is not confirmed in its block by a
+  strict majority of origins, the row halts `nonce_consumed_without_receipt`
+  for review (possible key compromise: our nonce was used without our
+  transaction). With only two origins, one origin that has pruned old blocks
+  is enough for that halt; run three.
 - Give it at least two independent RPC providers per chain (reviewed loopback
   tunnels with the provided template). It never acts on a disagreement: a
   disagreement, transport failure or a RelayStore locked by the coordinator is
