@@ -4,10 +4,10 @@ import { isAbsolute, join, normalize } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { Interface, Signature, Transaction, getAddress, keccak256 } from "ethers";
 import { BroadcastLedger } from "./broadcast-ledger.js";
-import { createBoundedGetFetch } from "./bounded-transport.js";
+import { TransportError, createBoundedGetFetch } from "./bounded-transport.js";
 import { buildTransferApprovalRequest } from "./coordinator.js";
 import { inspectCronosSignedTransaction, prepareCronosRelease } from "./cronos-destination.js";
-import { CronosRpcQuorum, RpcDisagreement } from "./cronos-rpc.js";
+import { CronosRpcQuorum, RpcDisagreement, RpcInvalid } from "./cronos-rpc.js";
 import { verifiedDestinationQuorum } from "./destination-validation.js";
 import { runDurableSubmissionCycle, SubmissionUnavailable } from "./durable-broadcast.js";
 import { CometBftHttpClient, decodeXitcoinOutboundBlock, decodeXitcoinOutboundTransaction } from "./network.js";
@@ -15,7 +15,7 @@ import { TESTNET_ROUTE_ID } from "./preflight.js";
 import { DIRECTION_OUTBOUND } from "./protocol.js";
 import { createEncryptedKeystoreDigestSigner } from "./secure-keystore.js";
 import { createOutboundSourceVerifier } from "./source-verification.js";
-import { RelayStore } from "./store.js";
+import { RelayStore, isRelayStoreBusy } from "./store.js";
 import { validateCronosTestnetManifest } from "./submitter-manifest.js";
 import { XitcoinFinalizedWatcher } from "./watchers.js";
 
@@ -39,7 +39,11 @@ const VAULT = new Interface([
 const RELEASED_TOPIC = VAULT.getEvent("Released").topicHash;
 const ZERO_WORD = "0".repeat(64);
 const halt = (code) => ({ action: "halt", code });
+// Route-scoped waits stop the cycle; transfer-scoped waits defer only that
+// transfer so the queue keeps moving.
 const wait = (code) => ({ action: "wait", code });
+const defer = (code) => ({ action: "wait", code, defer: true });
+const hex = (number) => `0x${number.toString(16)}`;
 const unavailable = (code) => new SubmissionUnavailable(code);
 
 function words(value, count) {
@@ -122,9 +126,50 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
   async function live(transferId) {
     const [paused, processed, liquidity, blocks] = await Promise.all([viewEach("paused", [], boolean),
       viewEach("processedBurns", [transferId], boolean), viewEach("availableLiquidity", [], uint), rpc.latestBlocks()]);
+    const times = blocks.map((block) => block.timestamp);
     return { paused: paused.some(Boolean), processedAll: processed.every(Boolean), processedAny: processed.some(Boolean),
-      liquidity: min(liquidity), chainTime: Math.max(...blocks.map((block) => block.timestamp)) };
+      liquidity: min(liquidity), chainTime: Math.max(...times), agreedChainTime: Math.min(...times) };
   }
+
+  // A permanent deadline decision needs every origin to agree that the margin
+  // is lost; a single origin (or the local clock) can only stop temporarily.
+  function marginLost(request, nowUnix, state) {
+    if (request.deadlineUnix < state.agreedChainTime + margin) return true;
+    if (request.deadlineUnix < Math.max(nowUnix, state.chainTime) + margin) throw unavailable("deadline_evidence_disagreement");
+    return false;
+  }
+
+  // The vault's Released event for this burn from any transaction, identical
+  // on every origin, searched backwards over a bounded window. Every approved
+  // field the event carries must match; the receipt must succeed and contain
+  // it, and its block must be canonical. Null when no event is in the window.
+  async function releaseElsewhere(request, ownHash = null) {
+    const p = request.payload, burn = String(p.sourceBurnId).toLowerCase();
+    const expected = VAULT.encodeEventLog(VAULT.getEvent("Released"), [p.sourceBurnId, p.recipient, p.amount, p.signerSetVersion]);
+    const tip = await rpc.tip();
+    const lowest = Math.max(0, tip - cronos.releaseLookbackBlocks);
+    for (let to = tip; to >= lowest; to -= cronos.logRangeBlocks) {
+      const from = Math.max(lowest, to - cronos.logRangeBlocks + 1);
+      const logs = (await rpc.logs({ address: vault, topics: [RELEASED_TOPIC, burn], fromBlock: hex(from), toBlock: hex(to) }))
+        .filter((log) => !log.removed && log.address === vault.toLowerCase() && log.topics[0] === RELEASED_TOPIC && log.topics[1] === burn);
+      if (!logs.length) continue;
+      const log = logs[0];
+      if (logs.length > 1 || stable(log.topics) !== stable(expected.topics.map((topic) => topic.toLowerCase()))
+          || log.data !== expected.data.toLowerCase()) return { mismatch: true };
+      if (log.transactionHash === ownHash) return { final: false };
+      const receipts = await rpc.receipts(log.transactionHash);
+      if (receipts.some((receipt) => receipt === null)) return { final: false };
+      if (receipts.some((receipt) => stable(receipt) !== stable(receipts[0]))) throw new RpcDisagreement();
+      const receipt = receipts[0];
+      if (receipt.status !== "0x1" || receipt.blockHash !== log.blockHash || receipt.blockNumber !== log.blockNumber
+          || !receipt.logs.some((item) => stable(item) === stable(log))) return { mismatch: true };
+      if ((await rpc.block(log.blockNumber)).hash !== log.blockHash || log.blockNumber > tip - cronos.confirmations) return { final: false };
+      return { final: true, releaseHash: log.transactionHash, blockNumber: log.blockNumber, blockHash: log.blockHash };
+    }
+    return null;
+  }
+  const released = (evidence) => ({ action: "released_elsewhere", releaseHash: evidence.releaseHash,
+    blockNumber: evidence.blockNumber, blockHash: evidence.blockHash });
 
   async function simulate(request) {
     const results = await rpc.callEach(request, "latest");
@@ -181,30 +226,37 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
       await rpc.chainId();
       if (!storedRequestMatches(transfer, request, approvals) || transferId !== transfer.source_ref) return halt("stored_request_mismatch");
       const recipient = String(request.payload.recipient).toLowerCase();
+      // The vault refuses these recipients forever: reject this transfer alone.
       if (!/^0x[0-9a-f]{40}$/.test(recipient) || /^0x0{40}$/.test(recipient) || recipient === "0x000000000000000000000000000000000000dead"
-          || recipient === vault.toLowerCase()) return halt("invalid_recipient");
-      if (request.deadlineUnix < nowUnix + margin) return wait("approval_expired_awaiting_reissue");
+          || recipient === vault.toLowerCase()) return { action: "reject", code: "invalid_recipient" };
+      if (request.deadlineUnix < nowUnix + margin) return defer("approval_expired_awaiting_reissue");
       const identity = await identityAt(Math.max(0, await rpc.tip() - cronos.confirmations));
       try {
         const quorum = verifiedDestinationQuorum(request, approvals, cronos.authorizedSigners, nowUnix);
         if (quorum.some(({ signature }) => ![27, 28].includes(Number.parseInt(signature.slice(130, 132), 16)))) throw new Error();
       } catch { return halt("stored_quorum_invalid"); }
       const amount = BigInt(request.payload.amount);
-      if (amount > BigInt(cronos.maxAmount) || amount > identity.maxReleaseAmount) return wait("amount_above_release_limit");
+      if (amount > BigInt(cronos.maxAmount) || amount > identity.maxReleaseAmount) return defer("amount_above_release_limit");
       const state = await live(transferId);
       if (state.paused) return wait("route_paused");
-      if (state.processedAll) return halt("processed_without_local_transaction");
-      if (state.processedAny) return wait("replay_state_unsettled");
-      if (request.deadlineUnix < Math.max(nowUnix, state.chainTime) + margin) return wait("approval_expired_awaiting_reissue");
-      if (state.liquidity < amount) return wait("insufficient_vault_liquidity");
+      if (state.processedAll) {
+        // Released by another transaction (anyone may call the vault with valid approvals).
+        const evidence = await releaseElsewhere(request);
+        if (evidence?.mismatch) return halt("processed_with_mismatching_release");
+        if (!evidence) return defer("processed_elsewhere_unverified");
+        return evidence.final ? released(evidence) : defer("release_elsewhere_not_final");
+      }
+      if (state.processedAny) return defer("replay_state_unsettled");
+      if (request.deadlineUnix < Math.max(nowUnix, state.chainTime) + margin) return defer("approval_expired_awaiting_reissue");
+      if (state.liquidity < amount) return defer("insufficient_vault_liquidity");
       try { await verifySource(request); } catch { throw unavailable("source_finality_unverified"); }
       const data = calldata(request, approvals);
       const gasPrice = max(await rpc.gasPrices());
       if (gasPrice < 1n || gasPrice > maxGasPrice) return wait("gas_price_above_cap");
       const estimates = await rpc.estimateEach({ from: submitter, to: vault, data });
-      if (estimates.some((estimate) => !estimate.ok)) return wait("release_simulation_reverted");
-      if (estimates.some((estimate) => estimate.value > gasLimit)) return wait("gas_estimate_above_limit");
-      if (!await simulate({ from: submitter, to: vault, data })) return wait("release_simulation_reverted");
+      if (estimates.some((estimate) => !estimate.ok)) return defer("release_simulation_reverted");
+      if (estimates.some((estimate) => estimate.value > gasLimit)) return defer("gas_estimate_above_limit");
+      if (!await simulate({ from: submitter, to: vault, data })) return defer("release_simulation_reverted");
       if (min(await rpc.balances(submitter)) < gasLimit * gasPrice) return wait("submitter_balance_insufficient");
       return { action: "sign", context: Object.freeze({ gasPrice: gasPrice.toString(), blockHash: identity.blockHash }) };
     },
@@ -251,9 +303,17 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
       if (nonces.pending !== nonces.latest) return halt("foreign_pending_transaction");
       const state = await live(row.transferId);
       if (state.paused) return wait("route_paused");
-      if (state.processedAll) return halt("processed_by_foreign_transaction");
+      if (state.processedAll) {
+        // Released elsewhere after our bytes were committed. Send the identical
+        // bytes once anyway: they revert, but consume the nonce the ledger
+        // reserved for them, so the next transfer keeps sequential nonces.
+        const evidence = await releaseElsewhere(request);
+        if (evidence?.mismatch) return halt("processed_with_mismatching_release");
+        if (!evidence) throw unavailable("release_evidence_unavailable");
+        return { action: "send" };
+      }
       if (state.processedAny) return wait("replay_state_unsettled");
-      if (request.deadlineUnix < Math.max(nowUnix, state.chainTime) + margin) return halt("approval_expired_before_broadcast");
+      if (marginLost(request, nowUnix, state)) return halt("approval_expired_before_broadcast");
       const exact = { from: submitter, to: vault, data: tx.data, gas: `0x${tx.gasLimit.toString(16)}`, gasPrice: `0x${tx.gasPrice.toString(16)}` };
       if (!await simulate(exact)) return wait("release_simulation_reverted");
       return { action: "send" };
@@ -281,14 +341,17 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
         if (nonces.latest < row.nonce) return halt("account_nonce_regressed");
         if (nonces.pending !== nonces.latest) return await visible() ? { action: "pending" } : halt("foreign_pending_transaction");
         const state = await live(row.transferId);
+        if (state.paused) return wait("route_paused");
         if (state.processedAny) {
           if (!state.processedAll || await visible()) return { action: "pending" };
           const again = await accountNonces();
+          if (again?.latest !== row.nonce) return { action: "pending" };
           // Still unknown with our nonce unused: another transaction released it.
-          return again?.latest === row.nonce ? halt("processed_by_foreign_transaction") : { action: "pending" };
-        }
-        if (state.paused) return wait("route_paused");
-        if (request.deadlineUnix < Math.max(nowUnix, state.chainTime) + margin) return halt("approval_expired_before_inclusion");
+          // Resend the identical bytes so the reserved nonce is consumed.
+          const evidence = await releaseElsewhere(request, row.transactionHash);
+          if (evidence?.mismatch) return halt("processed_with_mismatching_release");
+          if (!evidence) throw unavailable("release_evidence_unavailable");
+        } else if (marginLost(request, nowUnix, state)) return halt("approval_expired_before_inclusion");
         if (row.broadcastAttempts >= cronos.maxBroadcastAttempts) return halt("broadcast_attempts_exhausted");
         return { action: "rebroadcast" };
       }
@@ -300,7 +363,9 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
           || receipt.to !== vault.toLowerCase() || receipt.contractAddress !== null) return halt("receipt_mismatch");
       const included = await rpc.transactions(row.transactionHash);
       if (included.some((observed) => observed === null)) return { action: "pending" };
-      if (included.some((observed) => !matchesProvider(observed, tx))) return halt("included_transaction_mismatch");
+      // Persist a mismatch only when every origin returns the same object.
+      if (included.some((observed) => stable(observed) !== stable(included[0]))) throw new RpcDisagreement();
+      if (!matchesProvider(included[0], tx)) return halt("included_transaction_mismatch");
       if (included.some((observed) => observed.blockHash !== receipt.blockHash || observed.blockNumber !== receipt.blockNumber)) {
         return { action: "pending" };
       }
@@ -310,7 +375,15 @@ export function createCronosAdapter({ manifest, rpc, signer, verifySource }) {
       const finalizedHeight = tip - cronos.confirmations;
       if (receipt.blockNumber > finalizedHeight) return { action: "pending" };
       const inclusion = { blockNumber: receipt.blockNumber, blockHash: receipt.blockHash };
-      if (receipt.status === "0x0") return { action: "failed", ...inclusion };
+      if (receipt.status === "0x0") {
+        // A revert because another finalized transaction already released this
+        // transfer (for example a front-run copying our calldata) is not a failure.
+        if (!boolean(await rpc.call(view("processedBurns", [row.transferId]), finalizedHeight))) return { action: "failed", ...inclusion };
+        const evidence = await releaseElsewhere(request, row.transactionHash);
+        if (evidence?.mismatch) return halt("processed_with_mismatching_release");
+        if (!evidence) throw unavailable("release_evidence_unavailable");
+        return evidence.final ? released(evidence) : { action: "pending" };
+      }
       if (!boolean(await rpc.call(view("processedBurns", [row.transferId]), finalizedHeight))) return halt("replay_flag_missing_after_release");
       return { action: "finalized", ...inclusion };
     },
@@ -324,11 +397,25 @@ export function cronosLedgerBinding(manifest) {
 }
 
 // RelayStore is created by the coordinator. Never create an empty one here.
-export function openExistingRelayStore(path) {
+export function openExistingRelayStore(path, options) {
   if (typeof path !== "string" || !isAbsolute(path) || normalize(path) !== path) throw unavailable("relay_store_unavailable");
   const info = lstatSync(path, { throwIfNoEntry: false });
   if (!info || !info.isFile() || info.isSymbolicLink()) throw unavailable("relay_store_unavailable");
-  return new RelayStore(path);
+  return new RelayStore(path, options);
+}
+
+// Conditions that persist nothing and may clear by themselves: the runtime
+// pauses and retries. Persisted halts, identity or configuration mismatches and
+// unknown errors still stop the process for an operator.
+const TEMPORARY_CODES = new Set(["deadline_evidence_disagreement", "release_evidence_unavailable",
+  "rpc_transaction_mismatch", "source_finality_unverified"]);
+export function isTemporaryStop(error) {
+  return error instanceof TransportError || error instanceof RpcDisagreement || error instanceof RpcInvalid
+    || isRelayStoreBusy(error) || (error instanceof SubmissionUnavailable && TEMPORARY_CODES.has(error.code));
+}
+function temporaryCode(error) {
+  if (isRelayStoreBusy(error)) return "relay_store_busy";
+  return typeof error?.code === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(error.code) ? error.code : "temporary_condition";
 }
 
 const delay = (ms, signal) => new Promise((resolve) => {
@@ -369,10 +456,18 @@ export async function buildCronosSubmitterRuntime(manifest, { credentialsDirecto
       manifest: config,
       runOnce,
       async run({ signal } = {}) {
+        let failures = 0;
         while (!signal?.aborted) {
-          const report = await runOnce();
-          log(report);
-          await delay(config.cycleIntervalMs, signal);
+          try {
+            log(await runOnce());
+            failures = 0;
+            await delay(config.cycleIntervalMs, signal);
+          } catch (error) {
+            if (!isTemporaryStop(error)) throw error;
+            failures = Math.min(failures + 1, 8);
+            log(Object.freeze({ destination: "cronos", action: "temporarily_stopped", code: temporaryCode(error) }));
+            await delay(Math.min(config.cycleIntervalMs * 2 ** failures, 300_000), signal);
+          }
         }
       },
       close() {

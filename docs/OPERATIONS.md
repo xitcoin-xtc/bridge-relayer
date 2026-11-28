@@ -223,13 +223,22 @@ transaction is recorded as `released_elsewhere` with that transaction.
   identity; pass its password only as the encrypted systemd credential
   `keystore-password`.
 - Give it at least two independent RPC providers per chain (reviewed loopback
-  tunnels with the provided template). It stops on any disagreement.
-- It stops on halts, RPC disagreement, transport failures and finalized failed
-  executions and does not restart itself. Investigate before restarting; never
-  lower confirmations, remove a pinned value or reset state to resume.
-- A paused vault, an approval too close to its deadline, a gas price above the
-  cap, insufficient liquidity or submitter balance makes it wait without
-  claiming anything.
+  tunnels with the provided template). It never acts on a disagreement: a
+  disagreement, transport failure or a RelayStore locked by the coordinator is
+  a temporary stop, retried with backoff and logged as `temporarily_stopped`.
+- It stops on persisted halts, finalized failed executions and identity or
+  configuration mismatches and does not restart itself. Investigate before
+  restarting; never lower confirmations, remove a pinned value or reset state
+  to resume.
+- A paused vault, a gas price above the cap or an insufficient submitter
+  balance makes it wait without claiming anything. A transfer with an approval
+  too close to its deadline, an amount above the limits, insufficient vault
+  liquidity or a failing simulation is deferred (1 minute, doubling, at most 1
+  hour) while the next transfers proceed.
+- A release of a burn by another transaction (for example a front-run) is
+  recorded as `released_elsewhere` and is not an error. A transfer to an
+  invalid recipient is `rejected` and needs an operator decision (refund
+  procedure); it does not block other transfers.
 - Logs contain only stable codes, transfer IDs and transaction hashes.
 
 ## Testnet preflight
