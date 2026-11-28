@@ -20,7 +20,14 @@ if [[ -z "$pinned" || "$pinned" != "$actual" ]]; then
   exit 1
 fi
 
+# The SDK module (pos-chain replaces it with its fork) must be in the module
+# cache before its directory can be listed.
+(cd "$pos_chain/evmd" && go mod download github.com/cosmos/cosmos-sdk)
 sdk="$(cd "$pos_chain/evmd" && go list -m -f '{{.Dir}}' github.com/cosmos/cosmos-sdk)"
+if [[ -z "$sdk" || ! -d "$sdk/proto" ]]; then
+  echo "Cosmos SDK module source not found" >&2
+  exit 1
+fi
 status=0
 check() {
   if ! cmp -s "$repo_root/test/fixtures/proto/$1" "$2"; then
