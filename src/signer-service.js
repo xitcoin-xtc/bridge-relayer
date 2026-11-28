@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { getAddress, isHexString, recoverAddress, Signature } from "ethers";
+import { ZeroAddress, getAddress, isHexString, recoverAddress, Signature } from "ethers";
 
 import { approvalContentHash, approvalSourceKey, buildApprovalRequest } from "./approvals.js";
 import { DIRECTION_INBOUND, DIRECTION_OUTBOUND, validateChainId, validateRouteId } from "./protocol.js";
@@ -50,6 +50,10 @@ export function authorizeSignerRequest({ request, policy, nowUnix = Math.floor(D
     if (!policy.routes.has(validateRouteId(canonical.payload.routeId))) throw new Error("route is not authorized");
     if (!policy.chains.has(positiveInteger(canonical.payload.chainId, "destination chain ID"))) throw new Error("destination chain is not authorized");
     if (!policy.vaults.has(getAddress(canonical.payload.vault).toLowerCase())) throw new Error("destination vault is not authorized");
+    // The vault refuses these recipients forever; never sign an unreleasable approval.
+    const recipient = getAddress(canonical.payload.recipient).toLowerCase();
+    if (recipient === ZeroAddress || recipient === "0x000000000000000000000000000000000000dead"
+        || recipient === getAddress(canonical.payload.vault).toLowerCase()) throw new Error("release recipient is not allowed");
   } else {
     throw new Error("approval direction is not authorized");
   }

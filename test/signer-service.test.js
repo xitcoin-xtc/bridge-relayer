@@ -72,3 +72,15 @@ test("HTTP boundary requires authorization and bounded JSON", async () => {
   assert.equal(allowedResponse.status, 200);
   assert.equal(JSON.parse(allowedResponse.body).accepted, inbound().digest);
 });
+
+// Regression: an approval the vault can never execute would otherwise reach the
+// submitter as a permanently unreleasable transfer.
+test("signer policy refuses release recipients the vault rejects: zero, dead and the vault itself", () => {
+  for (const recipient of ["0x0000000000000000000000000000000000000000", "0x000000000000000000000000000000000000dEaD",
+    "0x000000000000000000000000000000000000dead", VAULT, VAULT.toLowerCase()]) {
+    assert.throws(() => authorizeSignerRequest({ request: outbound({ recipient }), policy: policy(), nowUnix: 1_900_000_000 }),
+      /recipient is not allowed/, recipient);
+  }
+  assert.equal(authorizeSignerRequest({ request: outbound(), policy: policy(), nowUnix: 1_900_000_000 }).payload.recipient,
+    "0x2222222222222222222222222222222222222222");
+});
