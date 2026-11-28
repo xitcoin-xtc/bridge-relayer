@@ -198,9 +198,14 @@ activation.
 
 Never manually retry an approved or submitted transfer. The submission helper
 can resume a persisted transaction reference or a canonically processed record.
-An ambiguous broadcast without a saved reference requires durable recovery that
-is not implemented yet. Both public submitter startup paths fail closed;
-[SUBMITTERS.md](SUBMITTERS.md) lists the exact adapter and persistence gaps.
+The [durable broadcast ledger](SUBMITTERS.md#durable-broadcast-ledger) persists
+exact signed bytes before any send and recovers ambiguous broadcasts by
+observation or by resending only those identical bytes; it is not yet connected
+to a startup path. Never delete, copy between hosts or restore an old copy of a
+broadcast ledger: like a signer journal, it is what prevents a second
+transaction. Back it up like a key. A `failed` or `halted` ledger row blocks the
+submitter until an offline review. Both public submitter startup paths fail
+closed; [SUBMITTERS.md](SUBMITTERS.md) lists the exact adapter gaps.
 
 ## Testnet preflight
 

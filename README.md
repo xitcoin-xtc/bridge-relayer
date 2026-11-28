@@ -74,7 +74,10 @@ See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) and
 
 The public destination submitter phase provides strict root-owned manifests,
 immutable release binding and offline checks for `xitcoin` and `cronos`. Both
-startup paths fail closed pending production adapters and durable broadcast
-recovery. See [phase-one scope and exact gaps](docs/SUBMITTERS.md). The existing
-submission helper and staging adapters exercise status-first recovery and
-idempotent completion; they do not yet provide a production broadcaster.
+startup paths fail closed pending production adapters. See
+[phase-one scope and exact gaps](docs/SUBMITTERS.md). A destination-generic
+[durable broadcast ledger](docs/SUBMITTERS.md#durable-broadcast-ledger) commits
+an exclusive claim and the exact signed transaction before any send and recovers
+without ever creating a second transaction; it is not yet connected to startup.
+The existing submission helper and staging adapters exercise status-first
+recovery and idempotent completion; they do not provide a production broadcaster.
