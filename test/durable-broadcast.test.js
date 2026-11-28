@@ -518,3 +518,25 @@ for (const destination of ["cronos", "xitcoin"]) {
     await until(cycle, chain, () => setup.store.get(second.sourceChain, second.sourceRef).state === "completed");
   }));
 }
+
+test("a destination that paces its own resends records every send past 32 and reports a stalled row, never a halt", () => harness("xitcoin", async ({ chain, cycle, setup, adapterOptions }) => {
+  approvedTransfer(setup.store, "xitcoin");
+  const base = modelAdapter("xitcoin", chain, adapterOptions);
+  const paced = { ...base, maxBroadcastAttempts: null, stalledAlertSeconds: 600, observe: async () => ({ action: "rebroadcast" }) };
+  const now = Date.now();
+  const first = await cycle({ adapter: paced, nowMs: now });
+  assert.equal(first.action, "submitted");
+  assert.equal(first.attention.stalled, 0);
+  for (let attempt = 2; attempt <= 40; attempt++) {
+    const report = await cycle({ adapter: paced, nowMs: now });
+    assert.deepEqual([report.action, report.attempts], ["rebroadcast", attempt]);
+  }
+  assert.equal(chain.distinctDeliveries(), 1); // identical bytes only
+  const late = await cycle({ adapter: { ...paced, observe: async () => ({ action: "wait", code: "fee_below_required" }) },
+    nowMs: now + 3_600_000 });
+  assert.deepEqual([late.action, late.code, late.attention.stalled], ["waiting", "fee_below_required", 1]);
+  assert.equal(setup.ledger.blocking().length, 0);
+  for (const patch of [{ stalledAlertSeconds: 0 }, { stalledAlertSeconds: "600" }]) {
+    await assert.rejects(cycle({ adapter: { ...paced, ...patch }, nowMs: now }), SubmissionUnavailable);
+  }
+}));

@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, rmSync, symlinkSync, chmodSync, mkdirSync } from "node:fs";
+import { closeSync, mkdtempSync, openSync, rmSync, symlinkSync, chmodSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { keccak256, sha256 } from "ethers";
-import { BroadcastLedger, ledgerBinding, LEDGER_MAX_BROADCAST_ATTEMPTS } from "../src/broadcast-ledger.js";
+import { BroadcastLedger, ledgerBinding, LEDGER_MAX_BROADCAST_ATTEMPTS, LEDGER_SCHEMA_V1, LEDGER_SCHEMA_VERSION } from "../src/broadcast-ledger.js";
 import { evmAddressToBech32 } from "../src/address.js";
 import { journalOptions } from "./journal-fixture.js";
 import { signers } from "./fixtures/destination.js";
@@ -409,7 +409,7 @@ test("reopening requires the identical binding, schema, triggers and version", (
   assert.throws(() => ledger.assertBinding({ ...bindings.cronos, targetIdentity: hash("e") }), failure);
   ledger.assertBinding(bindings.cronos);
   ledger.close();
-  for (const sql of ["DROP TRIGGER transfers_no_delete", "PRAGMA user_version = 2",
+  for (const sql of ["DROP TRIGGER transfers_no_delete", "PRAGMA user_version = 1", "PRAGMA user_version = 3",
     "CREATE INDEX unexpected ON transfers(state)", "DROP TABLE transfer_events",
     "CREATE TABLE extra (id INTEGER) STRICT"]) {
     await fixture((copy) => {
@@ -515,4 +515,117 @@ test("ledger filesystem rejects symlinks, shared parents and foreign identities"
     identity: () => ({ username: "xitcoin-bridge-submitter-cronos", uid: process.geteuid() + 1 }) }), failure);
   assert.throws(() => new BroadcastLedger(path, bindings.cronos, journalOptions("xitcoin")), failure);
   assert.throws(() => new BroadcastLedger("relative.sqlite", bindings.cronos, journalOptions("cronos")), failure);
+}));
+
+// A version 1 ledger as the previous release created it: exact DDL, binding,
+// rows in every state that can exist, and the 32-attempt cap in a CHECK.
+function versionOneLedger(path, destination, populate) {
+  closeSync(openSync(path, "wx", 0o600));
+  const raw = new DatabaseSync(path);
+  try {
+    raw.exec("BEGIN IMMEDIATE");
+    raw.exec(LEDGER_SCHEMA_V1);
+    raw.exec("PRAGMA user_version = 1");
+    raw.prepare("INSERT INTO ledger_binding VALUES (1, ?)").run(ledgerBinding(bindings[destination]));
+    populate?.(raw);
+    raw.exec("COMMIT");
+  } finally { raw.close(); }
+}
+const insert = (raw, values) => raw.prepare(`INSERT INTO transfers (transfer_id, source_ref, approval_digest, request_hash, state,
+  claim_epoch, broadcast_attempts, reason_code, release_hash, block_number, block_hash, created_at, updated_at)
+  VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?, 10, 10)`).run(...values);
+
+test("a version 1 ledger is migrated forward once, keeping every row and rule; attempts are no longer capped at 32", () => fixture((path) => {
+  assert.equal(LEDGER_SCHEMA_VERSION, 2);
+  versionOneLedger(path, "xitcoin", (raw) => {
+    raw.prepare("INSERT INTO worker_lease VALUES (1, ?, 3, 0)").run(owner(1));
+    raw.prepare("INSERT INTO account_nonce VALUES (1, 8)").run();
+    insert(raw, [hash("1"), hash("1"), hash("b"), hash("d"), "claimed", null, null, null, null]);
+    raw.exec(`UPDATE transfers SET state = 'signed', nonce = 7, signed_hex = '${bytes("1")}', transaction_digest = '${sha256(bytes("1"))}',
+      transaction_hash = '${keccak256(bytes("1"))}' WHERE transfer_id = '${hash("1")}'`);
+    for (let attempt = 0; attempt < 32; attempt++) {
+      raw.exec(`UPDATE transfers SET state = 'broadcast', broadcast_attempts = broadcast_attempts + 1 WHERE transfer_id = '${hash("1")}'`);
+    }
+    // The cap the migration lifts: a 33rd attempt is impossible in version 1.
+    assert.throws(() => raw.exec(`UPDATE transfers SET broadcast_attempts = 33 WHERE transfer_id = '${hash("1")}'`));
+    insert(raw, [hash("2"), hash("2"), hash("b"), hash("d"), "rejected", "invalid_recipient", null, null, null]);
+    insert(raw, [hash("3"), hash("3"), hash("b"), hash("d"), "released_elsewhere", null, hash("e"), 4, hash("f")]);
+    insert(raw, [hash("4"), hash("4"), hash("b"), hash("d"), "halted", "stale", null, null, null]);
+    raw.exec(`INSERT INTO transfer_events (transfer_id, state, code, epoch, at) VALUES ('${hash("1")}', 'signed', 'signed', 3, 5)`);
+    raw.exec(`INSERT INTO deferrals VALUES ('${hash("5")}', '${hash("5")}', 'waiting', 99, 2)`);
+  });
+  const before = new DatabaseSync(path);
+  const rows = (db) => ({ transfers: db.prepare("SELECT * FROM transfers ORDER BY transfer_id").all(),
+    events: db.prepare("SELECT * FROM transfer_events ORDER BY seq").all(), deferrals: db.prepare("SELECT * FROM deferrals").all(),
+    nonce: db.prepare("SELECT * FROM account_nonce").all(), lease: db.prepare("SELECT * FROM worker_lease").all(),
+    binding: db.prepare("SELECT * FROM ledger_binding").all() });
+  const original = JSON.stringify(rows(before));
+  before.close();
+  // A ledger bound to another deployment is never migrated.
+  assert.throws(() => open(path, "cronos"), failure);
+  assert.throws(() => new BroadcastLedger(path, { ...bindings.xitcoin, targetIdentity: "a".repeat(40) }, journalOptions("xitcoin")), failure);
+  let ledger = open(path, "xitcoin");
+  ledger.close();
+  const after = new DatabaseSync(path);
+  try {
+    assert.equal(after.prepare("PRAGMA user_version").get().user_version, 2);
+    assert.equal(JSON.stringify(rows(after)), original); // every row unchanged
+  } finally { after.close(); }
+  ledger = open(path, "xitcoin"); // reopening a migrated ledger is idempotent
+  try {
+    const row = ledger.inspect(hash("1"));
+    assert.deepEqual([row.state, row.broadcastAttempts, row.nonce], ["broadcast", 32, 7]);
+    assert.equal(ledger.blocking().length, 1); // the halted row still blocks
+    const lease = ledger.acquireLease(owner(1));
+    // A capped destination still stops at its cap; an uncapped one keeps recording sends.
+    assert.throws(() => ledger.markBroadcast(lease, hash("1"), { maxAttempts: LEDGER_MAX_BROADCAST_ATTEMPTS }), failure);
+    for (let attempt = 33; attempt <= 40; attempt++) {
+      assert.equal(ledger.markBroadcast(lease, hash("1"), { maxAttempts: null }).broadcastAttempts, attempt);
+    }
+  } finally { ledger.close(); }
+  // The migrated schema keeps every trigger of version 2.
+  const raw = new DatabaseSync(path);
+  try {
+    for (const sql of ["DELETE FROM transfers", "UPDATE transfers SET broadcast_attempts = 0", "UPDATE transfers SET broadcast_attempts = 50",
+      "UPDATE transfers SET state = 'signed'", `UPDATE transfers SET signed_hex = '${bytes("x")}' WHERE transfer_id = '${hash("1")}'`,
+      "UPDATE transfers SET broadcast_attempts = -1"]) {
+      assert.throws(() => raw.exec(sql), Error, sql);
+    }
+  } finally { raw.close(); }
+}));
+
+test("only the exact version 1 schema is migrated; anything else is refused unchanged", async () => {
+  for (const sql of ["DROP TRIGGER transfers_no_delete", "CREATE INDEX unexpected ON transfers(state)", "DROP TABLE deferrals",
+    "PRAGMA user_version = 0"]) {
+    await fixture((path) => {
+      versionOneLedger(path, "cronos", (raw) => raw.exec(sql));
+      assert.throws(() => open(path, "cronos"), failure, sql);
+      const raw = new DatabaseSync(path, { readOnly: true });
+      try {
+        assert.ok([0, 1].includes(raw.prepare("PRAGMA user_version").get().user_version));
+        assert.ok(raw.prepare("SELECT sql FROM sqlite_schema WHERE name = 'transfers'").get().sql.includes("BETWEEN 0 AND 32"));
+      } finally { raw.close(); }
+    });
+  }
+});
+
+test("uncapped destinations record every send; stalled unfinished rows are counted for attention", () => fixture((path) => {
+  const ledger = open(path, "xitcoin");
+  const lease = ledger.acquireLease(owner(1));
+  ledger.claim(lease, claimOf(hash("1")));
+  ledger.recordSigned(lease, signed(hash("1"), 0));
+  for (let attempt = 1; attempt <= 40; attempt++) {
+    assert.equal(ledger.markBroadcast(lease, hash("1"), { maxAttempts: null }).broadcastAttempts, attempt);
+  }
+  assert.ok(Number.isSafeInteger(ledger.inspect(hash("1")).updatedAt));
+  const now = Date.now();
+  assert.deepEqual({ ...ledger.attention() }, { rejected: 0, expired: 0, releaseUnverified: 0, reverted: 0 });
+  assert.equal(ledger.attention({ nowMs: now, stalledAfterSeconds: 3_600 }).stalled, 0);
+  assert.equal(ledger.attention({ nowMs: now + 3_601_000, stalledAfterSeconds: 3_600 }).stalled, 1);
+  for (const options of [{ nowMs: now, stalledAfterSeconds: 0 }, { stalledAfterSeconds: 60 }, { nowMs: -1, stalledAfterSeconds: 60 }]) {
+    assert.throws(() => ledger.attention(options), failure);
+  }
+  ledger.finalize(lease, hash("1"), { blockNumber: 3, blockHash: hash("f") });
+  assert.equal(ledger.attention({ nowMs: now + 3_601_000, stalledAfterSeconds: 3_600 }).stalled, 0);
+  ledger.close();
 }));
