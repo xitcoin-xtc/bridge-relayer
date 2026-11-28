@@ -306,7 +306,9 @@ reviewed local tunnels. The manifest never contains a key or password.
     "maxGasPrice": "10000000000000",
     "maxFee": "4000000000000000000",
     "minDeadlineMarginSeconds": 120,
-    "maxBroadcastAttempts": 5
+    "maxBroadcastAttempts": 5,
+    "releaseLookbackBlocks": 50000,
+    "logRangeBlocks": 2000
   },
   "xitcoin": {
     "rpcUrls": ["http://127.0.0.1:26657", "http://127.0.0.1:26658"],
@@ -319,8 +321,9 @@ reviewed local tunnels. The manifest never contains a key or password.
 Placeholders are intentionally invalid. Bounds: `confirmations` 2–10000,
 `gasLimit` 21000–10000000, `maxGasPrice` at most 10000 gwei, `maxFee` must cover
 `gasLimit * maxGasPrice`, `minDeadlineMarginSeconds` 30–3600,
-`maxBroadcastAttempts` 1–32, `cycleIntervalMs` 1000–60000, 2–4 RPC origins per
-chain. `cronosRouteId` must equal the deployed testnet vault route
+`maxBroadcastAttempts` 1–32, `releaseLookbackBlocks` 1000–1000000,
+`logRangeBlocks` 100–10000 (keep it within the providers' `eth_getLogs` range
+limit), `cycleIntervalMs` 1000–60000, 2–4 RPC origins per chain. `cronosRouteId` must equal the deployed testnet vault route
 (`TESTNET_ROUTE_ID`), never a hash of the Xitcoin route label. The signer set
 and version must equal the vault's on-chain values. `vaultCodeHash` is
 `keccak256(eth_getCode(vault))` of the deployed runtime code. The runtime code
@@ -343,8 +346,13 @@ secure keystore adapter (`keystorePath` owned by the service identity, mode
 requires the decrypted account to equal `submitter`. It opens the existing
 RelayStore (never creating an empty one) and the broadcast ledger bound to the
 vault, code hash and submitter account, then runs one durable cycle per
-`cycleIntervalMs`. Any halt, disagreement, transport failure or unavailable
-dependency stops the process with a stable code; it does not restart itself.
+`cycleIntervalMs`. Conditions that persist nothing and may clear by themselves
+(transport failures, origins disagreeing, deadline or release evidence that not
+every origin confirms yet, a RelayStore locked by the coordinator beyond its
+5-second busy timeout) pause the loop and retry with bounded backoff (up to 5
+minutes), logging `temporarily_stopped` with a stable code. A persisted halt, a
+finalized failed execution, an identity or configuration mismatch, or any
+unknown error stops the process with a stable code; it does not restart itself.
 SIGTERM finishes the current cycle and releases the worker lease.
 
 ### Transport
@@ -369,19 +377,25 @@ the same transport.
   the stored finalized source transfer, route, vault and signer version, and the
   stored approvals form a recovered, authorized, strictly ordered 2-of-3 quorum
   with vault-compatible recovery bytes (`27`/`28`);
+- the recipient is a valid address other than zero, `0x...dEaD` and the vault;
+  otherwise the transfer is `rejected` (the vault would refuse it forever) and
+  the queue moves on. Signers refuse such approvals too;
 - the deadline leaves at least `minDeadlineMarginSeconds` against both the local
-  clock and the latest block timestamp; otherwise the transfer waits for
+  clock and the latest block timestamp; otherwise the transfer is deferred until
   re-issue;
-- amount within `maxAmount` and the vault's `maxReleaseAmount`; recipient is a
-  valid nonzero, non-dead address;
-- on every origin at the latest block: vault not paused (`route_paused` waits),
-  `processedBurns(sourceBurnId)` false (all true halts permanently,
-  mixed waits), liquidity at least the amount;
+- amount within `maxAmount` and the vault's `maxReleaseAmount` (otherwise
+  deferred);
+- on every origin at the latest block: vault not paused (`route_paused` stops
+  the cycle), `processedBurns(sourceBurnId)` false, liquidity at least the
+  amount (otherwise deferred). If every origin reports the burn processed, the
+  submitter looks for the vault's `Released` event for it (see
+  [Releases by other transactions](#releases-by-other-transactions));
 - the Xitcoin source burn is re-verified as canonical and finalized on
   independent CometBFT origins;
-- gas price (maximum across origins) within `maxGasPrice`; `eth_estimateGas`
-  within `gasLimit` and an `eth_call` simulation of the exact release succeed
-  on every origin; the submitter balance covers `gasLimit * gasPrice`;
+- gas price (maximum across origins) within `maxGasPrice` and the submitter
+  balance covers `gasLimit * gasPrice` (otherwise the cycle waits);
+  `eth_estimateGas` within `gasLimit` and an `eth_call` simulation of the exact
+  release succeed on every origin (otherwise this transfer is deferred);
 - account nonce: `latest` equals `pending` on every origin (no foreign pending
   transaction) and equals the ledger's next nonce (after the first transfer).
 
@@ -405,21 +419,52 @@ deadline and signatures); the block is at least `confirmations` deep; and
 `processedBurns` is true at the finalized height. Then the ledger records
 `finalized` and only afterwards RelayStore records `completed`.
 
+### Releases by other transactions
+
+`release()` is callable by anyone holding valid approvals, so a third party may
+release a burn first, for example by copying our pending calldata with a higher
+gas price. That is not a failure: the recipient received exactly the approved
+amount. When every origin reports the burn processed, the submitter searches
+the vault's `Released` event for that burn ID backwards over at most
+`releaseLookbackBlocks`, in `logRangeBlocks` chunks, and requires on every
+origin: an identical log whose topics and data match source burn ID, recipient,
+amount and signer version; a successful receipt containing it; a canonical
+block; and finality depth. The ledger then records `released_elsewhere` with
+that transaction and block, RelayStore records `completed` (still referencing
+only our own transaction, or none), and the queue moves on.
+
+- Before any claim, or with a claimed row: no transaction is sent.
+- After our bytes were committed but before their first send, or after they
+  were dropped: the identical bytes are sent once anyway. They revert, but they
+  consume the nonce the ledger reserved for them, so later transfers keep
+  strictly sequential nonces.
+- Our transaction reverted because the burn was already processed: recorded as
+  released elsewhere instead of `failed`.
+- A `Released` event for the burn that does not match the approved fields halts
+  (`processed_with_mismatching_release`). Evidence not yet final defers the
+  transfer; evidence not found in the window defers it before claiming and
+  stops temporarily once bytes exist.
+
 Recovery decisions (all from canonical observations, never from send errors):
 
 | Observation | Action |
 | --- | --- |
 | receipt absent on some origins | wait (indexing lag) |
-| receipts differ between origins, or content disagrees | stop (`rpc_disagreement`) |
+| receipts or included transactions differ between origins, or content disagrees | temporary stop (`rpc_disagreement`), retried |
 | transaction pending on any origin | wait |
 | unknown everywhere, nonce unused, not processed, not paused, deadline margin intact, attempts left | resend the identical persisted bytes |
 | unknown everywhere and the account nonce advanced | halt `nonce_consumed_without_receipt` |
 | a foreign pending transaction from the account | halt `foreign_pending_transaction` |
-| replay processed by another transaction | halt `processed_by_foreign_transaction` |
-| deadline margin lost before inclusion | halt `approval_expired_before_inclusion` |
-| receipt, event or input mismatch | halt |
+| unknown everywhere, nonce unused, released by another transaction | resend the identical bytes once (they revert and consume the nonce), then record `released_elsewhere` |
+| every origin's latest block says the deadline margin is lost before inclusion | halt `approval_expired_before_inclusion` |
+| only some origins (or only the local clock) say so | temporary stop (`deadline_evidence_disagreement`), retried |
+| receipt, event or input mismatch returned identically by every origin | halt |
 | reorganized block | wait, then observe again (resend identical bytes if dropped) |
-| finalized failed execution (status `0`) | ledger `failed`; stop; never retried |
+| finalized revert because another transaction released the burn | `released_elsewhere`; RelayStore `completed`; queue continues |
+| any other finalized failed execution (status `0`) | ledger `failed`; stop; never retried |
+
+Every persisted halt is based on evidence that every origin returns
+identically; a single origin can only cause a temporary stop.
 
 ### Tests
 
@@ -434,8 +479,14 @@ the submitter's own source checks bypass them deliberately). Vendored sources ar
 checked against their git blob hashes in `test/evm/provenance.json`: the vault
 recorded for the deployed testnet vault (`d3ae705`) and current contracts main
 (`96ee420`). Scenarios: approve, release and complete on both vault versions;
-concurrent workers, a later worker and an independent ledger (no second
-release); SIGKILL in a child process at every boundary (claimed, signed,
+concurrent workers, two submitter processes contesting the lease, a later
+worker and an independent ledger (no second release; the independent ledger
+records `released_elsewhere`); a front-run copying our pending calldata; a
+third-party release before any claim and after our bytes were committed; an
+invalid recipient rejected without blocking the next transfer; a far-future
+timestamp and a different included transaction from a single origin (temporary
+stops, no halt); a RelayStore locked by another process (temporary stop, then
+progress); SIGKILL in a child process at every boundary (claimed, signed,
 RelayStore submitted, broadcast marker, sent, ledger finalized, RelayStore
 completed) followed by recovery with exactly one transaction; a reorganization
 that removes the release (identical bytes resent) and one that replaces it with

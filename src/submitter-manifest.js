@@ -10,7 +10,7 @@ const FIELDS = ["version", "mode", "destination", "releaseCommit", "routeId", "c
 const TESTNET_FIELDS = [...FIELDS, "relayStorePath", "ledgerPath", "keystorePath", "cycleIntervalMs", "cronos", "xitcoin"];
 const CRONOS_FIELDS = ["rpcUrls", "allowLoopbackHttp", "vault", "vaultCodeHash", "cronosRouteId", "signerSetVersion",
   "authorizedSigners", "submitter", "confirmations", "maxAmount", "gasLimit", "maxGasPrice", "maxFee",
-  "minDeadlineMarginSeconds", "maxBroadcastAttempts"];
+  "minDeadlineMarginSeconds", "maxBroadcastAttempts", "releaseLookbackBlocks", "logRangeBlocks"];
 const XITCOIN_FIELDS = ["rpcUrls", "allowLoopbackHttp", "safetyLag"];
 const EMPTY_CODE_HASH = "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470";
 const MAX_BYTES = 16_384;
@@ -105,6 +105,9 @@ export function validateCronosTestnetManifest(input) {
       gasLimit, maxGasPrice, maxFee,
       minDeadlineMarginSeconds: integer(cronos.minDeadlineMarginSeconds, 30, 3_600),
       maxBroadcastAttempts: integer(cronos.maxBroadcastAttempts, 1, 32),
+      // Bounded search for a release of a burn by another transaction.
+      releaseLookbackBlocks: integer(cronos.releaseLookbackBlocks, 1_000, 1_000_000),
+      logRangeBlocks: integer(cronos.logRangeBlocks, 100, 10_000),
     }),
     xitcoin: Object.freeze({ rpcUrls: urls(xitcoin.rpcUrls, xitcoin.allowLoopbackHttp),
       allowLoopbackHttp: xitcoin.allowLoopbackHttp, safetyLag: integer(xitcoin.safetyLag, 0, 1_000) }),
