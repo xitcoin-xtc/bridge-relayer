@@ -1,8 +1,10 @@
 // Command xitcoin-chain-vectors prints test/fixtures/xitcoin-chain-vectors.json
 // using the chain's own Go code: x/bridge/types for the attestation digests and
 // MsgSubmitAttestation, the Cosmos SDK for TxBody, AuthInfo, SignDoc and TxRaw,
-// and crypto/ethsecp256k1 for the signer key and signature. It never contacts
-// a network and uses synthetic small-integer keys only.
+// and crypto/ethsecp256k1 for the signer key and signature (SIGN_MODE_DIRECT:
+// 64 bytes R || S with a low S, the single encoding the chain accepts from
+// xitcoin-security-hardening-v2). It never contacts a network and uses
+// synthetic small-integer keys only.
 //
 // It must run inside the evmd module of a pos-chain checkout (which carries
 // the SDK replace directives), for example:
@@ -222,8 +224,17 @@ func transaction(name string, submitterKey int64, accountNumber, sequence, gasLi
 	must(err)
 	signature, err := signer.Sign(signDocBytes)
 	must(err)
-	if !signer.PubKey().VerifySignature(signDocBytes, signature) {
-		panic("signature does not verify")
+	if len(signature) != ethsecp256k1.SignatureLength || !signer.PubKey().VerifySignature(signDocBytes, signature) {
+		panic("signature is not a verifying 64-byte R || S")
+	}
+	// The same content with any recovery byte appended is another encoding,
+	// which the chain rejects.
+	recoverable, err := signer.SignRecoverable(signDocBytes)
+	must(err)
+	for _, v := range []byte{0, 1, 27, 28} {
+		if signer.PubKey().VerifySignature(signDocBytes, append(append([]byte{}, recoverable[:64]...), v)) {
+			panic("a 65-byte sign-bytes signature verifies")
+		}
 	}
 	raw := &txtypes.TxRaw{BodyBytes: bodyBytes, AuthInfoBytes: authInfoBytes, Signatures: [][]byte{signature}}
 	rawBytes, err := raw.Marshal()

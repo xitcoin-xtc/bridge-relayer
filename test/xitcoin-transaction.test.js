@@ -53,14 +53,26 @@ for (const t of vectors.transactions) {
   });
 }
 
-test("signatures are normalized to R || S || V with V in {0, 1} and must match the key", () => {
+test("signatures are the 64-byte low-S R || S whose recovery byte, checked but never sent, matches the key", () => {
   const t = vectors.transactions[1];
   const { doc, signer } = build(t);
   const serialized = signer.sign(doc.signingDigest).serialized;
-  const normalized = cosmosSignature(serialized, doc.signingDigest, signer.compressedPublicKey);
-  assert.ok([0, 1].includes(normalized[64]));
-  assert.equal(hex(normalized.subarray(0, 64)), serialized.slice(0, 130));
+  const signature = cosmosSignature(serialized, doc.signingDigest, signer.compressedPublicKey);
+  assert.equal(signature.length, 64);
+  assert.equal(hex(signature), serialized.slice(0, 130));
+  // A digest signer may return V as 27/28 or 0/1: the same 64 bytes.
+  const v = Number.parseInt(serialized.slice(130), 16);
+  assert.deepEqual(cosmosSignature(`${serialized.slice(0, 130)}${(v - 27).toString(16).padStart(2, "0")}`, doc.signingDigest,
+    signer.compressedPublicKey), signature);
+  // The other recovery byte does not recover this key; another key never does.
+  assert.throws(() => cosmosSignature(`${serialized.slice(0, 130)}${(v === 27 ? 28 : 27).toString(16)}`, doc.signingDigest,
+    signer.compressedPublicKey), failure);
   assert.throws(() => cosmosSignature(serialized, doc.signingDigest, key(7).compressedPublicKey), failure);
+  assert.throws(() => cosmosSignature(serialized.slice(0, 130), doc.signingDigest, signer.compressedPublicKey), failure); // needs V to check
+  // Only 64 bytes are ever assembled.
+  for (const bytes of [Buffer.concat([signature, Buffer.from([0])]), Buffer.concat([signature, Buffer.from([27])]), signature.subarray(0, 63)]) {
+    assert.throws(() => assembleTxRaw({ ...doc, signature: bytes }), failure);
+  }
   // High-s (malleated) signatures are refused.
   const n = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
   const s = BigInt(`0x${serialized.slice(66, 130)}`);
@@ -96,10 +108,12 @@ test("decoding rejects every non-canonical or unsupported encoding", () => {
     reassemble(memo, doc.authInfoBytes), reassemble(timeout, doc.authInfoBytes), reassemble(extension, doc.authInfoBytes),
     reassemble(Buffer.concat([doc.bodyBytes, doc.bodyBytes]), doc.authInfoBytes), // two messages
     reassemble(doc.bodyBytes, Buffer.concat([doc.authInfoBytes, Buffer.from([0x1a, 0x00])])), // tip
-    `0x${Buffer.concat([raw, Buffer.from([0x1a, 0x41]), signature]).toString("hex")}`, // two signatures
+    `0x${Buffer.concat([raw, Buffer.from([0x1a, 0x40]), signature]).toString("hex")}`, // two signatures
     `0x${Buffer.concat([raw, Buffer.from([0x20, 0x01])]).toString("hex")}`, // unknown field
     `0x${raw.subarray(0, raw.length - 1).toString("hex")}`, // truncated
-    reassemble(doc.bodyBytes, doc.authInfoBytes, signature.subarray(0, 64)), // 64-byte signature
+    reassemble(doc.bodyBytes, doc.authInfoBytes, Buffer.concat([signature, Buffer.from([1])])), // R || S || V, as earlier releases signed
+    reassemble(doc.bodyBytes, doc.authInfoBytes, Buffer.concat([signature, Buffer.from([28])])),
+    reassemble(doc.bodyBytes, doc.authInfoBytes, signature.subarray(0, 63)),
     `0x${Buffer.concat([Buffer.from([0x0a, 0x80 | (doc.bodyBytes.length & 0x7f), 0x80 | (doc.bodyBytes.length >> 7), 0x00]),
       doc.bodyBytes, raw.subarray(3 + doc.bodyBytes.length)]).toString("hex")}`, // overlong length varint
     reassemble(Buffer.from(doc.bodyBytes.toString("hex").replace(Buffer.from("MsgSubmitAttestation").toString("hex"),
@@ -141,11 +155,13 @@ test("re-encodings of the same signed content are recognised; any other signed c
   const tagged = (tag, bytes) => Buffer.concat([tag, varint(bytes.length), bytes]);
   const raw = (sig, { prefix = Buffer.alloc(0), bodyTag = Buffer.from([0x0a]) } = {}) => hex(Buffer.concat([prefix,
     tagged(bodyTag, doc.bodyBytes), tagged(Buffer.from([0x12]), doc.authInfoBytes), tagged(Buffer.from([0x1a]), sig)]));
-  const rs = signature.subarray(0, 64);
-  // What pos-chain's verifier and the SDK decoder accept for the same content:
-  // any 65th byte, a 64-byte R || S, a repeated body field (the last wins) and
-  // an overlong field tag. Each is another TxRaw with another hash.
-  for (const variant of [raw(Buffer.concat([rs, Buffer.from([27])])), raw(Buffer.concat([rs, Buffer.from([255])])), raw(rs),
+  const rs = signature;
+  assert.equal(raw(rs), t.txRaw);
+  // Other TxRaws (other hashes) with the same signed content: any 65th byte
+  // (accepted by pos-chain's verifier before xitcoin-security-hardening-v2),
+  // a repeated body field (the last wins) and an overlong field tag.
+  for (const variant of [raw(Buffer.concat([rs, Buffer.from([27])])), raw(Buffer.concat([rs, Buffer.from([255])])),
+    raw(Buffer.concat([rs, Buffer.from([0])])),
     raw(signature, { prefix: tagged(Buffer.from([0x0a]), Buffer.from("other body")) }), raw(signature, { bodyTag: Buffer.from([0x8a, 0x00]) })]) {
     assert.notEqual(variant, t.txRaw);
     assert.equal(sameSignedContent(signedContent(variant), ours), true, variant.slice(0, 20));
@@ -156,5 +172,24 @@ test("re-encodings of the same signed content are recognised; any other signed c
     hex(Buffer.concat([Buffer.from(t.txRaw.slice(2), "hex"), tagged(Buffer.from([0x1a]), signature)])), // two signatures
     hex(Buffer.concat([Buffer.from(t.txRaw.slice(2), "hex"), Buffer.from([0x20, 0x01])])), "0x", "0x00"]) {
     assert.equal(sameSignedContent(signedContent(other), ours), false, other.slice(0, 20));
+  }
+});
+
+test("only a 64-byte low-S R || S that recovers the signer key verifies; a 65-byte signature never does", () => {
+  const t = vectors.transactions[1];
+  const decoded = decodeXitcoinTransaction(t.txRaw);
+  const check = (patch) => verifyXitcoinSignature({ ...decoded, chainId: vectors.chainId, accountNumber: t.accountNumber, ...patch });
+  assert.equal(decoded.signatureHex, t.signature);
+  assert.equal(check({}), true);
+  const rs = Buffer.from(t.signature.slice(2), "hex");
+  for (const v of [0, 1, 27, 28]) assert.equal(check({ signatureHex: hex(Buffer.concat([rs, Buffer.from([v])])) }), false);
+  const n = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+  const s = BigInt(`0x${t.signature.slice(66, 130)}`);
+  assert.equal(check({ signatureHex: `${t.signature.slice(0, 66)}${(n - s).toString(16).padStart(64, "0")}` }), false); // high S
+  const flipped = Buffer.from(rs); flipped[10] ^= 1;
+  for (const patch of [{ signatureHex: hex(flipped) }, { signatureHex: t.signature.slice(0, 128) }, { signatureHex: `0x${"00".repeat(64)}` },
+    { signatureHex: `${t.signature.slice(0, 66)}${n.toString(16)}` }, { publicKey: key(7).compressedPublicKey }, { chainId: "xitcoin" },
+    { accountNumber: "13" }]) {
+    assert.equal(check(patch), false, JSON.stringify(patch).slice(0, 60));
   }
 });

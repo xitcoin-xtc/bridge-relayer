@@ -9,8 +9,12 @@ import { evmAddressToBech32 } from "./address.js";
 //   - envelope: test/fixtures/proto/cosmos-sdk-tx.proto TxBody, AuthInfo,
 //     SignerInfo, ModeInfo.Single (SIGN_MODE_DIRECT = 1), Fee, SignDoc, TxRaw;
 //   - signer key: /cosmos.evm.crypto.v1.ethsecp256k1.PubKey (compressed, 33
-//     bytes), signature over keccak256(SignDoc) as R || S || V with V in {0, 1}
-//     and low S, as the chain's eth_secp256k1 keyring signs.
+//     bytes), signature over keccak256(SignDoc) as exactly 64 bytes R || S
+//     with a low S and no recovery byte: the single encoding pos-chain accepts
+//     for SIGN_MODE_DIRECT from xitcoin-security-hardening-v2 (pos-chain #108,
+//     crypto/ethsecp256k1 VerifySignature, ante SignatureEncodingDecorator),
+//     which earlier binaries also accept. A 65-byte R || S || V is rejected
+//     from that upgrade height.
 // The transaction hash is SHA-256 of the TxRaw bytes (the CometBFT hash).
 // Golden vectors produced by the chain's own Go encoder are checked in
 // test/fixtures/xitcoin-chain-vectors.json; CI regenerates them from the
@@ -19,13 +23,15 @@ export const XITCOIN_TESTNET_CHAIN_ID = "xitcoin-testnet-v2-1";
 // The pos-chain commit whose encoders and queries this release was verified
 // against (test/fixtures/xitcoin-chain-vectors.json). It binds the broadcast
 // ledger and must equal the submitter manifest's chainSchemaCommit.
-export const XITCOIN_CHAIN_SCHEMA_COMMIT = "c006842b4f02c68055b47690ef144df408b7f962";
+export const XITCOIN_CHAIN_SCHEMA_COMMIT = "cfe743d4f39d4f9e77ba4f0257ea3e3f21800dff";
 export const XITCOIN_MAINNET_CHAIN_ID = "xitcoin";
 export const MSG_SUBMIT_ATTESTATION = "/cosmos.evm.bridge.v1.MsgSubmitAttestation";
 export const ETH_SECP256K1_PUBKEY = "/cosmos.evm.crypto.v1.ethsecp256k1.PubKey";
 export const FEE_DENOM = "axtc";
 export const SIGN_MODE_DIRECT = 1n;
 export const MAX_TRANSACTION_BYTES = 16_384;
+// SIGN_MODE_DIRECT signature length of an eth_secp256k1 key: R || S.
+export const COSMOS_SIGNATURE_BYTES = 64;
 const N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
 const U64 = (1n << 64n) - 1n;
 const I64 = (1n << 63n) - 1n;
@@ -115,21 +121,22 @@ export function buildXitcoinSignDoc({ messageBytes, publicKey, accountNumber, se
   return Object.freeze({ bodyBytes: body, authInfoBytes: authInfo, signDocBytes: signDoc, signingDigest: keccak256(signDoc) });
 }
 
-// Low-S R || S || V (V in {0, 1}) from an Ethereum-style 65-byte signature.
+// The 64-byte low-S R || S of an Ethereum-style 65-byte signature (V 27/28 or
+// 0/1, as a digest signer returns it), after checking that V recovers this
+// key over the digest. The recovery byte is checked, never sent.
 export function cosmosSignature(serialized, digest, publicKey) {
   const bytes = unhex(serialized, 65);
   const r = BigInt(hex(bytes.subarray(0, 32))), s = BigInt(hex(bytes.subarray(32, 64)));
   let v = bytes[64];
   if (v === 27 || v === 28) v -= 27;
   if (v > 1 || r < 1n || r >= N || s < 1n || s > N / 2n) throw failure();
-  const normalized = Buffer.concat([bytes.subarray(0, 64), Buffer.from([v])]);
   if (SigningKey.recoverPublicKey(digest, hex(Buffer.concat([bytes.subarray(0, 64), Buffer.from([v + 27])])))
       !== SigningKey.computePublicKey(compressedPublicKey(publicKey), false)) throw failure();
-  return normalized;
+  return Buffer.from(bytes.subarray(0, COSMOS_SIGNATURE_BYTES));
 }
 
 export function assembleTxRaw({ bodyBytes, authInfoBytes, signature }) {
-  if (!Buffer.isBuffer(signature) || signature.length !== 65) throw failure();
+  if (!Buffer.isBuffer(signature) || signature.length !== COSMOS_SIGNATURE_BYTES) throw failure();
   const raw = Buffer.concat([bytesField(1, bodyBytes), bytesField(2, authInfoBytes), bytesAlways(3, signature)]);
   if (raw.length > MAX_TRANSACTION_BYTES) throw failure();
   return Object.freeze({ signedHex: hex(raw), transactionHash: hex(sha256(raw)) });
@@ -203,8 +210,8 @@ export function decodeSubmitAttestation(bytes) {
 
 // Exactly the supported subset: one MsgSubmitAttestation, no memo, timeout,
 // extension options or unordered flag; one eth_secp256k1 signer in
-// SIGN_MODE_DIRECT; one axtc fee coin, no payer or granter; one 65-byte
-// signature. Returns the decoded fields; the caller compares them with what
+// SIGN_MODE_DIRECT; one axtc fee coin, no payer or granter; one 64-byte
+// R || S signature (a 65-byte signature from an earlier release is refused). Returns the decoded fields; the caller compares them with what
 // it expects and verifies the signature against the SignDoc.
 export function decodeXitcoinTransaction(signedHex) {
   try {
@@ -214,7 +221,7 @@ export function decodeXitcoinTransaction(signedHex) {
     only(top, { 1: 2, 2: 2, 3: 2 });
     const bodyBytes = single(top, 1), authInfoBytes = single(top, 2);
     const signatures = top.filter((item) => item.field === 3);
-    if (!bodyBytes || !authInfoBytes || signatures.length !== 1 || signatures[0].value.length !== 65) throw failure();
+    if (!bodyBytes || !authInfoBytes || signatures.length !== 1 || signatures[0].value.length !== COSMOS_SIGNATURE_BYTES) throw failure();
     const body = read(bodyBytes);
     only(body, { 1: 2 });
     const messages = body.filter((item) => item.field === 1);
@@ -262,14 +269,16 @@ export function decodeXitcoinTransaction(signedHex) {
 
 // The signed content of a transaction as the chain reads it: the last
 // body_bytes and auth_info_bytes fields and R || S of a single 64- or 65-byte
-// signature. pos-chain's eth_secp256k1 verifier (crypto/ethsecp256k1,
-// verifySignatureECDSA) drops a 65th byte without checking it and also accepts
-// 64-byte R || S, and the SDK's TxRaw decoder accepts a repeated body_bytes or
-// auth_info_bytes field (the last wins) and overlong field tags. So anyone who
-// sees our broadcast bytes can re-wrap the same signed content into another
-// TxRaw with another hash, which spends our sequence and fee exactly as ours
-// would. Our inclusion is therefore recognised by signed content, never only
-// by hash. Returns null for anything that cannot carry exactly one signature.
+// signature. Before xitcoin-security-hardening-v2, pos-chain's eth_secp256k1
+// verifier dropped a 65th byte without checking it (so a copy of our 64-byte
+// signature with any byte appended verified); from that upgrade only the
+// 64-byte form verifies. The SDK's TxRaw decoder accepts a repeated
+// body_bytes or auth_info_bytes field (the last wins) and overlong field tags.
+// So anyone who sees our broadcast bytes may be able to re-wrap the same
+// signed content into another TxRaw with another hash, which spends our
+// sequence and fee exactly as ours would. Our inclusion is therefore
+// recognised by signed content (R || S unchanged), never only by hash.
+// Returns null for anything that cannot carry exactly one signature.
 export function signedContent(tx) {
   try {
     const raw = typeof tx === "string" ? unhex(tx) : tx;
@@ -313,14 +322,21 @@ export function accountOfPublicKey(publicKey) {
   return evmAddressToBech32(computeAddress(hex(compressedPublicKey(publicKey))));
 }
 
-// True only when the signature is the low-S, V in {0, 1} signature of this
-// key over the SignDoc for this chain and account number.
+// True only when the signature is exactly 64 bytes R || S with a low S and
+// one of the recovery IDs (V 27 or 28) recovers this key over the SignDoc for
+// this chain and account number.
 export function verifyXitcoinSignature({ bodyBytes, authInfoBytes, chainId, accountNumber, signatureHex, publicKey }) {
   try {
     const signingDigest = keccak256(Buffer.concat([bytesField(1, bodyBytes), bytesField(2, authInfoBytes), bytesField(3, chainId),
       uintField(4, uint(accountNumber))]));
-    const signature = unhex(signatureHex, 65);
-    return cosmosSignature(hex(signature), signingDigest, publicKey).equals(signature);
+    const signature = unhex(signatureHex, COSMOS_SIGNATURE_BYTES);
+    const r = BigInt(hex(signature.subarray(0, 32))), s = BigInt(hex(signature.subarray(32, 64)));
+    if (r < 1n || r >= N || s < 1n || s > N / 2n) return false;
+    const expected = SigningKey.computePublicKey(compressedPublicKey(publicKey), false);
+    return [27, 28].some((v) => {
+      try { return SigningKey.recoverPublicKey(signingDigest, hex(Buffer.concat([signature, Buffer.from([v])]))) === expected; }
+      catch { return false; }
+    });
   } catch { return false; }
 }
 
